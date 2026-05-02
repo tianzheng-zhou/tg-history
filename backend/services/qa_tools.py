@@ -14,6 +14,7 @@ from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from backend.models.database import Import, Message, Topic
+from backend.services import llm_adapter
 from backend.services.embedding import search_similar
 
 
@@ -57,8 +58,11 @@ async def tool_semantic_search(
     """向量语义检索（top_k 上限 200）"""
     top_k = max(1, min(int(top_k), 200))
     where_filter = None
-    if chat_ids and len(chat_ids) == 1:
-        where_filter = {"chat_id": chat_ids[0]}
+    if chat_ids:
+        if len(chat_ids) == 1:
+            where_filter = {"chat_id": chat_ids[0]}
+        else:
+            where_filter = {"chat_id": {"$in": chat_ids}}
 
     results = await search_similar(query, n_results=top_k, where=where_filter)
 
@@ -91,8 +95,11 @@ async def tool_keyword_search(
     chat_ids: list[str] | None = None,
     limit: int = 30,
 ) -> dict:
-    """关键词检索：优先 FTS5（trigram），命中 0 时回退 LIKE 模糊匹配（兼容短中文词）"""
+    """关键词检索：优先 FTS5（trigram），命中 0 时回退 LIKE 模糊匹配（兼容短中文词）。
+    结果经 rerank 模型按相关性排序。"""
     limit = max(1, min(int(limit), 200))
+    # 先多取一些候选，再 rerank 筛选
+    fetch_limit = min(limit * 3, 200)
     from sqlalchemy import text as sa_text
 
     msgs: list[Message] = []
@@ -100,7 +107,7 @@ async def tool_keyword_search(
     try:
         rows = db.execute(
             sa_text("SELECT rowid FROM messages_fts WHERE messages_fts MATCH :kw LIMIT :lim"),
-            {"kw": keyword, "lim": limit},
+            {"kw": keyword, "lim": fetch_limit},
         ).fetchall()
         if rows:
             ids = [r[0] for r in rows]
@@ -109,20 +116,42 @@ async def tool_keyword_search(
                 q = q.filter(Message.chat_id.in_(chat_ids))
             msgs = q.order_by(Message.date).all()
     except Exception as e:
-        # FTS 解析失败（如非法 FTS5 表达式），跳过去走 LIKE
         used_method = f"fts5_err({type(e).__name__})"
 
     # FTS 0 命中 → 用 LIKE 兜底（适配 trigram 不支持的短中文词）
     if not msgs:
         used_method = "like"
-        # 取出第一个 OR 操作数（FTS 表达式拆分），用最朴素的关键词做 LIKE
         primary_kw = keyword.split(" OR ")[0].split()[0].strip('"').strip()
         if primary_kw:
             q = db.query(Message).filter(Message.text_plain.like(f"%{primary_kw}%"))
             if chat_ids:
                 q = q.filter(Message.chat_id.in_(chat_ids))
-            msgs = q.order_by(Message.date.desc()).limit(limit).all()
-            msgs.reverse()  # 改回时间正序
+            msgs = q.order_by(Message.date.desc()).limit(fetch_limit).all()
+            msgs.reverse()
+
+    # rerank：用语义相关性重排候选结果
+    reranked = False
+    if len(msgs) > 1:
+        try:
+            docs = [(m.text_plain or "")[:500] for m in msgs]
+            rerank_results = await llm_adapter.rerank(
+                query=keyword, documents=docs, top_n=min(limit, len(msgs)),
+            )
+            if rerank_results:
+                reranked_msgs = []
+                for rr in rerank_results:
+                    idx = rr["index"]
+                    if 0 <= idx < len(msgs):
+                        reranked_msgs.append(msgs[idx])
+                msgs = reranked_msgs
+                reranked = True
+                used_method += "+rerank"
+        except Exception:
+            # rerank 失败，fallback 到原始顺序并截断
+            pass
+
+    if not reranked:
+        msgs = msgs[:limit]
 
     return {
         "results": [_msg_to_dict(m, preview_len=250) for m in msgs],
@@ -188,7 +217,7 @@ async def tool_search_by_sender(
     sender: str,
     chat_ids: list[str] | None = None,
     keyword: str | None = None,
-    limit: int = 20,
+    limit: int = 50,
 ) -> dict:
     """查询某发言人的消息，可选关键词过滤"""
     q = db.query(Message).filter(Message.sender.like(f"%{sender}%"))
@@ -208,7 +237,7 @@ async def tool_search_by_date(
     chat_id: str,
     start_date: str,
     end_date: str | None = None,
-    limit: int = 30,
+    limit: int = 50,
 ) -> dict:
     """按日期范围查询消息。start_date / end_date 格式: YYYY-MM-DD"""
     try:
@@ -346,7 +375,7 @@ TOOL_SCHEMAS = [
                     "sender": {"type": "string", "description": "发言人昵称（支持模糊匹配）"},
                     "chat_ids": {"type": "array", "items": {"type": "string"}},
                     "keyword": {"type": "string", "description": "可选的关键词过滤"},
-                    "limit": {"type": "integer", "default": 20},
+                    "limit": {"type": "integer", "default": 50},
                 },
                 "required": ["sender"],
             },
@@ -363,7 +392,7 @@ TOOL_SCHEMAS = [
                     "chat_id": {"type": "string"},
                     "start_date": {"type": "string", "description": "YYYY-MM-DD"},
                     "end_date": {"type": "string", "description": "YYYY-MM-DD，可选"},
-                    "limit": {"type": "integer", "default": 30},
+                    "limit": {"type": "integer", "default": 50},
                 },
                 "required": ["chat_id", "start_date"],
             },

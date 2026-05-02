@@ -330,23 +330,25 @@ async def answer_question_stream(
         else:
             kwargs["temperature"] = 0.3
 
-        stream = await client.chat.completions.create(**kwargs)
+        sem = llm_adapter.get_chat_semaphore(model)
         full_answer_parts: list[str] = []
         last_usage: dict | None = None
-        async for chunk in stream:
-            usage = getattr(chunk, "usage", None)
-            if usage is not None:
-                last_usage = {
-                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-                    "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
-                    "total_tokens": getattr(usage, "total_tokens", 0) or 0,
-                }
-            choice = chunk.choices[0] if chunk.choices else None
-            if not choice:
-                continue
-            if choice.delta.content:
-                full_answer_parts.append(choice.delta.content)
-                yield {"type": "token", "text": choice.delta.content}
+        async with sem:
+            stream = await client.chat.completions.create(**kwargs)
+            async for chunk in stream:
+                usage = getattr(chunk, "usage", None)
+                if usage is not None:
+                    last_usage = {
+                        "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                        "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                        "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+                    }
+                choice = chunk.choices[0] if chunk.choices else None
+                if not choice:
+                    continue
+                if choice.delta.content:
+                    full_answer_parts.append(choice.delta.content)
+                    yield {"type": "token", "text": choice.delta.content}
 
         full_answer = "".join(full_answer_parts)
 
