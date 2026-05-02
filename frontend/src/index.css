@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@plugin "@tailwindcss/typography";
 
 @theme {
   --color-background: #ffffff;
@@ -27,4 +28,26 @@ body {
   background-color: var(--color-background);
   color: var(--color-foreground);
   min-height: 100vh;
+}
+
+/* Markdown 表格样式 */
+.prose table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.85em;
+  overflow-x: auto;
+  display: block;
+}
+.prose th,
+.prose td {
+  border: 1px solid var(--color-border);
+  padding: 0.35rem 0.6rem;
+  text-align: left;
+}
+.prose th {
+  background-color: var(--color-muted);
+  font-weight: 600;
+}
+.prose tr:nth-child(even) {
+  background-color: var(--color-muted);
 }

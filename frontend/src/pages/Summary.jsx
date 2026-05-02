@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
-import { FileText, Loader2, RefreshCw } from "lucide-react";
-import { getChats, getSummaries, getSummaryProgress, triggerSummarize } from "@/lib/api";
+import { FileText, Loader2, RefreshCw, Sparkles } from "lucide-react";
+import { getChats, getSummaries, getSummaryProgress, triggerSummarize, triggerSummarizeAll } from "@/lib/api";
 
 const CATEGORIES = [
   { key: "full", label: "完整报告" },
@@ -11,13 +11,6 @@ const CATEGORIES = [
   { key: "decision", label: "关键决策" },
   { key: "opinion", label: "重要观点" },
 ];
-
-const STAGE_LABELS = {
-  map: "正在分析消息片段",
-  reduce: "正在合并生成报告",
-  done: "生成完成",
-  error: "生成失败",
-};
 
 export default function Summary() {
   const [chats, setChats] = useState([]);
@@ -101,6 +94,23 @@ export default function Summary() {
     }
   };
 
+  const handleGenerateAll = async (force = false) => {
+    setError(null);
+    try {
+      const res = await triggerSummarizeAll(force);
+      if (res.status === "exists") {
+        setError("所有群聊摘要均已存在，可点击「全部重建」强制重新生成");
+        return;
+      }
+      startPolling();
+    } catch (err) {
+      setError(err.response?.data?.detail || "批量摘要生成失败");
+    }
+  };
+
+  const indexedChats = chats.filter((c) => c.index_built);
+  const summarizedCount = chats.filter((c) => c.index_built).length;
+
   const activeSummary = summaries.find((s) => s.category === activeTab);
 
   const selectedChatObj = chats.find((c) => c.chat_id === selectedChat);
@@ -111,6 +121,25 @@ export default function Summary() {
         <h1 className="text-2xl font-bold">摘要报告</h1>
         <div className="flex items-center gap-2">
           <button
+            onClick={() => handleGenerateAll(false)}
+            disabled={generating || indexedChats.length === 0}
+            className="inline-flex items-center gap-2 bg-purple-600 text-white px-3 py-1.5 rounded-md text-sm hover:bg-purple-700 disabled:opacity-50"
+            title="为所有已索引但未生成摘要的群聊批量生成"
+          >
+            <Sparkles size={14} />
+            一键生成全部
+          </button>
+          <button
+            onClick={() => handleGenerateAll(true)}
+            disabled={generating || indexedChats.length === 0}
+            className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground px-2 py-1.5"
+            title="强制重新生成所有摘要"
+          >
+            <RefreshCw size={12} />
+            全部重建
+          </button>
+          <div className="w-px h-6 bg-border mx-1" />
+          <button
             onClick={() => handleGenerate(false)}
             disabled={generating || !selectedChat}
             className="inline-flex items-center gap-2 bg-primary text-primary-foreground px-3 py-1.5 rounded-md text-sm hover:opacity-90 disabled:opacity-50"
@@ -120,7 +149,7 @@ export default function Summary() {
             ) : (
               <FileText size={14} />
             )}
-            {generating ? "生成中..." : "生成摘要"}
+            {generating ? "生成中..." : "生成当前"}
           </button>
           {summaries.length > 0 && (
             <button
@@ -129,7 +158,7 @@ export default function Summary() {
               className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
             >
               <RefreshCw size={14} />
-              重新生成
+              重建当前
             </button>
           )}
         </div>
@@ -170,27 +199,46 @@ export default function Summary() {
           <div className="flex items-center gap-2 mb-2">
             <Loader2 size={16} className="text-blue-600 animate-spin" />
             <span className="font-medium text-blue-800 text-sm">
-              {progress.chat_name && `${progress.chat_name} · `}
-              {STAGE_LABELS[progress.stage] || progress.stage}
-              {progress.stage === "map" && progress.map_total > 0 &&
-                ` (${progress.map_done}/${progress.map_total})`}
+              正在生成摘要 {progress.total > 0 && `(${progress.completed}/${progress.total})`}
+              {progress.queued > 0 && ` · 排队中 ${progress.queued}`}
             </span>
           </div>
-          {progress.stage === "map" && progress.map_total > 0 && (
-            <div className="w-full bg-blue-100 rounded-full h-2">
+          {progress.total > 0 && (
+            <div className="w-full bg-blue-100 rounded-full h-2 mb-3">
               <div
                 className="bg-blue-500 h-2 rounded-full transition-all duration-500"
-                style={{ width: `${(progress.map_done / progress.map_total) * 100}%` }}
+                style={{ width: `${(progress.completed / progress.total) * 100}%` }}
               />
             </div>
           )}
-          {progress.stage === "reduce" && (
-            <div className="w-full bg-blue-100 rounded-full h-2">
-              <div className="bg-blue-500 h-2 rounded-full animate-pulse w-full" />
+          {progress.chat_details && Object.keys(progress.chat_details).length > 0 && (
+            <div className="space-y-2">
+              {Object.entries(progress.chat_details).map(([name, d]) => {
+                const isMap = d.stage === "map";
+                const pct = isMap
+                  ? (d.map_total > 0 ? (d.map_done / d.map_total) * 100 : 0)
+                  : 100;
+                const label = isMap
+                  ? `分析片段 ${d.map_done}/${d.map_total}`
+                  : "合并报告";
+                return (
+                  <div key={name} className="flex items-center gap-2">
+                    <span className="text-xs text-blue-700 w-36 truncate shrink-0" title={name}>{name}</span>
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${
+                      isMap ? "bg-blue-100 text-blue-700" : "bg-purple-100 text-purple-700"
+                    }`}>{label}</span>
+                    <div className="flex-1 bg-blue-100 rounded-full h-1.5">
+                      <div
+                        className={`h-full rounded-full transition-all duration-300 ${
+                          isMap ? "bg-blue-500" : "bg-purple-500 animate-pulse"
+                        }`}
+                        style={{ width: `${Math.min(pct, 100)}%` }}
+                      />
+                    </div>
+                  </div>
+                );
+              })}
             </div>
-          )}
-          {progress.queued > 0 && (
-            <p className="text-xs text-blue-600 mt-1">排队中: {progress.queued}</p>
           )}
         </div>
       )}

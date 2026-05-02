@@ -1,6 +1,8 @@
 """Map-Reduce 摘要引擎"""
 
+import asyncio
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -21,7 +23,7 @@ CATEGORY_LABELS = {
     "opinion": "重要观点与讨论",
 }
 
-CHUNK_SIZE = 80  # 每组消息数
+CHUNK_SIZE = 200  # 每组消息数（合并小话题以减少 LLM 调用）
 
 
 def _load_prompt(name: str) -> str:
@@ -41,22 +43,42 @@ def _format_messages(messages: list[Message]) -> str:
 
 
 def _chunk_messages(messages: list[Message]) -> list[list[Message]]:
-    """按话题分组，若话题内消息过多则再按 CHUNK_SIZE 切分"""
+    """按话题分组，并把多个小话题合并成接近 CHUNK_SIZE 的组以减少 LLM 调用次数。
+    
+    - 大话题（>= CHUNK_SIZE）单独切分
+    - 小话题按时间顺序累积，达到 CHUNK_SIZE 才输出
+    """
+    # 按话题分组（保持时间顺序）
     topic_groups: dict[int | None, list[Message]] = {}
+    topic_order: list[int | None] = []
     for m in messages:
         key = m.topic_id
         if key not in topic_groups:
             topic_groups[key] = []
+            topic_order.append(key)
         topic_groups[key].append(m)
 
-    chunks = []
-    for group in topic_groups.values():
-        if len(group) <= CHUNK_SIZE:
-            chunks.append(group)
-        else:
+    chunks: list[list[Message]] = []
+    buffer: list[Message] = []
+
+    def flush_buffer():
+        if buffer:
+            chunks.append(list(buffer))
+            buffer.clear()
+
+    for key in topic_order:
+        group = topic_groups[key]
+        if len(group) >= CHUNK_SIZE:
+            # 大话题：先冲掉小话题缓冲区，再切分大话题
+            flush_buffer()
             for i in range(0, len(group), CHUNK_SIZE):
                 chunks.append(group[i : i + CHUNK_SIZE])
+        else:
+            buffer.extend(group)
+            if len(buffer) >= CHUNK_SIZE:
+                flush_buffer()
 
+    flush_buffer()
     return chunks
 
 
@@ -114,12 +136,16 @@ async def run_summarize(db: Session, chat_id: str, progress: dict | None = None)
         progress["map_done"] = 0
         progress["stage"] = "map"
 
-    chunk_summaries = []
-    for chunk in chunks:
+    # 并发 Map（受 llm_adapter 全局 semaphore 限流）
+    async def _map_one(idx: int, chunk: list[Message]) -> tuple[int, str]:
         summary = await _map_summarize(chunk)
-        chunk_summaries.append(summary)
         if progress is not None:
-            progress["map_done"] += 1
+            progress["map_done"] = progress.get("map_done", 0) + 1
+        return idx, summary
+
+    map_results = await asyncio.gather(*[_map_one(i, c) for i, c in enumerate(chunks)])
+    map_results.sort(key=lambda x: x[0])
+    chunk_summaries = [s for _, s in map_results]
 
     # Reduce 阶段
     if progress is not None:
@@ -127,15 +153,69 @@ async def run_summarize(db: Session, chat_id: str, progress: dict | None = None)
 
     full_report = await _reduce_summarize(chunk_summaries)
 
-    # 保存为单个报告（category="full"）
-    report = SummaryReport(
-        chat_id=chat_id,
-        category="full",
-        content=full_report,
-        generated_at=datetime.utcnow(),
-        chunk_summaries=json.dumps(chunk_summaries, ensure_ascii=False),
-    )
-    db.add(report)
+    # 解析 full 报告，按分类切分（与 reduce_summary.txt 中的标题一一对应）
+    sections = _split_by_category(full_report)
+    now = datetime.utcnow()
+    summaries_json = json.dumps(chunk_summaries, ensure_ascii=False)
+
+    # 保存完整报告
+    db.add(SummaryReport(
+        chat_id=chat_id, category="full", content=full_report,
+        generated_at=now, chunk_summaries=summaries_json,
+    ))
+    # 保存各分类（即使内容为"暂无"也写入空标记）
+    for cat_key, cat_content in sections.items():
+        db.add(SummaryReport(
+            chat_id=chat_id, category=cat_key, content=cat_content,
+            generated_at=now,
+        ))
     db.commit()
 
-    return {"full": full_report}
+    return {"full": full_report, **sections}
+
+
+# 标题 → category key 映射
+_CATEGORY_HEADERS = {
+    "技术信息": "tech",
+    "商业信息": "business",
+    "资源与链接": "resource",
+    "关键决策与待办": "decision",
+    "重要观点与讨论": "opinion",
+}
+
+
+def _split_by_category(markdown: str) -> dict[str, str]:
+    """把 reduce 阶段输出的 full markdown 按 5 个分类标题切分。
+    
+    匹配多种 markdown 标题格式，允许前置 emoji，例如：
+      ## 🔧 技术信息
+      ## 技术信息
+      **技术信息**
+      ### 💼 商业信息：
+    """
+    headers_pattern = "|".join(re.escape(h) for h in _CATEGORY_HEADERS.keys())
+    # 匹配 ## / ### / **...** 标题，允许中间有任意非中文字符（emoji、空格、符号）
+    pattern = re.compile(
+        rf"^\s*(?:#{{1,4}}\s+|\*\*\s*)[^\u4e00-\u9fa5\n]*?({headers_pattern})[^\n]*$",
+        re.MULTILINE,
+    )
+
+    matches = list(pattern.finditer(markdown))
+    result = {v: "暂无内容" for v in _CATEGORY_HEADERS.values()}
+
+    if not matches:
+        return result
+
+    for i, m in enumerate(matches):
+        header_zh = m.group(1)
+        cat_key = _CATEGORY_HEADERS.get(header_zh)
+        if not cat_key:
+            continue
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(markdown)
+        body = markdown[start:end].strip()
+        # 去掉末尾的 "---" 分隔线
+        body = re.sub(r"\n*-{3,}\s*$", "", body).strip()
+        if body and body not in ("暂无", "暂无内容", "无"):
+            result[cat_key] = body
+    return result

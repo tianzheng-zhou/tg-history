@@ -75,11 +75,17 @@ class SummaryItem(BaseModel):
 
 # ---------- QA ----------
 
+class ChatMessage(BaseModel):
+    role: str  # "user" | "assistant"
+    content: str
+
+
 class AskRequest(BaseModel):
     question: str
     chat_ids: list[str] | None = None
     date_range: list[str] | None = None
     sender: str | None = None
+    history: list[ChatMessage] | None = None  # 多轮对话历史
 
 
 class SourceItem(BaseModel):

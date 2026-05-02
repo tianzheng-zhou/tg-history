@@ -24,7 +24,7 @@ def _get_client() -> AsyncOpenAI:
                 max_keepalive_connections=50,
                 keepalive_expiry=30.0,
             ),
-            timeout=httpx.Timeout(60.0, connect=10.0),
+            timeout=httpx.Timeout(180.0, connect=10.0),
         )
         _client_singleton = AsyncOpenAI(
             api_key=settings.dashscope_api_key,

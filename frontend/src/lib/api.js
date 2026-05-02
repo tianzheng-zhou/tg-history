@@ -55,6 +55,11 @@ export async function triggerSummarize(chatId, force = false) {
   return data;
 }
 
+export async function triggerSummarizeAll(force = false) {
+  const { data } = await api.post(`/summarize-all?force=${force}`);
+  return data;
+}
+
 export async function getSummaries(chatId) {
   const { data } = await api.get(`/summaries/${chatId}`);
   return data;
@@ -75,6 +80,115 @@ export async function askQuestion(question, options = {}) {
     sender: options.sender || null,
   });
   return data;
+}
+
+/**
+ * 流式 RAG 问答。逐事件推送 RAG 各阶段状态。
+ * @param {string} question
+ * @param {object} options - { chatIds, dateRange, sender, signal, onEvent }
+ *   - onEvent(ev): 每收到一个事件回调，ev 形如 { type, ... }
+ */
+export async function askQuestionStream(question, options = {}) {
+  const body = {
+    question,
+    chat_ids: options.chatIds || null,
+    date_range: options.dateRange || null,
+    sender: options.sender || null,
+  };
+
+  const resp = await fetch("/api/ask/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: options.signal,
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`HTTP ${resp.status}: ${errText}`);
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    // 按 SSE 事件分隔（\n\n）
+    let idx;
+    while ((idx = buffer.indexOf("\n\n")) !== -1) {
+      const rawEvent = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+
+      const dataLine = rawEvent
+        .split("\n")
+        .filter((l) => l.startsWith("data:"))
+        .map((l) => l.slice(5).trim())
+        .join("");
+
+      if (!dataLine) continue;
+      try {
+        const ev = JSON.parse(dataLine);
+        options.onEvent?.(ev);
+      } catch (e) {
+        console.warn("SSE parse error:", e, dataLine);
+      }
+    }
+  }
+}
+
+/**
+ * Agent 式问答：LLM 自主调用工具。事件类型更丰富。
+ * @param {string} question
+ * @param {object} options - { chatIds, signal, onEvent }
+ */
+export async function askAgentStream(question, options = {}) {
+  const body = {
+    question,
+    chat_ids: options.chatIds || null,
+    history: options.history || null,
+  };
+
+  const resp = await fetch("/api/ask/agent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: options.signal,
+  });
+
+  if (!resp.ok) {
+    throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf("\n\n")) !== -1) {
+      const rawEvent = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      const dataLine = rawEvent
+        .split("\n")
+        .filter((l) => l.startsWith("data:"))
+        .map((l) => l.slice(5).trim())
+        .join("");
+      if (!dataLine) continue;
+      try {
+        const ev = JSON.parse(dataLine);
+        options.onEvent?.(ev);
+      } catch (e) {
+        console.warn("SSE parse error:", e, dataLine);
+      }
+    }
+  }
 }
 
 export async function getQAHistory(limit = 50) {

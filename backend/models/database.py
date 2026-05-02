@@ -128,15 +128,36 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
 def init_db():
-    """创建所有表 + FTS5 虚拟表"""
+    """创建所有表 + FTS5 虚拟表（trigram tokenizer，对中文友好）"""
     Base.metadata.create_all(bind=engine)
     with engine.connect() as conn:
-        # 用独立 FTS 表（非 content 同步），避免损坏
+        # 检查现有 FTS 表的 tokenizer：trigram 对中文/CJK 远好于默认 unicode61
+        existing_sql_row = conn.execute(text(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'"
+        )).fetchone()
+        existing_sql = (existing_sql_row[0] if existing_sql_row else "") or ""
+        needs_rebuild = bool(existing_sql) and "tokenize" not in existing_sql.lower()
+
+        if needs_rebuild:
+            # 旧表是 unicode61（默认）—— DROP 重建为 trigram 并重新灌数据
+            conn.execute(text("DROP TABLE messages_fts"))
+            conn.commit()
+
         conn.execute(text(
             "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts "
-            "USING fts5(text_plain, sender, chat_id UNINDEXED, msg_id UNINDEXED)"
+            "USING fts5(text_plain, sender, chat_id UNINDEXED, msg_id UNINDEXED, "
+            "tokenize='trigram')"
         ))
         conn.commit()
+
+        if needs_rebuild:
+            # 把现有 messages 重新灌进新 FTS 表
+            conn.execute(text(
+                "INSERT INTO messages_fts(text_plain, sender, chat_id, msg_id) "
+                "SELECT text_plain, sender, chat_id, id FROM messages "
+                "WHERE text_plain IS NOT NULL AND text_plain != ''"
+            ))
+            conn.commit()
 
 
 def get_db():

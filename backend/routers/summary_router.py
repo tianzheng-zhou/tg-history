@@ -18,28 +18,36 @@ _summary_lock = threading.Lock()
 _summary_queue: list[dict] = []  # [{"chat_id", "chat_name", "force"}]
 _summary_progress: dict = {
     "running": False,
+    "total": 0,
+    "completed": 0,
+    "active_chats": [],          # 正在并行处理的群聊名
+    "chat_details": {},          # chat_name → {stage, map_done, map_total}
+    "results": [],               # [{chat_name, status, error}]
+    # 兼容旧字段
     "chat_id": "",
     "chat_name": "",
-    "stage": "",       # "map" | "reduce" | "done" | "error"
+    "stage": "",
     "map_total": 0,
     "map_done": 0,
     "queued": 0,
     "error": "",
 }
 
+MAX_PARALLEL_SUMMARY = 8  # 群聊级并发上限
 
-def _enqueue_summary(chat_id: str, chat_name: str, force: bool):
+
+def _enqueue_summary(chat_ids: list[tuple[str, str, bool]]):
+    """chat_ids: [(chat_id, chat_name, force), ...]"""
     with _summary_lock:
-        # 去重
-        for item in _summary_queue:
-            if item["chat_id"] == chat_id:
-                return
-        if _summary_progress["running"] and _summary_progress["chat_id"] == chat_id:
-            return
-        _summary_queue.append({"chat_id": chat_id, "chat_name": chat_name, "force": force})
+        existing = {item["chat_id"] for item in _summary_queue}
+        for cid, cname, force in chat_ids:
+            if cid not in existing:
+                _summary_queue.append({"chat_id": cid, "chat_name": cname, "force": force})
+                existing.add(cid)
         _summary_progress["queued"] = len(_summary_queue)
 
         if _summary_progress["running"]:
+            _summary_progress["total"] = _summary_progress["completed"] + len(_summary_queue)
             return
 
     t = threading.Thread(target=_summary_worker, daemon=True)
@@ -49,49 +57,80 @@ def _enqueue_summary(chat_id: str, chat_name: str, force: bool):
 def _summary_worker():
     with _summary_lock:
         _summary_progress["running"] = True
+        _summary_progress["completed"] = 0
+        _summary_progress["total"] = len(_summary_queue)
+        _summary_progress["active_chats"] = []
+        _summary_progress["chat_details"] = {}
+        _summary_progress["results"] = []
         _summary_progress["error"] = ""
 
-    async def _run():
-        db = SessionLocal()
-        try:
-            while True:
+    async def _process_one(task: dict, sem: asyncio.Semaphore):
+        async with sem:
+            chat_id = task["chat_id"]
+            chat_name = task["chat_name"]
+            force = task["force"]
+
+            db = SessionLocal()
+            try:
+                detail = {"stage": "map", "map_done": 0, "map_total": 0}
                 with _summary_lock:
-                    if not _summary_queue:
-                        break
-                    task = _summary_queue.pop(0)
-                    _summary_progress["queued"] = len(_summary_queue)
-
-                chat_id = task["chat_id"]
-                chat_name = task["chat_name"]
-                force = task["force"]
-
-                _summary_progress["chat_id"] = chat_id
-                _summary_progress["chat_name"] = chat_name
-                _summary_progress["stage"] = "map"
-                _summary_progress["map_total"] = 0
-                _summary_progress["map_done"] = 0
-                _summary_progress["error"] = ""
+                    _summary_progress["active_chats"].append(chat_name)
+                    _summary_progress["chat_details"][chat_name] = detail
+                    _summary_progress["chat_name"] = chat_name
+                    _summary_progress["stage"] = "map"
 
                 try:
-                    # 删除旧摘要
-                    existing = db.query(SummaryReport).filter(SummaryReport.chat_id == chat_id).first()
-                    if existing and (force or existing.stale):
-                        db.query(SummaryReport).filter(SummaryReport.chat_id == chat_id).delete()
-                        db.commit()
-                    elif existing and not force and not existing.stale:
-                        continue  # 已存在且未过期，跳过
+                    existing = db.query(SummaryReport).filter(SummaryReport.chat_id == chat_id).all()
+                    has_valid = any(not (r.stale or False) for r in existing)
+                    if existing and not force and has_valid:
+                        _summary_progress["results"].append({
+                            "chat_name": chat_name, "status": "skipped"
+                        })
+                        return
 
-                    await run_summarize(db, chat_id, progress=_summary_progress)
-                    _summary_progress["stage"] = "done"
+                    # 先生成新摘要（run_summarize 会 commit 一条新 SummaryReport）
+                    old_ids = [r.id for r in existing]
+                    await run_summarize(db, chat_id, progress=detail)
+
+                    # 生成成功后才删除旧的，确保失败时旧摘要不丢
+                    if old_ids:
+                        db.query(SummaryReport).filter(SummaryReport.id.in_(old_ids)).delete(synchronize_session=False)
+                        db.commit()
+
+                    _summary_progress["results"].append({
+                        "chat_name": chat_name, "status": "ok"
+                    })
                     logger.info(f"摘要生成完成: {chat_name}")
                 except Exception as e:
                     logger.warning(f"摘要生成失败({chat_name}): {e}")
-                    _summary_progress["stage"] = "error"
-                    _summary_progress["error"] = str(e)[:200]
+                    _summary_progress["results"].append({
+                        "chat_name": chat_name, "status": "error", "error": str(e)[:200]
+                    })
                     db.rollback()
-        finally:
-            _summary_progress["running"] = False
-            db.close()
+                finally:
+                    with _summary_lock:
+                        _summary_progress["completed"] += 1
+                        if chat_name in _summary_progress["active_chats"]:
+                            _summary_progress["active_chats"].remove(chat_name)
+                        _summary_progress["chat_details"].pop(chat_name, None)
+            finally:
+                db.close()
+
+    async def _run():
+        sem = asyncio.Semaphore(MAX_PARALLEL_SUMMARY)
+        with _summary_lock:
+            all_tasks = list(_summary_queue)
+            _summary_queue.clear()
+            _summary_progress["queued"] = 0
+
+        coros = [asyncio.create_task(_process_one(t, sem)) for t in all_tasks]
+        if coros:
+            await asyncio.gather(*coros)
+
+        _summary_progress["running"] = False
+        _summary_progress["active_chats"] = []
+        _summary_progress["chat_details"] = {}
+        _summary_progress["stage"] = "done"
 
     asyncio.run(_run())
 
@@ -100,7 +139,7 @@ def _summary_worker():
 
 @router.post("/summarize")
 def trigger_summarize(req: SummarizeRequest, db: Session = Depends(get_db)):
-    """触发摘要生成（后台执行）"""
+    """触发单个群聊摘要生成（后台执行）"""
     imp = db.query(Import).filter(Import.chat_id == req.chat_id).first()
     if not imp:
         raise HTTPException(404, "群聊未找到")
@@ -109,8 +148,30 @@ def trigger_summarize(req: SummarizeRequest, db: Session = Depends(get_db)):
     if existing and not req.force and not (existing.stale if existing.stale else False):
         return {"status": "exists", "message": "摘要已存在，设置 force=true 可重新生成"}
 
-    _enqueue_summary(req.chat_id, imp.chat_name, req.force)
+    _enqueue_summary([(req.chat_id, imp.chat_name, req.force)])
     return {"status": "started", "message": "摘要生成已加入队列"}
+
+
+@router.post("/summarize-all")
+def trigger_summarize_all(force: bool = False, db: Session = Depends(get_db)):
+    """批量生成所有已索引群聊的摘要。force=true 强制重新生成已存在的"""
+    # 只对已建好向量索引的群聊生成摘要
+    imports = db.query(Import).filter(Import.index_built == True).all()
+    if not imports:
+        raise HTTPException(400, "没有已索引的群聊")
+
+    tasks: list[tuple[str, str, bool]] = []
+    for imp in imports:
+        existing = db.query(SummaryReport).filter(SummaryReport.chat_id == imp.chat_id).first()
+        if existing and not force and not (existing.stale if existing.stale else False):
+            continue  # 已存在且未过期，跳过
+        tasks.append((imp.chat_id, imp.chat_name, force))
+
+    if not tasks:
+        return {"status": "exists", "message": "所有群聊摘要均已存在", "total": 0}
+
+    _enqueue_summary(tasks)
+    return {"status": "started", "total": len(tasks)}
 
 
 @router.get("/summary-progress")
