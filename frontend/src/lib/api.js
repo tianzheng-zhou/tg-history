@@ -16,6 +16,21 @@ export async function importChat(file) {
   return data;
 }
 
+export async function getIndexProgress() {
+  const { data } = await api.get("/index-progress");
+  return data;
+}
+
+export async function rebuildIndex(chatId) {
+  const { data } = await api.post(`/rebuild-index/${chatId}`);
+  return data;
+}
+
+export async function rebuildAllIndex(force = false) {
+  const { data } = await api.post(`/rebuild-index-all?force=${force}`);
+  return data;
+}
+
 export async function getChats() {
   const { data } = await api.get("/chats");
   return data;
@@ -42,6 +57,11 @@ export async function triggerSummarize(chatId, force = false) {
 
 export async function getSummaries(chatId) {
   const { data } = await api.get(`/summaries/${chatId}`);
+  return data;
+}
+
+export async function getSummaryProgress() {
+  const { data } = await api.get("/summary-progress");
   return data;
 }
 

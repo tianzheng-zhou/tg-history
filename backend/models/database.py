@@ -3,6 +3,7 @@ from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     Integer,
@@ -68,6 +69,7 @@ class Import(Base):
     imported_at = Column(DateTime, default=datetime.utcnow)
     message_count = Column(Integer, default=0)
     date_range = Column(String)  # "2024-01-01 ~ 2024-06-30"
+    index_built = Column(Boolean, default=False)  # 向量索引是否已构建
 
 
 class SummaryReport(Base):
@@ -79,6 +81,7 @@ class SummaryReport(Base):
     content = Column(Text)
     generated_at = Column(DateTime, default=datetime.utcnow)
     chunk_summaries = Column(Text)  # JSON: Map 阶段各段摘要
+    stale = Column(Boolean, default=False)  # 新数据导入后标记过期
 
 
 class QAHistory(Base):
@@ -124,9 +127,10 @@ def init_db():
     """创建所有表 + FTS5 虚拟表"""
     Base.metadata.create_all(bind=engine)
     with engine.connect() as conn:
+        # 用独立 FTS 表（非 content 同步），避免损坏
         conn.execute(text(
             "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts "
-            "USING fts5(text_plain, sender, content=messages, content_rowid=id)"
+            "USING fts5(text_plain, sender, chat_id UNINDEXED, msg_id UNINDEXED)"
         ))
         conn.commit()
 

@@ -32,7 +32,7 @@ async def add_documents(
     ids: list[str],
     texts: list[str],
     metadatas: list[dict] | None = None,
-    batch_size: int = 50,
+    batch_size: int = 10,
 ):
     """批量添加文档到向量索引"""
     collection = get_or_create_collection()
@@ -88,8 +88,38 @@ async def search_similar(
     return output
 
 
+MAX_CHUNK_CHARS = 2000
+OVERLAP_LINES = 3
+
+
+def _chunk_lines(lines: list[str], msg_ids: list[int]) -> list[tuple[str, list[int]]]:
+    """将过长的话题按字符数切分成多个 chunk，相邻 chunk 有少量重叠"""
+    chunks = []
+    cur_lines = []
+    cur_ids = []
+    cur_len = 0
+
+    for line, mid in zip(lines, msg_ids):
+        line_len = len(line) + 1  # +1 for newline
+        if cur_len + line_len > MAX_CHUNK_CHARS and cur_lines:
+            chunks.append(("\n".join(cur_lines), list(cur_ids)))
+            # 保留尾部几行作为下一个 chunk 的上文重叠
+            overlap = min(OVERLAP_LINES, len(cur_lines))
+            cur_lines = cur_lines[-overlap:]
+            cur_ids = cur_ids[-overlap:]
+            cur_len = sum(len(l) + 1 for l in cur_lines)
+        cur_lines.append(line)
+        cur_ids.append(mid)
+        cur_len += line_len
+
+    if cur_lines:
+        chunks.append(("\n".join(cur_lines), list(cur_ids)))
+
+    return chunks
+
+
 async def build_index_for_chat(db_session, chat_id: str):
-    """为指定群聊构建向量索引"""
+    """为指定群聊构建向量索引（大话题自动切分）"""
     from backend.models.database import Message, Topic
 
     # 按话题分组获取消息
@@ -109,7 +139,6 @@ async def build_index_for_chat(db_session, chat_id: str):
         if not msgs:
             continue
 
-        # 合并同一话题的消息为一个文档
         lines = []
         msg_ids = []
         senders = set()
@@ -124,20 +153,24 @@ async def build_index_for_chat(db_session, chat_id: str):
         if not lines:
             continue
 
-        doc_text = "\n".join(lines)
-        doc_id = f"{chat_id}_topic_{topic.id}"
+        participants = ", ".join(senders)
+        chunks = _chunk_lines(lines, msg_ids)
 
-        ids.append(doc_id)
-        texts.append(doc_text[:8000])  # 限制文档长度
-        metadatas.append({
-            "chat_id": chat_id,
-            "topic_id": topic.id,
-            "message_ids": str(msg_ids),
-            "participants": ", ".join(senders),
-            "start_date": topic.start_date.isoformat() if topic.start_date else "",
-            "end_date": topic.end_date.isoformat() if topic.end_date else "",
-            "message_count": len(msgs),
-        })
+        for ci, (chunk_text, chunk_ids) in enumerate(chunks):
+            doc_id = f"{chat_id}_topic_{topic.id}_c{ci}" if len(chunks) > 1 else f"{chat_id}_topic_{topic.id}"
+            ids.append(doc_id)
+            texts.append(chunk_text)
+            metadatas.append({
+                "chat_id": chat_id,
+                "topic_id": topic.id,
+                "chunk_index": ci,
+                "chunk_total": len(chunks),
+                "message_ids": str(chunk_ids),
+                "participants": participants,
+                "start_date": topic.start_date.isoformat() if topic.start_date else "",
+                "end_date": topic.end_date.isoformat() if topic.end_date else "",
+                "message_count": len(chunk_ids),
+            })
 
     if ids:
         await add_documents(ids, texts, metadatas)

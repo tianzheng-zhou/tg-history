@@ -2,6 +2,7 @@ import { NavLink, Outlet } from "react-router-dom";
 import {
   LayoutDashboard,
   Upload,
+  Database,
   FileText,
   MessageCircleQuestion,
   Settings,
@@ -10,6 +11,7 @@ import {
 const navItems = [
   { to: "/", icon: LayoutDashboard, label: "仪表盘" },
   { to: "/import", icon: Upload, label: "数据导入" },
+  { to: "/index", icon: Database, label: "索引管理" },
   { to: "/summary", icon: FileText, label: "摘要报告" },
   { to: "/qa", icon: MessageCircleQuestion, label: "智能问答" },
   { to: "/settings", icon: Settings, label: "设置" },

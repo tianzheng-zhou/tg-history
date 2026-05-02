@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { FileText, Loader2, RefreshCw } from "lucide-react";
-import { getChats, getSummaries, triggerSummarize } from "@/lib/api";
+import { getChats, getSummaries, getSummaryProgress, triggerSummarize } from "@/lib/api";
 
 const CATEGORIES = [
   { key: "full", label: "完整报告" },
@@ -12,13 +12,22 @@ const CATEGORIES = [
   { key: "opinion", label: "重要观点" },
 ];
 
+const STAGE_LABELS = {
+  map: "正在分析消息片段",
+  reduce: "正在合并生成报告",
+  done: "生成完成",
+  error: "生成失败",
+};
+
 export default function Summary() {
   const [chats, setChats] = useState([]);
   const [selectedChat, setSelectedChat] = useState(null);
   const [summaries, setSummaries] = useState([]);
   const [activeTab, setActiveTab] = useState("full");
   const [generating, setGenerating] = useState(false);
+  const [progress, setProgress] = useState(null);
   const [error, setError] = useState(null);
+  const pollRef = useRef(null);
 
   useEffect(() => {
     getChats().then((data) => {
@@ -33,18 +42,53 @@ export default function Summary() {
     }
   }, [selectedChat]);
 
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
+  const startPolling = useCallback(() => {
+    stopPolling();
+    setGenerating(true);
+    pollRef.current = setInterval(async () => {
+      try {
+        const prog = await getSummaryProgress();
+        setProgress(prog);
+        if (!prog.running) {
+          stopPolling();
+          setGenerating(false);
+          if (selectedChat) {
+            getSummaries(selectedChat).then(setSummaries).catch(() => {});
+          }
+        }
+      } catch {
+        stopPolling();
+        setGenerating(false);
+      }
+    }, 2000);
+  }, [stopPolling, selectedChat]);
+
+  useEffect(() => {
+    getSummaryProgress().then((prog) => {
+      if (prog.running) {
+        setProgress(prog);
+        setGenerating(true);
+        startPolling();
+      }
+    }).catch(() => {});
+    return stopPolling;
+  }, [startPolling, stopPolling]);
+
   const handleGenerate = async (force = false) => {
     if (!selectedChat) return;
-    setGenerating(true);
     setError(null);
     try {
       await triggerSummarize(selectedChat, force);
-      const data = await getSummaries(selectedChat);
-      setSummaries(data);
+      startPolling();
     } catch (err) {
       setError(err.response?.data?.detail || "摘要生成失败");
-    } finally {
-      setGenerating(false);
     }
   };
 
@@ -94,6 +138,51 @@ export default function Summary() {
       {error && (
         <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-4 text-sm text-red-700">
           {error}
+        </div>
+      )}
+
+      {/* 生成进度 */}
+      {generating && progress && progress.running && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
+          <div className="flex items-center gap-2 mb-2">
+            <Loader2 size={16} className="text-blue-600 animate-spin" />
+            <span className="font-medium text-blue-800 text-sm">
+              {progress.chat_name && `${progress.chat_name} · `}
+              {STAGE_LABELS[progress.stage] || progress.stage}
+              {progress.stage === "map" && progress.map_total > 0 &&
+                ` (${progress.map_done}/${progress.map_total})`}
+            </span>
+          </div>
+          {progress.stage === "map" && progress.map_total > 0 && (
+            <div className="w-full bg-blue-100 rounded-full h-2">
+              <div
+                className="bg-blue-500 h-2 rounded-full transition-all duration-500"
+                style={{ width: `${(progress.map_done / progress.map_total) * 100}%` }}
+              />
+            </div>
+          )}
+          {progress.stage === "reduce" && (
+            <div className="w-full bg-blue-100 rounded-full h-2">
+              <div className="bg-blue-500 h-2 rounded-full animate-pulse w-full" />
+            </div>
+          )}
+          {progress.queued > 0 && (
+            <p className="text-xs text-blue-600 mt-1">排队中: {progress.queued}</p>
+          )}
+        </div>
+      )}
+
+      {/* 过期提醒 */}
+      {summaries.some((s) => s.stale) && (
+        <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 text-sm text-amber-800 flex items-center justify-between">
+          <span>有新数据导入，当前摘要可能已过期。建议重新生成。</span>
+          <button
+            onClick={() => handleGenerate(true)}
+            disabled={generating}
+            className="text-amber-800 underline hover:no-underline text-sm font-medium"
+          >
+            重新生成
+          </button>
         </div>
       )}
 

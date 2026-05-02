@@ -96,8 +96,8 @@ async def _reduce_summarize(summaries: list[str]) -> str:
     return result
 
 
-async def run_summarize(db: Session, chat_id: str) -> dict[str, str]:
-    """执行完整的 Map-Reduce 摘要流程"""
+async def run_summarize(db: Session, chat_id: str, progress: dict | None = None) -> dict[str, str]:
+    """执行完整的 Map-Reduce 摘要流程，可选 progress dict 实时上报进度"""
     messages = (
         db.query(Message)
         .filter(Message.chat_id == chat_id)
@@ -110,12 +110,22 @@ async def run_summarize(db: Session, chat_id: str) -> dict[str, str]:
 
     # Map 阶段
     chunks = _chunk_messages(messages)
+    if progress is not None:
+        progress["map_total"] = len(chunks)
+        progress["map_done"] = 0
+        progress["stage"] = "map"
+
     chunk_summaries = []
     for chunk in chunks:
         summary = await _map_summarize(chunk)
         chunk_summaries.append(summary)
+        if progress is not None:
+            progress["map_done"] += 1
 
     # Reduce 阶段
+    if progress is not None:
+        progress["stage"] = "reduce"
+
     full_report = await _reduce_summarize(chunk_summaries)
 
     # 保存为单个报告（category="full"）

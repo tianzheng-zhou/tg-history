@@ -76,22 +76,13 @@ def parse_message(raw: dict, chat_id: str) -> dict | None:
     }
 
 
-def parse_export_file(file_path: str | Path) -> dict:
-    """解析整个 Telegram 导出文件。
-
-    Returns:
-        {
-            "chat_name": str,
-            "chat_id": str,
-            "messages": list[dict],
-            "date_range": str,
-        }
-    """
-    with open(file_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
+def _parse_single_chat(data: dict) -> dict | None:
+    """解析单个群聊数据块，返回标准化结果。"""
     chat_name = data.get("name", "Unknown")
     chat_id = str(data.get("id", ""))
+
+    if not chat_id:
+        return None
 
     raw_messages = data.get("messages", [])
     messages = []
@@ -99,6 +90,9 @@ def parse_export_file(file_path: str | Path) -> dict:
         parsed = parse_message(raw, chat_id)
         if parsed:
             messages.append(parsed)
+
+    if not messages:
+        return None
 
     # 计算时间范围
     dates = [m["date"] for m in messages if m.get("date")]
@@ -115,3 +109,43 @@ def parse_export_file(file_path: str | Path) -> dict:
         "messages": messages,
         "date_range": date_range,
     }
+
+
+def parse_export_file(file_path: str | Path) -> list[dict]:
+    """解析 Telegram 导出文件，支持两种格式：
+
+    1. 单群聊导出: {"name": "...", "id": ..., "messages": [...]}
+    2. 全量导出:   {"chats": {"list": [{"name": "...", ...}, ...]}}
+
+    Returns:
+        list[dict] — 每个元素: {"chat_name", "chat_id", "messages", "date_range"}
+    """
+    with open(file_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    results = []
+
+    # 检测全量导出格式: {"chats": {"list": [...]}}
+    chats_data = data.get("chats")
+    if isinstance(chats_data, dict) and "list" in chats_data:
+        chat_list = chats_data["list"]
+        for chat in chat_list:
+            parsed = _parse_single_chat(chat)
+            if parsed:
+                results.append(parsed)
+        return results
+
+    # 也支持 {"chats": {"list": [...]}} 的变体: 顶层就是 list
+    if isinstance(chats_data, list):
+        for chat in chats_data:
+            parsed = _parse_single_chat(chat)
+            if parsed:
+                results.append(parsed)
+        return results
+
+    # 单群聊导出格式
+    parsed = _parse_single_chat(data)
+    if parsed:
+        results.append(parsed)
+
+    return results

@@ -19,6 +19,7 @@ class ChatInfo(BaseModel):
     imported_at: datetime
     message_count: int
     date_range: str
+    index_built: bool = False
 
 
 class ChatStats(BaseModel):
@@ -69,6 +70,7 @@ class SummaryItem(BaseModel):
     category: str
     content: str
     generated_at: datetime
+    stale: bool = False
 
 
 # ---------- QA ----------
