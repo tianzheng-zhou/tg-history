@@ -6,6 +6,7 @@ import {
   AlertTriangle,
   Loader2,
   Clock,
+  Zap,
 } from "lucide-react";
 import { getChats, getIndexProgress, rebuildIndex, rebuildAllIndex } from "@/lib/api";
 
@@ -59,14 +60,16 @@ export default function IndexManager() {
     return stopPolling;
   }, [loadChats, startPolling, stopPolling]);
 
-  const handleRebuild = async (chatId) => {
+  const handleRebuild = async (chatId, force = false) => {
+    if (force && !window.confirm("强制全量重建会清空所有旧话题重新划分（token 开销较大），确定继续？")) return;
     try {
-      await rebuildIndex(chatId);
+      await rebuildIndex(chatId, force);
       startPolling();
     } catch {}
   };
 
   const handleRebuildAll = async (force = false) => {
+    if (force && !window.confirm("强制全量重建所有群聊会消耗大量 token。\n请仅在切换了 embedding model 或数据损坏时使用，确定继续？")) return;
     try {
       await rebuildAllIndex(force);
       startPolling();
@@ -86,18 +89,22 @@ export default function IndexManager() {
               onClick={() => handleRebuildAll(false)}
               disabled={rebuilding}
               className="flex items-center gap-2 bg-amber-600 text-white px-4 py-2 rounded-md text-sm hover:bg-amber-700 transition-colors disabled:opacity-50"
+              title="增量更新待索引的群聊（仅处理新消息）"
             >
               <RefreshCw size={16} className={rebuilding ? "animate-spin" : ""} />
               构建过期 ({staleChats.length})
+              <span className="text-[10px] bg-amber-700/40 rounded px-1">增量</span>
             </button>
           )}
           <button
             onClick={() => handleRebuildAll(true)}
             disabled={rebuilding || chats.length === 0}
             className="flex items-center gap-2 border border-border px-4 py-2 rounded-md text-sm hover:bg-secondary transition-colors disabled:opacity-50"
+            title="强制全量重建（token 开销大，慢）"
           >
             <RefreshCw size={16} className={rebuilding ? "animate-spin" : ""} />
             全部重建
+            <span className="text-[10px] bg-secondary rounded px-1">全量</span>
           </button>
         </div>
       </div>
@@ -199,14 +206,25 @@ export default function IndexManager() {
                     {chat.date_range}
                   </p>
                 </div>
-                <button
-                  onClick={() => handleRebuild(chat.chat_id)}
-                  disabled={rebuilding}
-                  className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50 transition-colors"
-                >
-                  <RefreshCw size={12} />
-                  构建索引
-                </button>
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => handleRebuild(chat.chat_id, false)}
+                    disabled={rebuilding}
+                    className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50 transition-colors"
+                    title="增量构建（仅处理新消息）"
+                  >
+                    <RefreshCw size={12} />
+                    构建索引
+                  </button>
+                  <button
+                    onClick={() => handleRebuild(chat.chat_id, true)}
+                    disabled={rebuilding}
+                    className="flex items-center text-xs p-1.5 rounded-md border border-amber-300 text-amber-700 hover:bg-amber-100 disabled:opacity-50 transition-colors"
+                    title="强制全量重建（token 开销大）"
+                  >
+                    <Zap size={12} />
+                  </button>
+                </div>
               </div>
             ))}
           </div>
@@ -233,14 +251,25 @@ export default function IndexManager() {
                     {chat.date_range}
                   </p>
                 </div>
-                <button
-                  onClick={() => handleRebuild(chat.chat_id)}
-                  disabled={rebuilding}
-                  className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md border border-border text-muted-foreground hover:bg-secondary disabled:opacity-50 transition-colors"
-                >
-                  <RefreshCw size={12} />
-                  重建
-                </button>
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => handleRebuild(chat.chat_id, false)}
+                    disabled={rebuilding}
+                    className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md border border-border text-muted-foreground hover:bg-secondary disabled:opacity-50 transition-colors"
+                    title="增量重建（仅处理新消息）"
+                  >
+                    <RefreshCw size={12} />
+                    重建
+                  </button>
+                  <button
+                    onClick={() => handleRebuild(chat.chat_id, true)}
+                    disabled={rebuilding}
+                    className="flex items-center text-xs p-1.5 rounded-md border border-border text-muted-foreground hover:bg-secondary hover:text-foreground disabled:opacity-50 transition-colors"
+                    title="强制全量重建（token 开销大）"
+                  >
+                    <Zap size={12} />
+                  </button>
+                </div>
               </div>
             ))}
           </div>

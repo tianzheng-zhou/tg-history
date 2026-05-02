@@ -35,7 +35,10 @@ from backend.models.schemas import (
     WatchedFolderInfo,
 )
 from backend.services.parser import parse_export_file
-from backend.services.embedding import build_index_for_chat
+from backend.services.embedding import (
+    build_index_for_chat,
+    build_index_for_chat_incremental,
+)
 from backend.services.folder_scanner import (
     diff_pending,
     find_result_jsons,
@@ -44,7 +47,7 @@ from backend.services.folder_scanner import (
     validate_folder,
 )
 from backend.services.main_loop import schedule_on_main_loop
-from backend.services.topic_builder import build_topics
+from backend.services.topic_builder import build_topics, build_topics_incremental
 
 logger = logging.getLogger(__name__)
 
@@ -151,27 +154,39 @@ def _import_single_chat(parsed: dict, db: Session) -> ImportResult:
 
 
 _index_lock = threading.Lock()
-_index_queue: list[str] = []
+_index_queue: list[tuple[str, bool]] = []  # [(chat_id, force)]
 _index_progress: dict = {
     "running": False,
     "total": 0,
     "completed": 0,
     "current_chat": "",
     "active_chats": [],
-    "chat_details": {},       # chat_name → {stage, topic_done, topic_total, index_done, index_total}
+    "chat_details": {},       # chat_name → {stage, topic_done, topic_total, index_done, index_total, mode}
     "results": [],
 }
 
 MAX_PARALLEL = 16  # 群聊级并发上限（实际 LLM/embed 并发由 llm_adapter 全局 semaphore 控制）
 
 
-def _enqueue_index(chat_ids: list[str]):
+def _enqueue_index(chat_ids: list[str], force: bool = False):
+    """把 chat_ids 入队等待索引构建。
+
+    - force=False（默认）：走增量路径（build_topics_incremental → 只处理 topic_id IS NULL 的新消息）
+    - force=True：走全量路径（build_topics → 清空重建）
+
+    同一 chat_id 若已在队列里：force=True 会覆盖原先的 force=False（就高不就低）。
+    """
     with _index_lock:
-        existing = set(_index_queue)
+        existing = {cid: i for i, (cid, _) in enumerate(_index_queue)}
         for cid in chat_ids:
-            if cid not in existing:
-                _index_queue.append(cid)
-                existing.add(cid)
+            if cid in existing:
+                if force:
+                    # 覆盖为全量
+                    idx = existing[cid]
+                    _index_queue[idx] = (cid, True)
+            else:
+                _index_queue.append((cid, force))
+                existing[cid] = len(_index_queue) - 1
 
         if _index_progress["running"]:
             _index_progress["total"] = _index_progress["completed"] + len(_index_queue)
@@ -192,28 +207,43 @@ async def _index_runner():
         _index_progress["chat_details"] = {}
         _index_progress["results"] = []
 
-    async def _process_one(chat_id: str, sem: asyncio.Semaphore):
+    async def _process_one(chat_id: str, force: bool, sem: asyncio.Semaphore):
         async with sem:
             db = SessionLocal()
             try:
                 imp = db.query(Import).filter(Import.chat_id == chat_id).first()
                 chat_name = imp.chat_name if imp else chat_id
 
+                mode = "force" if force else "incremental"
                 detail = {"stage": "topics", "topic_done": 0, "topic_total": 0,
-                          "index_done": 0, "index_total": 0}
+                          "index_done": 0, "index_total": 0, "mode": mode}
                 with _index_lock:
                     _index_progress["active_chats"].append(chat_name)
                     _index_progress["chat_details"][chat_name] = detail
                     _index_progress["current_chat"] = chat_name
 
                 try:
-                    logger.info(f"话题构建中: {chat_name}")
+                    logger.info(f"话题构建中 [{mode}]: {chat_name}")
                     detail["stage"] = "topics"
-                    await build_topics(db, chat_id, progress=detail)
 
-                    logger.info(f"向量索引构建中: {chat_name}")
-                    detail["stage"] = "indexing"
-                    indexed = await build_index_for_chat(db, chat_id, progress=detail)
+                    if force:
+                        await build_topics(db, chat_id, progress=detail)
+                        logger.info(f"向量索引构建中 [全量]: {chat_name}")
+                        detail["stage"] = "indexing"
+                        indexed = await build_index_for_chat(
+                            db, chat_id, progress=detail
+                        )
+                    else:
+                        _total, changed_topic_ids = await build_topics_incremental(
+                            db, chat_id, progress=detail
+                        )
+                        logger.info(
+                            f"向量索引构建中 [增量 {len(changed_topic_ids)} topics]: {chat_name}"
+                        )
+                        detail["stage"] = "indexing"
+                        indexed = await build_index_for_chat_incremental(
+                            db, chat_id, changed_topic_ids, progress=detail
+                        )
 
                     if imp:
                         imp.index_built = True
@@ -223,8 +253,9 @@ async def _index_runner():
                         "chat_name": chat_name,
                         "status": "ok",
                         "topics": indexed,
+                        "mode": mode,
                     })
-                    logger.info(f"构建完成: {chat_name} ({indexed} chunks)")
+                    logger.info(f"构建完成 [{mode}]: {chat_name} ({indexed} chunks)")
                 except Exception as e:
                     logger.warning(f"构建失败({chat_name}): {e}")
                     _index_progress["results"].append({
@@ -257,11 +288,14 @@ async def _index_runner():
 
     sem = asyncio.Semaphore(MAX_PARALLEL)
     with _index_lock:
-        all_ids = list(_index_queue)
+        all_items = list(_index_queue)  # [(chat_id, force), ...]
         _index_queue.clear()
-        _index_progress["total"] = _index_progress["completed"] + len(all_ids)
+        _index_progress["total"] = _index_progress["completed"] + len(all_items)
 
-    tasks = [asyncio.create_task(_process_one(cid, sem)) for cid in all_ids]
+    tasks = [
+        asyncio.create_task(_process_one(cid, force, sem))
+        for cid, force in all_items
+    ]
     if tasks:
         await asyncio.gather(*tasks)
 
@@ -319,18 +353,30 @@ def get_index_progress():
 
 
 @router.post("/rebuild-index/{chat_id}")
-def rebuild_single_index(chat_id: str, db: Session = Depends(get_db)):
-    """重建单个群聊的向量索引"""
+def rebuild_single_index(
+    chat_id: str,
+    force: bool = False,
+    db: Session = Depends(get_db),
+):
+    """重建单个群聊的向量索引。
+
+    - force=false（默认）：增量 —— 只处理 topic_id IS NULL 的新消息
+    - force=true：全量 —— 清空所有话题和向量重新构建
+    """
     imp = db.query(Import).filter(Import.chat_id == chat_id).first()
     if not imp:
         raise HTTPException(404, "群聊未找到")
-    _enqueue_index([chat_id])
-    return {"status": "started", "chat_name": imp.chat_name}
+    _enqueue_index([chat_id], force=force)
+    return {"status": "started", "chat_name": imp.chat_name, "mode": "force" if force else "incremental"}
 
 
 @router.post("/rebuild-index-all")
 def rebuild_all_index(force: bool = False, db: Session = Depends(get_db)):
-    """重建向量索引。默认只重建过期的，force=true 重建所有"""
+    """重建向量索引。
+
+    - force=false（默认）：只对 index_built=False 的群聊做增量构建
+    - force=true：对所有群聊做全量重建（慎用，token 开销巨大）
+    """
     query = db.query(Import)
     if not force:
         query = query.filter(Import.index_built == False)
@@ -338,8 +384,12 @@ def rebuild_all_index(force: bool = False, db: Session = Depends(get_db)):
     if not imports:
         raise HTTPException(400, "没有需要重建索引的群聊")
     chat_ids = [imp.chat_id for imp in imports]
-    _enqueue_index(chat_ids)
-    return {"status": "started", "total": len(chat_ids)}
+    _enqueue_index(chat_ids, force=force)
+    return {
+        "status": "started",
+        "total": len(chat_ids),
+        "mode": "force" if force else "incremental",
+    }
 
 
 @router.get("/chats", response_model=list[ChatInfo])

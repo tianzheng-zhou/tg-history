@@ -4,10 +4,12 @@ import { getSettings, updateSettings } from "@/lib/api";
 
 const MODEL_OPTIONS = {
   llm: [
+    "qwen3.5-flash",
     "qwen3.5-plus",
     "qwen3.6-plus",
   ],
   llm_qa: [
+    "qwen3.5-flash",
     "qwen3.5-plus",
     "qwen3.6-plus",
     "kimi-k2.6",

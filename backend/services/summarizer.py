@@ -113,6 +113,8 @@ async def _reduce_summarize(summaries: list[str]) -> str:
         messages=[{"role": "user", "content": prompt}],
         model=settings.llm_model_reduce,
         temperature=0.3,
+        # 防御性关思考：用户若切到 flash 系列做 reduce，避免被默认开思考吃额外 token
+        enable_thinking=False,
     )
     return result
 

@@ -21,8 +21,8 @@ export async function getIndexProgress() {
   return data;
 }
 
-export async function rebuildIndex(chatId) {
-  const { data } = await api.post(`/rebuild-index/${chatId}`);
+export async function rebuildIndex(chatId, force = false) {
+  const { data } = await api.post(`/rebuild-index/${chatId}?force=${force}`);
   return data;
 }
 

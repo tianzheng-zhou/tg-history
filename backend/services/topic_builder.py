@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from collections import defaultdict
+from datetime import datetime
 
 from sqlalchemy.orm import Session
 
@@ -250,6 +251,260 @@ async def _llm_merge_check(results: list[dict], check_indices: list[int]) -> Non
         if idx + 1 < len(results):
             results[idx]["messages"].extend(results[idx + 1]["messages"])
             del results[idx + 1]
+
+
+MERGE_BOUNDARY_PROMPT = """判断以下两段相邻群聊消息是否属于**同一个话题**。
+
+片段A 标题: {title_a}
+片段A 最后几条消息:
+{tail_a}
+
+---
+
+片段B 标题: {title_b}
+片段B 开头几条消息:
+{head_b}
+
+这两个片段是否在讨论同一个话题？只回答 "是" 或 "否"，不要其他内容。"""
+
+
+async def _check_boundary_merge(
+    last_old_topic_msgs: list[Message],
+    last_old_title: str,
+    first_new_msgs: list[Message],
+    first_new_title: str,
+) -> bool:
+    """判断"最后一个旧话题"与"第一组新消息"是否同一话题（1 次 LLM 调用）。"""
+    if not last_old_topic_msgs or not first_new_msgs:
+        return False
+    prompt = MERGE_BOUNDARY_PROMPT.format(
+        title_a=last_old_title or "(无标题)",
+        tail_a=_format_snippet(last_old_topic_msgs[-8:]),
+        title_b=first_new_title or "(无标题)",
+        head_b=_format_snippet(first_new_msgs[:8]),
+    )
+    try:
+        resp = await llm_adapter.chat(
+            messages=[{"role": "user", "content": prompt}],
+            model=settings.llm_model_map,
+            temperature=0.0,
+            enable_thinking=False,
+        )
+        return "是" in resp.strip()[:5]
+    except Exception as e:
+        logger.warning(f"边界合并检查失败: {e}")
+        return False
+
+
+async def build_topics_incremental(
+    db: Session, chat_id: str, progress: dict | None = None
+) -> tuple[int, set[int]]:
+    """增量构建话题。
+
+    - 仅对 ``topic_id IS NULL`` 的新消息做处理：
+      - 能通过 reply_to_id 挂到旧 topic 的，直接挂上去
+      - 剩余孤立新消息走 _llm_split（只切新消息，不动旧消息）
+      - 第一批新 topic 与最后一个旧 topic 做 1 次 merge_check，避免边界切断
+    - 旧 topic 不删、不重切；只把新增的 message 挂进去并刷新 end_date / message_count
+
+    返回 ``(total_topic_count, changed_topic_ids)``。
+    若没有任何旧 topic（首次构建），自动回退到全量 ``build_topics``。
+    """
+    # 0. 没有任何旧 topic → 走全量
+    has_existing_topic = (
+        db.query(Topic).filter(Topic.chat_id == chat_id).limit(1).first() is not None
+    )
+    if not has_existing_topic:
+        total = await build_topics(db, chat_id, progress)
+        # 全量重建后，所有 topic 都视为 "changed"，调用方据此重 embed
+        all_ids = set(
+            row[0]
+            for row in db.query(Topic.id).filter(Topic.chat_id == chat_id).all()
+        )
+        return total, all_ids
+
+    # 1. 找新消息（topic_id IS NULL）
+    new_msgs = (
+        db.query(Message)
+        .filter(Message.chat_id == chat_id, Message.topic_id.is_(None))
+        .order_by(Message.date)
+        .all()
+    )
+    if not new_msgs:
+        # 没有任何变更，调用方应跳过 embedding 步骤
+        total = db.query(Topic).filter(Topic.chat_id == chat_id).count()
+        return total, set()
+
+    # 加载该 chat 所有 messages 用于 reply chain 解析
+    all_msgs = (
+        db.query(Message).filter(Message.chat_id == chat_id).all()
+    )
+    msg_map: dict[int, Message] = {m.id: m for m in all_msgs}
+
+    changed_topic_ids: set[int] = set()
+
+    # 2. 通过 reply chain 把新消息挂到旧 topic
+    def _resolve_topic_via_reply(m: Message, depth: int = 0) -> int | None:
+        """沿 reply_to_id 向上找到第一个有 topic_id 的祖先，返回其 topic_id。"""
+        if depth > 32:
+            return None  # 防环
+        if not m.reply_to_id or m.reply_to_id not in msg_map:
+            return None
+        parent = msg_map[m.reply_to_id]
+        if parent.topic_id is not None:
+            return parent.topic_id
+        return _resolve_topic_via_reply(parent, depth + 1)
+
+    unassigned: list[Message] = []
+    topic_dirty: dict[int, dict] = {}  # topic_id → {count_added, max_date}
+
+    for m in new_msgs:
+        attached_topic_id = _resolve_topic_via_reply(m)
+        if attached_topic_id is not None:
+            m.topic_id = attached_topic_id
+            changed_topic_ids.add(attached_topic_id)
+            d = topic_dirty.setdefault(
+                attached_topic_id, {"count_added": 0, "max_date": None}
+            )
+            d["count_added"] += 1
+            if m.date and (d["max_date"] is None or m.date > d["max_date"]):
+                d["max_date"] = m.date
+        else:
+            unassigned.append(m)
+
+    # 把挂到旧 topic 的统计写回 Topic 行
+    for tid, d in topic_dirty.items():
+        topic = db.query(Topic).filter(Topic.id == tid).first()
+        if topic:
+            topic.message_count = (topic.message_count or 0) + d["count_added"]
+            if d["max_date"] and (
+                topic.end_date is None or d["max_date"] > topic.end_date
+            ):
+                topic.end_date = d["max_date"]
+
+    # 3. 对孤立新消息内部先做小型 reply-chain 分组（new ↔ new）
+    if unassigned:
+        new_msg_ids = {m.id for m in unassigned}
+        new_reply_root: dict[int, int] = {}
+        for m in unassigned:
+            cur = m
+            visited = set()
+            while (
+                cur.reply_to_id
+                and cur.reply_to_id in msg_map
+                and cur.reply_to_id in new_msg_ids
+                and cur.id not in visited
+            ):
+                visited.add(cur.id)
+                cur = msg_map[cur.reply_to_id]
+            if cur.id != m.id:
+                new_reply_root[m.id] = cur.id
+
+        reply_groups: dict[int, list[Message]] = defaultdict(list)
+        true_orphan: list[Message] = []
+        for m in unassigned:
+            root = new_reply_root.get(m.id)
+            if root is not None:
+                reply_groups[root].append(m)
+            elif any(
+                x.reply_to_id == m.id and x.id in new_msg_ids for x in unassigned
+            ):
+                reply_groups[m.id].append(m)
+            else:
+                true_orphan.append(m)
+
+        # 4. 对真正孤立的消息走 _llm_split（仅新消息）
+        semantic_groups = (
+            await _llm_split(true_orphan, progress) if true_orphan else []
+        )
+
+        # 5. last-topic merge_check：把第一个 semantic_group 尝试并入"最后一个旧 topic"
+        new_groups_combined: list[dict] = []
+        for root_id, msgs in reply_groups.items():
+            new_groups_combined.append({"title": None, "messages": msgs})
+        new_groups_combined.extend(semantic_groups)
+
+        # 按时间排序，找最早的新 group
+        if new_groups_combined:
+            new_groups_combined.sort(
+                key=lambda g: min(
+                    (m.date for m in g["messages"] if m.date),
+                    default=datetime.max,
+                )
+            )
+            first_new_group = new_groups_combined[0]
+            # 找最后一个未被 changed 标记的旧 topic
+            old_topic_query = db.query(Topic).filter(Topic.chat_id == chat_id)
+            if changed_topic_ids:
+                old_topic_query = old_topic_query.filter(
+                    Topic.id.notin_(changed_topic_ids)
+                )
+            last_old_topic = old_topic_query.order_by(
+                Topic.end_date.desc().nullslast()
+            ).first()
+
+            if last_old_topic is not None:
+                last_old_msgs = (
+                    db.query(Message)
+                    .filter(Message.topic_id == last_old_topic.id)
+                    .order_by(Message.date)
+                    .all()
+                )
+                if progress is not None:
+                    # 边界 merge_check 也算一次 LLM 步骤
+                    progress["topic_total"] = (
+                        progress.get("topic_total") or 0
+                    ) + 1
+                merged = await _check_boundary_merge(
+                    last_old_msgs,
+                    last_old_topic.summary or "",
+                    first_new_group["messages"],
+                    first_new_group.get("title") or "",
+                )
+                if progress is not None:
+                    progress["topic_done"] = (
+                        progress.get("topic_done") or 0
+                    ) + 1
+                if merged:
+                    for m in first_new_group["messages"]:
+                        m.topic_id = last_old_topic.id
+                    last_old_topic.message_count = (
+                        last_old_topic.message_count or 0
+                    ) + len(first_new_group["messages"])
+                    dates = [m.date for m in first_new_group["messages"] if m.date]
+                    if dates and (
+                        last_old_topic.end_date is None
+                        or max(dates) > last_old_topic.end_date
+                    ):
+                        last_old_topic.end_date = max(dates)
+                    changed_topic_ids.add(last_old_topic.id)
+                    new_groups_combined = new_groups_combined[1:]
+
+        # 6. 创建新 Topic 行
+        for group in new_groups_combined:
+            group_msgs = group["messages"]
+            if not group_msgs:
+                continue
+            dates = [m.date for m in group_msgs if m.date]
+            participants = set(m.sender for m in group_msgs if m.sender)
+            topic = Topic(
+                chat_id=chat_id,
+                root_message_id=None,
+                start_date=min(dates) if dates else None,
+                end_date=max(dates) if dates else None,
+                participant_count=len(participants),
+                message_count=len(group_msgs),
+                summary=group.get("title"),
+            )
+            db.add(topic)
+            db.flush()
+            for m in group_msgs:
+                m.topic_id = topic.id
+            changed_topic_ids.add(topic.id)
+
+    db.commit()
+    total = db.query(Topic).filter(Topic.chat_id == chat_id).count()
+    return total, changed_topic_ids
 
 
 async def build_topics(db: Session, chat_id: str, progress: dict | None = None) -> int:

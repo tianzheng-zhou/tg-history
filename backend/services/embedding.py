@@ -130,16 +130,15 @@ def _chunk_lines(lines: list[str], msg_ids: list[int]) -> list[tuple[str, list[i
     return chunks
 
 
-async def build_index_for_chat(db_session, chat_id: str, progress: dict | None = None):
-    """为指定群聊构建向量索引（大话题自动切分）"""
-    from backend.models.database import Message, Topic
+def _collect_topic_chunks(
+    db_session, chat_id: str, topics: list,
+) -> tuple[list[str], list[str], list[dict]]:
+    """从给定 topic 列表生成 (ids, texts, metadatas)。供全量/增量复用。"""
+    from backend.models.database import Message
 
-    # 按话题分组获取消息
-    topics = db_session.query(Topic).filter(Topic.chat_id == chat_id).all()
-
-    ids = []
-    texts = []
-    metadatas = []
+    ids: list[str] = []
+    texts: list[str] = []
+    metadatas: list[dict] = []
 
     for topic in topics:
         msgs = (
@@ -151,9 +150,9 @@ async def build_index_for_chat(db_session, chat_id: str, progress: dict | None =
         if not msgs:
             continue
 
-        lines = []
-        msg_ids = []
-        senders = set()
+        lines: list[str] = []
+        msg_ids: list[int] = []
+        senders: set[str] = set()
         for m in msgs:
             if m.text_plain:
                 date_str = m.date.strftime("%Y-%m-%d %H:%M") if m.date else ""
@@ -169,7 +168,11 @@ async def build_index_for_chat(db_session, chat_id: str, progress: dict | None =
         chunks = _chunk_lines(lines, msg_ids)
 
         for ci, (chunk_text, chunk_ids) in enumerate(chunks):
-            doc_id = f"{chat_id}_topic_{topic.id}_c{ci}" if len(chunks) > 1 else f"{chat_id}_topic_{topic.id}"
+            doc_id = (
+                f"{chat_id}_topic_{topic.id}_c{ci}"
+                if len(chunks) > 1
+                else f"{chat_id}_topic_{topic.id}"
+            )
             ids.append(doc_id)
             texts.append(chunk_text)
             metadatas.append({
@@ -184,9 +187,112 @@ async def build_index_for_chat(db_session, chat_id: str, progress: dict | None =
                 "message_count": len(chunk_ids),
             })
 
+    return ids, texts, metadatas
+
+
+def _delete_chunks_for_topics(chat_id: str, topic_ids: set[int]) -> None:
+    """从 ChromaDB 删除指定 chat + topic_ids 的所有 chunks。
+
+    使用 metadata where 过滤；ChromaDB 0.4+ 支持 ``$and`` 与 ``$in``。
+    出错时降级为按整 chat 删除（最坏情况下也不会留脏向量）。
+    """
+    if not topic_ids:
+        return
+    collection = get_or_create_collection()
+    topic_id_list = list(topic_ids)
+    try:
+        if len(topic_id_list) == 1:
+            collection.delete(where={
+                "$and": [
+                    {"chat_id": chat_id},
+                    {"topic_id": topic_id_list[0]},
+                ]
+            })
+        else:
+            collection.delete(where={
+                "$and": [
+                    {"chat_id": chat_id},
+                    {"topic_id": {"$in": topic_id_list}},
+                ]
+            })
+    except Exception as e:
+        # 兜底：删整个 chat 的旧 chunks（之后 build_index_for_chat 会重新写入完整索引）
+        import logging
+        logging.getLogger(__name__).warning(
+            "按 topic_id 删除失败，降级到 chat 级清空: %s", e
+        )
+        try:
+            collection.delete(where={"chat_id": chat_id})
+        except Exception as e2:
+            logging.getLogger(__name__).error("chat 级清空也失败: %s", e2)
+            raise
+
+
+async def build_index_for_chat_incremental(
+    db_session,
+    chat_id: str,
+    changed_topic_ids: set[int],
+    progress: dict | None = None,
+) -> int:
+    """仅对 changed_topic_ids 重新切 chunk + 重新 embed。
+
+    - changed_topic_ids 为空：什么都不做（旧向量保留），返回 0
+    - 否则先按 topic_id 删除 ChromaDB 里这些 topic 的旧 chunks，再重新写入
+    - 返回本次写入的 chunk 数量
+    """
+    if not changed_topic_ids:
+        if progress is not None:
+            progress["index_total"] = 0
+            progress["index_done"] = 0
+        return 0
+
+    from backend.models.database import Topic
+
+    topics = (
+        db_session.query(Topic)
+        .filter(Topic.chat_id == chat_id, Topic.id.in_(changed_topic_ids))
+        .all()
+    )
+
+    ids, texts, metadatas = _collect_topic_chunks(db_session, chat_id, topics)
+
     if progress is not None:
         progress["index_total"] = len(ids)
         progress["index_done"] = 0
+
+    # 先删旧的（按 topic_id 精确删除，未变 topic 的向量保持不动）
+    _delete_chunks_for_topics(chat_id, changed_topic_ids)
+
+    if ids:
+        await add_documents(ids, texts, metadatas, progress=progress)
+
+    return len(ids)
+
+
+async def build_index_for_chat(db_session, chat_id: str, progress: dict | None = None):
+    """为指定群聊构建向量索引（大话题自动切分）。
+
+    全量重建：先清空该 chat 的所有旧 chunks，再重新写入。
+    """
+    from backend.models.database import Topic
+
+    topics = db_session.query(Topic).filter(Topic.chat_id == chat_id).all()
+    ids, texts, metadatas = _collect_topic_chunks(db_session, chat_id, topics)
+
+    if progress is not None:
+        progress["index_total"] = len(ids)
+        progress["index_done"] = 0
+
+    # 全量重建：先清空该 chat 的所有旧 chunks，避免遗留已删 topic 的向量
+    try:
+        collection = get_or_create_collection()
+        collection.delete(where={"chat_id": chat_id})
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(
+            "全量重建前清空 chat=%s 旧 chunks 失败（继续 upsert，可能有残留）: %s",
+            chat_id, e,
+        )
 
     if ids:
         await add_documents(ids, texts, metadatas, progress=progress)
