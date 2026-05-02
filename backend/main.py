@@ -12,12 +12,16 @@ from backend.routers import (
     settings_router,
     summary_router,
 )
+from backend.services.main_loop import set_main_loop
 from backend.services.run_registry import periodic_cleanup
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # 注册主事件循环，供 import / summary 后台 worker 使用
+    # （避免 worker 另起 loop 触碰 llm_adapter 的模块级 Semaphore / httpx 连接池）
+    set_main_loop(asyncio.get_running_loop())
     # 后台定时清理过期 run（完成 5 分钟后自动从 registry 中移除）
     cleanup_task = asyncio.create_task(periodic_cleanup(interval_seconds=60))
     try:

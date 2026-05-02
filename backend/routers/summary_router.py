@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from backend.models.database import Import, SummaryReport, SessionLocal, get_db
 from backend.models.schemas import SummarizeRequest, SummaryItem
+from backend.services.main_loop import schedule_on_main_loop
 from backend.services.summarizer import run_summarize
 
 logger = logging.getLogger(__name__)
@@ -50,11 +51,12 @@ def _enqueue_summary(chat_ids: list[tuple[str, str, bool]]):
             _summary_progress["total"] = _summary_progress["completed"] + len(_summary_queue)
             return
 
-    t = threading.Thread(target=_summary_worker, daemon=True)
-    t.start()
+    # 调度到 FastAPI 主循环上跑（不要另起线程 + asyncio.run，
+    # 否则会和 llm_adapter 模块级 Semaphore / httpx 客户端绑定的循环冲突）
+    schedule_on_main_loop(_summary_runner())
 
 
-def _summary_worker():
+async def _summary_runner():
     with _summary_lock:
         _summary_progress["running"] = True
         _summary_progress["completed"] = 0
@@ -116,23 +118,20 @@ def _summary_worker():
             finally:
                 db.close()
 
-    async def _run():
-        sem = asyncio.Semaphore(MAX_PARALLEL_SUMMARY)
-        with _summary_lock:
-            all_tasks = list(_summary_queue)
-            _summary_queue.clear()
-            _summary_progress["queued"] = 0
+    sem = asyncio.Semaphore(MAX_PARALLEL_SUMMARY)
+    with _summary_lock:
+        all_tasks = list(_summary_queue)
+        _summary_queue.clear()
+        _summary_progress["queued"] = 0
 
-        coros = [asyncio.create_task(_process_one(t, sem)) for t in all_tasks]
-        if coros:
-            await asyncio.gather(*coros)
+    coros = [asyncio.create_task(_process_one(t, sem)) for t in all_tasks]
+    if coros:
+        await asyncio.gather(*coros)
 
-        _summary_progress["running"] = False
-        _summary_progress["active_chats"] = []
-        _summary_progress["chat_details"] = {}
-        _summary_progress["stage"] = "done"
-
-    asyncio.run(_run())
+    _summary_progress["running"] = False
+    _summary_progress["active_chats"] = []
+    _summary_progress["chat_details"] = {}
+    _summary_progress["stage"] = "done"
 
 
 # ---------- API ----------

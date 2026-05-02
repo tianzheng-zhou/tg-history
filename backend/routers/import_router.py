@@ -13,6 +13,7 @@ from backend.models.database import Import, Message, SummaryReport, Topic, get_d
 from backend.models.schemas import ChatInfo, ChatStats, ImportResult, MessageItem, MessageQuery
 from backend.services.parser import parse_export_file
 from backend.services.embedding import build_index_for_chat
+from backend.services.main_loop import schedule_on_main_loop
 from backend.services.topic_builder import build_topics
 
 logger = logging.getLogger(__name__)
@@ -134,11 +135,12 @@ def _enqueue_index(chat_ids: list[str]):
             _index_progress["total"] = _index_progress["completed"] + len(_index_queue)
             return
 
-    t = threading.Thread(target=_index_worker, daemon=True)
-    t.start()
+    # 调度到 FastAPI 主循环上跑（不要另起线程 + asyncio.run，
+    # 否则会和 llm_adapter 模块级 Semaphore / httpx 客户端绑定的循环冲突）
+    schedule_on_main_loop(_index_runner())
 
 
-def _index_worker():
+async def _index_runner():
     with _index_lock:
         _index_progress["running"] = True
         _index_progress["completed"] = 0
@@ -211,23 +213,20 @@ def _index_worker():
             finally:
                 db.close()
 
-    async def _run():
-        sem = asyncio.Semaphore(MAX_PARALLEL)
-        with _index_lock:
-            all_ids = list(_index_queue)
-            _index_queue.clear()
-            _index_progress["total"] = _index_progress["completed"] + len(all_ids)
+    sem = asyncio.Semaphore(MAX_PARALLEL)
+    with _index_lock:
+        all_ids = list(_index_queue)
+        _index_queue.clear()
+        _index_progress["total"] = _index_progress["completed"] + len(all_ids)
 
-        tasks = [asyncio.create_task(_process_one(cid, sem)) for cid in all_ids]
-        if tasks:
-            await asyncio.gather(*tasks)
+    tasks = [asyncio.create_task(_process_one(cid, sem)) for cid in all_ids]
+    if tasks:
+        await asyncio.gather(*tasks)
 
-        _index_progress["running"] = False
-        _index_progress["current_chat"] = ""
-        _index_progress["active_chats"] = []
-        _index_progress["chat_details"] = {}
-
-    asyncio.run(_run())
+    _index_progress["running"] = False
+    _index_progress["current_chat"] = ""
+    _index_progress["active_chats"] = []
+    _index_progress["chat_details"] = {}
 
 
 @router.post("/import", response_model=list[ImportResult])
