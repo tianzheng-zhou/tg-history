@@ -18,6 +18,7 @@ def get_settings():
         embedding_model=settings.embedding_model,
         rerank_model=settings.rerank_model,
         has_api_key=bool(settings.dashscope_api_key),
+        has_moonshot_key=bool(settings.moonshot_api_key),
     )
 
 
@@ -26,6 +27,11 @@ def update_settings(req: SettingsUpdate):
     """更新配置（运行时生效，重启后需写入 .env）"""
     if req.dashscope_api_key is not None:
         settings.dashscope_api_key = req.dashscope_api_key
+    if req.moonshot_api_key is not None:
+        settings.moonshot_api_key = req.moonshot_api_key
+        # 切换 Moonshot key 时重置 client 单例
+        from backend.services import llm_adapter
+        llm_adapter._moonshot_client = None
     if req.llm_model_map is not None:
         settings.llm_model_map = req.llm_model_map
     if req.llm_model_reduce is not None:
@@ -47,6 +53,7 @@ def update_settings(req: SettingsUpdate):
         embedding_model=settings.embedding_model,
         rerank_model=settings.rerank_model,
         has_api_key=bool(settings.dashscope_api_key),
+        has_moonshot_key=bool(settings.moonshot_api_key),
     )
 
 
@@ -56,6 +63,8 @@ def _persist_env():
     lines = {
         "DASHSCOPE_API_KEY": settings.dashscope_api_key,
         "DASHSCOPE_BASE_URL": settings.dashscope_base_url,
+        "MOONSHOT_API_KEY": settings.moonshot_api_key,
+        "MOONSHOT_BASE_URL": settings.moonshot_base_url,
         "LLM_MODEL_MAP": settings.llm_model_map,
         "LLM_MODEL_REDUCE": settings.llm_model_reduce,
         "LLM_MODEL_QA": settings.llm_model_qa,

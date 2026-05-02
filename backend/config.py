@@ -3,9 +3,13 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # DashScope
+    # DashScope (阿里云百炼)
     dashscope_api_key: str = ""
     dashscope_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+    # Moonshot (Kimi)
+    moonshot_api_key: str = ""
+    moonshot_base_url: str = "https://api.moonshot.cn/v1"
 
     # LLM 模型
     llm_model_map: str = "qwen3.5-plus"

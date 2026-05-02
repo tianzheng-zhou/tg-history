@@ -113,6 +113,7 @@ class QAHistoryItem(BaseModel):
 
 class SettingsUpdate(BaseModel):
     dashscope_api_key: str | None = None
+    moonshot_api_key: str | None = None
     llm_model_map: str | None = None
     llm_model_reduce: str | None = None
     llm_model_qa: str | None = None
@@ -127,3 +128,4 @@ class SettingsResponse(BaseModel):
     embedding_model: str
     rerank_model: str
     has_api_key: bool
+    has_moonshot_key: bool = False

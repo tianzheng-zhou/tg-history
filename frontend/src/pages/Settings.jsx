@@ -6,10 +6,11 @@ const MODEL_OPTIONS = {
   llm: [
     "qwen3.5-plus",
     "qwen3.6-plus",
-    "qwen-plus",
-    "qwen-max",
-    "qwen-flash",
-    "qwen-turbo",
+  ],
+  llm_qa: [
+    "qwen3.5-plus",
+    "qwen3.6-plus",
+    "kimi-k2.6",
   ],
   embedding: ["text-embedding-v4"],
   rerank: ["qwen3-rerank"],
@@ -18,6 +19,7 @@ const MODEL_OPTIONS = {
 export default function Settings() {
   const [form, setForm] = useState({
     dashscope_api_key: "",
+    moonshot_api_key: "",
     llm_model_map: "qwen3.5-plus",
     llm_model_reduce: "qwen3.6-plus",
     llm_model_qa: "qwen3.6-plus",
@@ -25,6 +27,7 @@ export default function Settings() {
     rerank_model: "qwen3-rerank",
   });
   const [hasKey, setHasKey] = useState(false);
+  const [hasMoonshotKey, setHasMoonshotKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
@@ -39,6 +42,7 @@ export default function Settings() {
         rerank_model: data.rerank_model,
       }));
       setHasKey(data.has_api_key);
+      setHasMoonshotKey(data.has_moonshot_key);
     });
   }, []);
 
@@ -50,9 +54,13 @@ export default function Settings() {
       if (!payload.dashscope_api_key) {
         delete payload.dashscope_api_key;
       }
+      if (!payload.moonshot_api_key) {
+        delete payload.moonshot_api_key;
+      }
       await updateSettings(payload);
       setSaved(true);
       if (form.dashscope_api_key) setHasKey(true);
+      if (form.moonshot_api_key) setHasMoonshotKey(true);
       setTimeout(() => setSaved(false), 3000);
     } catch {
       alert("保存失败");
@@ -84,6 +92,21 @@ export default function Settings() {
             />
             {hasKey && (
               <p className="text-xs text-green-600 mt-1">✓ API Key 已配置</p>
+            )}
+          </div>
+          <div className="mt-3">
+            <label className="block text-sm text-muted-foreground mb-1">
+              Moonshot API Key <span className="text-xs">（Kimi K2.6 需要）</span>
+            </label>
+            <input
+              type="password"
+              value={form.moonshot_api_key}
+              onChange={(e) => update("moonshot_api_key", e.target.value)}
+              placeholder={hasMoonshotKey ? "已配置（留空保持不变）" : "sk-..."}
+              className="w-full border border-border rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+            {hasMoonshotKey && (
+              <p className="text-xs text-green-600 mt-1">✓ Moonshot Key 已配置</p>
             )}
           </div>
         </section>
@@ -136,12 +159,15 @@ export default function Settings() {
                 onChange={(e) => update("llm_model_qa", e.target.value)}
                 className="w-full border border-border rounded-md px-3 py-2 text-sm"
               >
-                {MODEL_OPTIONS.llm.map((m) => (
+                {MODEL_OPTIONS.llm_qa.map((m) => (
                   <option key={m} value={m}>
                     {m}
                   </option>
                 ))}
               </select>
+              <p className="text-xs text-muted-foreground mt-1">
+                kimi-k2.6 需配置 Moonshot Key
+              </p>
             </div>
           </div>
         </section>

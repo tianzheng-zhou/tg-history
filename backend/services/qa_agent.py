@@ -70,32 +70,50 @@ async def _stream_llm_step(
 ) -> AsyncIterator[dict]:
     """单轮 LLM 流式调用，yield：
        - {"type": "text_delta", "text": str}
+       - {"type": "reasoning_delta", "text": str}  (Kimi 思考链)
        - {"type": "tool_calls", "calls": [{"id", "name", "arguments"}]}  (完整聚合后)
-       - {"type": "usage", ...}
+       - {"type": "reasoning_content", "text": str}  (完整思考内容，供回传上下文)
        - {"type": "done"}
     """
-    client = llm_adapter._get_client()
     model = settings.llm_model_qa
+    client = llm_adapter.get_client_for_model(model)
+    is_kimi = llm_adapter.is_kimi_model(model)
 
-    stream = await client.chat.completions.create(
+    kwargs = dict(
         model=model,
         messages=messages,
         tools=TOOL_SCHEMAS,
         tool_choice="auto",
-        parallel_tool_calls=True,  # 允许 LLM 一轮调用多个工具
-        temperature=0.3,
-        max_tokens=2048,
+        max_tokens=32768 if is_kimi else 2048,
         stream=True,
     )
 
-    # 需要把 streaming tool_calls 聚合：DashScope/OpenAI 的 tool_calls delta 是分片的
-    tool_calls_acc: dict[int, dict] = {}  # index → {id, name, arguments_str}
+    if is_kimi:
+        # Kimi: 思考模式 + tool_choice 只能 auto/none
+        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+        kwargs["temperature"] = 1.0
+        # Kimi 不支持 parallel_tool_calls 参数
+    else:
+        kwargs["parallel_tool_calls"] = True
+        kwargs["temperature"] = 0.3
+
+    stream = await client.chat.completions.create(**kwargs)
+
+    # 需要把 streaming tool_calls 聚合
+    tool_calls_acc: dict[int, dict] = {}
+    reasoning_parts: list[str] = []
 
     async for chunk in stream:
         choice = chunk.choices[0] if chunk.choices else None
         if not choice:
             continue
         delta = choice.delta
+
+        # Kimi reasoning_content（思考链 token）
+        rc = getattr(delta, "reasoning_content", None)
+        if rc:
+            reasoning_parts.append(rc)
+            yield {"type": "reasoning_delta", "text": rc}
 
         # 文本 token
         if delta.content:
@@ -132,6 +150,10 @@ async def _stream_llm_step(
                 calls.append(c)
         if calls:
             yield {"type": "tool_calls", "calls": calls}
+
+    # Kimi 要求多步工具调用时 assistant message 必须保留 reasoning_content
+    if reasoning_parts:
+        yield {"type": "reasoning_content", "text": "".join(reasoning_parts)}
 
     yield {"type": "done"}
 
@@ -171,15 +193,20 @@ async def run_agent(
     for step in range(1, MAX_STEPS + 1):
         yield {"type": "step_start", "step": step}
 
-        # 本轮要收集的文本 & tool_calls
+        # 本轮要收集的文本 & tool_calls & 思考链
         step_text = ""
         step_tool_calls: list[dict] = []
+        step_reasoning = ""  # Kimi reasoning_content
 
         try:
             async for ev in _stream_llm_step(messages):
                 if ev["type"] == "text_delta":
                     step_text += ev["text"]
                     yield {"type": "thinking_delta", "step": step, "text": ev["text"]}
+                elif ev["type"] == "reasoning_delta":
+                    yield {"type": "reasoning_delta", "step": step, "text": ev["text"]}
+                elif ev["type"] == "reasoning_content":
+                    step_reasoning = ev["text"]
                 elif ev["type"] == "tool_calls":
                     step_tool_calls = ev["calls"]
                 elif ev["type"] == "done":
@@ -194,6 +221,9 @@ async def run_agent(
             assistant_msg["content"] = step_text
         else:
             assistant_msg["content"] = None
+        # Kimi 要求多步工具调用时 assistant message 保留 reasoning_content
+        if step_reasoning:
+            assistant_msg["reasoning_content"] = step_reasoning
         if step_tool_calls:
             assistant_msg["tool_calls"] = [
                 {
@@ -291,15 +321,20 @@ async def run_agent(
                        "并总结已找到的相关内容。",
         })
         try:
-            client = llm_adapter._get_client()
-            stream = await client.chat.completions.create(
-                model=settings.llm_model_qa,
+            _model = settings.llm_model_qa
+            _client = llm_adapter.get_client_for_model(_model)
+            _force_kwargs = dict(
+                model=_model,
                 messages=messages,
-                temperature=0.3,
-                max_tokens=2048,
+                max_tokens=32768 if llm_adapter.is_kimi_model(_model) else 2048,
                 stream=True,
-                # 不传 tools，强制只输出文本
             )
+            if llm_adapter.is_kimi_model(_model):
+                _force_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+                _force_kwargs["temperature"] = 0.6
+            else:
+                _force_kwargs["temperature"] = 0.3
+            stream = await _client.chat.completions.create(**_force_kwargs)
             forced_text = ""
             async for chunk in stream:
                 choice = chunk.choices[0] if chunk.choices else None

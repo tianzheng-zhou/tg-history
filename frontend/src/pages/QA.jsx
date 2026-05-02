@@ -198,7 +198,21 @@ function AgentStep({ step, streaming }) {
 
       {expanded && (
         <div className="mt-1.5 space-y-2">
-          {/* 思考文本 */}
+          {/* Kimi 深度思考链 */}
+          {step.reasoning && (
+            <details className="text-xs text-foreground/60 bg-purple-50 rounded p-2">
+              <summary className="cursor-pointer flex items-center gap-1 text-[10px] text-purple-600 font-medium">
+                <Sparkles size={10} />
+                <span>深度思考</span>
+                <span className="text-[9px] text-muted-foreground ml-1">({step.reasoning.length} 字符)</span>
+              </summary>
+              <div className="mt-1 whitespace-pre-wrap text-foreground/70 max-h-48 overflow-auto">
+                {step.reasoning}
+              </div>
+            </details>
+          )}
+
+          {/* 思考/回答文本 */}
           {step.thinking && (
             <div className="text-xs text-foreground/80 bg-muted/30 rounded p-2 whitespace-pre-wrap">
               <div className="flex items-center gap-1 text-[10px] text-muted-foreground mb-1">
@@ -206,7 +220,7 @@ function AgentStep({ step, streaming }) {
                 <span>thinking</span>
               </div>
               <div className="prose prose-xs max-w-none">
-                <ReactMarkdown>{step.thinking}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{step.thinking}</ReactMarkdown>
               </div>
             </div>
           )}
@@ -455,7 +469,7 @@ export default function QA() {
             ...m,
             agentSteps: [
               ...m.agentSteps,
-              { step: ev.step, thinking: "", toolCalls: [], done: false },
+              { step: ev.step, thinking: "", reasoning: "", toolCalls: [], done: false },
             ],
           }));
         } else if (ev.type === "thinking_delta") {
@@ -464,6 +478,16 @@ export default function QA() {
             const idx = steps.findIndex((s) => s.step === ev.step);
             if (idx !== -1) {
               steps[idx] = { ...steps[idx], thinking: (steps[idx].thinking || "") + ev.text };
+            }
+            return { ...m, agentSteps: steps };
+          });
+        } else if (ev.type === "reasoning_delta") {
+          // Kimi 思考链
+          updateLast((m) => {
+            const steps = [...m.agentSteps];
+            const idx = steps.findIndex((s) => s.step === ev.step);
+            if (idx !== -1) {
+              steps[idx] = { ...steps[idx], reasoning: (steps[idx].reasoning || "") + ev.text };
             }
             return { ...m, agentSteps: steps };
           });
