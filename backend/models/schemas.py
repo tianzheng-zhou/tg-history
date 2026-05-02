@@ -211,3 +211,51 @@ class SettingsResponse(BaseModel):
     rerank_model: str
     has_api_key: bool
     has_moonshot_key: bool = False
+
+
+# ---------- Watched Folders ----------
+
+class FolderValidateRequest(BaseModel):
+    path: str
+
+
+class FolderValidateResponse(BaseModel):
+    valid: bool
+    reason: str | None = None
+    resolved_path: str | None = None         # 规范化后的绝对路径
+    result_json_count: int = 0
+    sample_paths: list[str] = []             # 前 5 个相对路径，给用户预览用
+
+
+class FolderAddRequest(BaseModel):
+    path: str
+    alias: str | None = None
+
+
+class WatchedFolderInfo(BaseModel):
+    id: int
+    path: str
+    alias: str | None = None
+    added_at: datetime
+    last_scan_at: datetime | None = None
+    last_scan_total: int = 0
+    last_scan_imported: int = 0
+    last_scan_skipped: int = 0
+    last_scan_failed: int = 0
+
+
+class ScanFileResult(BaseModel):
+    path: str
+    status: str                              # "ok" | "skipped" | "error"
+    chats: list[ImportResult] = []           # status=ok 时填，每个解析出的群聊增量结果
+    error: str | None = None
+
+
+class ScanResult(BaseModel):
+    folder_id: int
+    folder_path: str
+    total: int                               # 找到的 result.json 总数
+    skipped: int                             # mtime 未变跳过的数量
+    imported: int                            # 本次成功处理的文件数
+    failed: int                              # 解析/导入失败的文件数
+    files: list[ScanFileResult] = []

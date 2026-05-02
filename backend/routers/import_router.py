@@ -1,24 +1,66 @@
 import asyncio
+import hashlib
 import json
 import logging
 import tempfile
 import threading
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
-from backend.models.database import Import, Message, SummaryReport, Topic, get_db, SessionLocal
-from backend.models.schemas import ChatInfo, ChatStats, ImportResult, MessageItem, MessageQuery
+from backend.models.database import (
+    Import,
+    ImportedFile,
+    Message,
+    SessionLocal,
+    SummaryReport,
+    Topic,
+    WatchedFolder,
+    get_db,
+)
+from backend.models.schemas import (
+    ChatInfo,
+    ChatStats,
+    FolderAddRequest,
+    FolderValidateRequest,
+    FolderValidateResponse,
+    ImportResult,
+    MessageItem,
+    MessageQuery,
+    ScanFileResult,
+    ScanResult,
+    WatchedFolderInfo,
+)
 from backend.services.parser import parse_export_file
 from backend.services.embedding import build_index_for_chat
+from backend.services.folder_scanner import (
+    diff_pending,
+    find_result_jsons,
+    resolve_path,
+    upsert_imported_file,
+    validate_folder,
+)
 from backend.services.main_loop import schedule_on_main_loop
 from backend.services.topic_builder import build_topics
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["import"])
+
+
+def _stable_id_offset(chat_id: str) -> int:
+    """生成稳定的 chat_id 哈希偏移（跨进程一致），用于消息全局唯一 ID。
+
+    曾用 ``abs(hash(chat_id))``，但 Python 内置 hash() 对字符串以 PYTHONHASHSEED
+    随进程启动加盐 → 重启后同一 chat_id 算出的偏移会变 → 导致 existing_ids 比对失效，
+    所有旧消息会被当作新消息再次插入（出现 message_count 翻倍 + 索引整库重建）。
+    改用 SHA-256 取前 8 字节，跨进程严格一致。
+    """
+    digest = hashlib.sha256(chat_id.encode("utf-8")).digest()
+    return (int.from_bytes(digest[:8], "big") % (10**9)) * 1000000
 
 
 def _import_single_chat(parsed: dict, db: Session) -> ImportResult:
@@ -36,8 +78,8 @@ def _import_single_chat(parsed: dict, db: Session) -> ImportResult:
             for row in db.query(Message.id).filter(Message.chat_id == chat_id).all()
         )
 
-    # 为避免跨群聊 message id 冲突，使用 chat_id 哈希偏移
-    id_offset = abs(hash(chat_id)) % (10**9) * 1000000
+    # 为避免跨群聊 message id 冲突，使用 chat_id 稳定哈希偏移
+    id_offset = _stable_id_offset(chat_id)
 
     # 批量插入新消息
     new_count = 0
@@ -420,4 +462,294 @@ def search_messages(
             }
             for m in msgs
         ],
+    }
+
+
+# ---------- Watched Folders ----------
+
+def _to_folder_info(f: WatchedFolder) -> WatchedFolderInfo:
+    return WatchedFolderInfo(
+        id=f.id,
+        path=f.path,
+        alias=f.alias,
+        added_at=f.added_at,
+        last_scan_at=f.last_scan_at,
+        last_scan_total=f.last_scan_total or 0,
+        last_scan_imported=f.last_scan_imported or 0,
+        last_scan_skipped=f.last_scan_skipped or 0,
+        last_scan_failed=f.last_scan_failed or 0,
+    )
+
+
+@router.post("/folders/validate", response_model=FolderValidateResponse)
+def folder_validate(req: FolderValidateRequest):
+    """校验路径是否可作为绑定目录：检查存在/可读/统计 result.json 数量"""
+    info = validate_folder(req.path)
+    return FolderValidateResponse(**info)
+
+
+@router.get("/folders", response_model=list[WatchedFolderInfo])
+def folder_list(db: Session = Depends(get_db)):
+    folders = db.query(WatchedFolder).order_by(WatchedFolder.added_at.desc()).all()
+    return [_to_folder_info(f) for f in folders]
+
+
+@router.post("/folders", response_model=WatchedFolderInfo)
+def folder_add(req: FolderAddRequest, db: Session = Depends(get_db)):
+    info = validate_folder(req.path)
+    if not info["valid"]:
+        raise HTTPException(400, info["reason"] or "路径不合法")
+
+    abs_path = info["resolved_path"] or resolve_path(req.path)
+    existing = db.query(WatchedFolder).filter(WatchedFolder.path == abs_path).first()
+    if existing:
+        raise HTTPException(400, "该目录已绑定")
+
+    alias = (req.alias or "").strip() or Path(abs_path).name or abs_path
+    folder = WatchedFolder(path=abs_path, alias=alias)
+    db.add(folder)
+    db.commit()
+    db.refresh(folder)
+    return _to_folder_info(folder)
+
+
+@router.delete("/folders/{folder_id}")
+def folder_delete(folder_id: int, db: Session = Depends(get_db)):
+    folder = db.query(WatchedFolder).filter(WatchedFolder.id == folder_id).first()
+    if not folder:
+        raise HTTPException(404, "目录未找到")
+    db.delete(folder)
+    # 不删除 imported_files，保留历史去重信息
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.post("/folders/{folder_id}/scan", response_model=ScanResult)
+def folder_scan(folder_id: int, db: Session = Depends(get_db)):
+    """递归扫描绑定目录下的 result.json，导入未处理或 mtime 已变的文件"""
+    folder = db.query(WatchedFolder).filter(WatchedFolder.id == folder_id).first()
+    if not folder:
+        raise HTTPException(404, "目录未找到")
+
+    files = find_result_jsons(folder.path)
+    pending, skipped = diff_pending(db, folder.id, files)
+
+    file_results: list[ScanFileResult] = []
+    imported_count = 0
+    failed_count = 0
+    new_chat_ids: list[str] = []
+
+    for item in pending:
+        path = item["path"]
+        mtime = item.get("mtime") or 0.0
+        size = item.get("size") or 0
+
+        if item.get("stat_error"):
+            err = f"读取文件信息失败: {item['stat_error']}"
+            upsert_imported_file(
+                db, folder_id=folder.id, abs_path=path, mtime=mtime,
+                size=size, chat_count=0, status="error", error=err,
+            )
+            file_results.append(ScanFileResult(path=path, status="error", error=err))
+            failed_count += 1
+            continue
+
+        try:
+            chat_list = parse_export_file(path)
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            err = f"JSON 解析失败: {e}"
+            logger.warning("解析失败 %s: %s", path, e)
+            upsert_imported_file(
+                db, folder_id=folder.id, abs_path=path, mtime=mtime,
+                size=size, chat_count=0, status="error", error=err,
+            )
+            db.commit()
+            file_results.append(ScanFileResult(path=path, status="error", error=err))
+            failed_count += 1
+            continue
+        except OSError as e:
+            err = f"读取文件失败: {e}"
+            logger.warning("读取失败 %s: %s", path, e)
+            upsert_imported_file(
+                db, folder_id=folder.id, abs_path=path, mtime=mtime,
+                size=size, chat_count=0, status="error", error=err,
+            )
+            db.commit()
+            file_results.append(ScanFileResult(path=path, status="error", error=err))
+            failed_count += 1
+            continue
+
+        if not chat_list:
+            err = "文件中没有有效消息"
+            upsert_imported_file(
+                db, folder_id=folder.id, abs_path=path, mtime=mtime,
+                size=size, chat_count=0, status="error", error=err,
+            )
+            db.commit()
+            file_results.append(ScanFileResult(path=path, status="error", error=err))
+            failed_count += 1
+            continue
+
+        chat_results: list[ImportResult] = []
+        try:
+            for parsed in chat_list:
+                r = _import_single_chat(parsed, db)
+                chat_results.append(r)
+                if r.message_count > 0:
+                    new_chat_ids.append(r.chat_id)
+        except Exception as e:
+            err = f"导入数据库失败: {e}"
+            logger.exception("导入失败 %s", path)
+            db.rollback()
+            upsert_imported_file(
+                db, folder_id=folder.id, abs_path=path, mtime=mtime,
+                size=size, chat_count=0, status="error", error=err,
+            )
+            db.commit()
+            file_results.append(ScanFileResult(path=path, status="error", error=err))
+            failed_count += 1
+            continue
+
+        upsert_imported_file(
+            db, folder_id=folder.id, abs_path=path, mtime=mtime,
+            size=size, chat_count=len(chat_results), status="ok", error=None,
+        )
+        db.commit()
+        file_results.append(ScanFileResult(
+            path=path, status="ok", chats=chat_results, error=None,
+        ))
+        imported_count += 1
+
+    # 更新 folder 扫描元数据
+    folder.last_scan_at = datetime.now()
+    folder.last_scan_total = len(files)
+    folder.last_scan_imported = imported_count
+    folder.last_scan_skipped = skipped
+    folder.last_scan_failed = failed_count
+    db.commit()
+
+    # 触发后台索引（去重 chat_id）
+    if new_chat_ids:
+        seen = set()
+        unique_ids = []
+        for cid in new_chat_ids:
+            if cid not in seen:
+                seen.add(cid)
+                unique_ids.append(cid)
+        _enqueue_index(unique_ids)
+
+    return ScanResult(
+        folder_id=folder.id,
+        folder_path=folder.path,
+        total=len(files),
+        skipped=skipped,
+        imported=imported_count,
+        failed=failed_count,
+        files=file_results,
+    )
+
+
+# ---------- Admin: 一次性数据修复 ----------
+
+@router.post("/admin/dedupe-messages")
+def dedupe_messages(dry_run: bool = False, db: Session = Depends(get_db)):
+    """清理由历史 hash 不稳定 bug 造成的重复消息。
+
+    分组键：(chat_id, date, sender_id, text_plain, COALESCE(reply_to_id,0),
+             COALESCE(media_type,''))。每组只保留最小 id 的一行，删除其余。
+    完成后：重建 messages_fts，修正 Import.message_count，标记受影响 chat 为待索引。
+
+    传 ``?dry_run=true`` 只统计、不删数据。
+    """
+    # 删除前各 chat 的总数
+    before_counts: dict[str, int] = dict(
+        db.query(Message.chat_id, func.count(Message.id))
+        .group_by(Message.chat_id)
+        .all()
+    )
+
+    # 计算每个 chat 的"应保留"数量（即 distinct signature 数）
+    after_counts: dict[str, int] = {}
+    rows = db.execute(text("""
+        SELECT chat_id, COUNT(*) AS keep
+        FROM (
+            SELECT chat_id
+            FROM messages
+            GROUP BY chat_id, date, sender_id, text_plain,
+                     COALESCE(reply_to_id, 0), COALESCE(media_type, '')
+        )
+        GROUP BY chat_id
+    """)).fetchall()
+    for cid, keep in rows:
+        after_counts[cid] = keep
+
+    affected = []
+    for cid, before in before_counts.items():
+        after = after_counts.get(cid, 0)
+        if after < before:
+            affected.append({
+                "chat_id": cid,
+                "before": before,
+                "after": after,
+                "deleted": before - after,
+            })
+
+    total_deleted = sum(a["deleted"] for a in affected)
+
+    if dry_run or total_deleted == 0:
+        return {
+            "dry_run": dry_run,
+            "affected_chats": len(affected),
+            "total_deleted": total_deleted,
+            "details": affected,
+        }
+
+    # 实际删除：保留每组最小 id
+    deleted_total = db.execute(text("""
+        DELETE FROM messages
+        WHERE id NOT IN (
+            SELECT MIN(id) FROM messages
+            GROUP BY chat_id, date, sender_id, text_plain,
+                     COALESCE(reply_to_id, 0), COALESCE(media_type, '')
+        )
+    """)).rowcount or 0
+    db.commit()
+
+    # 重建 FTS（只重建受影响 chat 的）
+    affected_chat_ids = [a["chat_id"] for a in affected]
+    for cid in affected_chat_ids:
+        db.execute(
+            text("DELETE FROM messages_fts WHERE chat_id = :cid"), {"cid": cid}
+        )
+        db.execute(text(
+            "INSERT INTO messages_fts(text_plain, sender, chat_id, msg_id) "
+            "SELECT text_plain, sender, chat_id, id FROM messages "
+            "WHERE chat_id = :cid AND text_plain IS NOT NULL AND text_plain != ''"
+        ), {"cid": cid})
+
+    # 修正 Import.message_count + 标记待索引（旧索引指向已删除的 message id）
+    for cid in affected_chat_ids:
+        new_count = db.query(Message).filter(Message.chat_id == cid).count()
+        imp = db.query(Import).filter(Import.chat_id == cid).first()
+        if imp:
+            imp.message_count = new_count
+            imp.index_built = False
+
+    # 旧的 topics 记录里保存的 root_message_id 可能已被删掉 → 一并清理
+    if affected_chat_ids:
+        db.query(Topic).filter(Topic.chat_id.in_(affected_chat_ids)).delete(
+            synchronize_session=False
+        )
+        db.query(SummaryReport).filter(
+            SummaryReport.chat_id.in_(affected_chat_ids),
+            SummaryReport.stale == False,
+        ).update({"stale": True}, synchronize_session=False)
+
+    db.commit()
+
+    return {
+        "dry_run": False,
+        "affected_chats": len(affected),
+        "total_deleted": deleted_total,
+        "details": affected,
     }

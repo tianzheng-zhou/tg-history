@@ -36,6 +36,35 @@ export async function getChats() {
   return data;
 }
 
+// ---------- Watched Folders ----------
+
+export async function validateFolder(path) {
+  const { data } = await api.post("/folders/validate", { path });
+  return data;
+}
+
+export async function listFolders() {
+  const { data } = await api.get("/folders");
+  return data;
+}
+
+export async function addFolder(path, alias) {
+  const { data } = await api.post("/folders", { path, alias: alias || null });
+  return data;
+}
+
+export async function deleteFolder(folderId) {
+  const { data } = await api.delete(`/folders/${folderId}`);
+  return data;
+}
+
+export async function scanFolder(folderId) {
+  const { data } = await api.post(`/folders/${folderId}/scan`, null, {
+    timeout: 0, // 大目录扫描可能很久，禁用超时
+  });
+  return data;
+}
+
 export async function getChatStats(chatId) {
   const { data } = await api.get(`/chats/${chatId}/stats`);
   return data;

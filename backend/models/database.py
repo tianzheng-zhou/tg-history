@@ -6,6 +6,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Float,
     Integer,
     String,
     Text,
@@ -116,6 +117,38 @@ class ChatTurn(Base):
     mode = Column(String)  # "agent" | "rag" 本轮实际模式
     meta = Column(Text)  # JSON：usage/confidence/aborted/run_id/...
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class WatchedFolder(Base):
+    """绑定的目录：手动触发扫描时递归找 result.json"""
+
+    __tablename__ = "watched_folders"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    path = Column(String, unique=True, nullable=False)        # 绝对、规范化后的路径
+    alias = Column(String)                                    # 可选别名（默认取路径末段）
+    added_at = Column(DateTime, default=datetime.now)
+    last_scan_at = Column(DateTime)
+    last_scan_total = Column(Integer, default=0)              # 上次扫描发现的 result.json 总数
+    last_scan_imported = Column(Integer, default=0)           # 上次扫描成功导入的文件数
+    last_scan_skipped = Column(Integer, default=0)            # 上次扫描因 mtime 未变跳过的文件数
+    last_scan_failed = Column(Integer, default=0)
+
+
+class ImportedFile(Base):
+    """已扫描/导入过的 result.json：用于路径 + mtime 去重"""
+
+    __tablename__ = "imported_files"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    folder_id = Column(Integer, index=True)                   # 软关联 watched_folders.id
+    abs_path = Column(String, unique=True, nullable=False)
+    mtime = Column(Float)                                     # os.stat().st_mtime
+    size = Column(Integer)
+    chat_count = Column(Integer, default=0)                   # 该文件解析出多少个群聊
+    status = Column(String)                                   # "ok" | "error"
+    error = Column(Text)                                      # 错误信息（截断）
+    imported_at = Column(DateTime, default=datetime.now)
 
 
 # ---------- Engine / Session ----------
