@@ -72,7 +72,7 @@ async def _map_summarize(chunk: list[Message]) -> str:
         messages=[{"role": "user", "content": prompt}],
         model=settings.llm_model_map,
         temperature=0.2,
-        max_tokens=2048,
+        enable_thinking=False,
     )
     return result
 
@@ -91,7 +91,6 @@ async def _reduce_summarize(summaries: list[str]) -> str:
         messages=[{"role": "user", "content": prompt}],
         model=settings.llm_model_reduce,
         temperature=0.3,
-        max_tokens=4096,
     )
     return result
 

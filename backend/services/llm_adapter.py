@@ -16,16 +16,20 @@ async def chat(
     model: str | None = None,
     temperature: float = 0.3,
     max_tokens: int = 4096,
+    enable_thinking: bool | None = None,
 ) -> str:
     """统一对话接口，返回纯文本"""
     client = _get_client()
     model = model or settings.llm_model_qa
-    resp = await client.chat.completions.create(
+    kwargs = dict(
         model=model,
         messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
     )
+    if enable_thinking is not None:
+        kwargs["extra_body"] = {"enable_thinking": enable_thinking}
+    resp = await client.chat.completions.create(**kwargs)
     return resp.choices[0].message.content or ""
 
 
