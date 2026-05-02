@@ -30,7 +30,59 @@ from backend.services import llm_adapter
 from backend.services.qa_tools import TOOL_SCHEMAS, dispatch_tool
 
 MAX_STEPS = 30  # 最大 agent 迭代轮数，防止死循环
-MAX_TOOL_OUTPUT_CHARS = 120000  # 塞回 LLM 的单次工具输出最大字符数（qwen3.6-plus 1M 上下文）
+MAX_TOOL_OUTPUT_CHARS = 50000  # 塞回 LLM 的单次工具输出最大字符数（降低防止上下文溢出）
+CONTEXT_RESERVE_TOKENS = 40000  # 为 LLM 输出预留的 token 数
+CHARS_PER_TOKEN = 1.8  # 中英混合文本的大致 chars/token 比
+
+
+def _estimate_tokens(messages: list[dict]) -> int:
+    """粗略估算 messages 的 token 数（中英混合按 1.8 chars/token）"""
+    total_chars = 0
+    for m in messages:
+        c = m.get("content")
+        if c:
+            total_chars += len(c)
+        tcs = m.get("tool_calls")
+        if tcs:
+            total_chars += len(json.dumps(tcs, ensure_ascii=False))
+        rc = m.get("reasoning_content")
+        if rc:
+            total_chars += len(rc)
+    return int(total_chars / CHARS_PER_TOKEN)
+
+
+def _trim_messages_to_budget(messages: list[dict], model: str) -> tuple[list[dict], bool]:
+    """如果 messages 预估 token 超出模型上下文预算，按比例截断 tool 消息。
+    返回 (trimmed_messages, was_trimmed)。
+    """
+    max_ctx = llm_adapter.get_context_window(model)
+    budget_tokens = max_ctx - CONTEXT_RESERVE_TOKENS
+    est = _estimate_tokens(messages)
+    if est <= budget_tokens:
+        return messages, False
+
+    excess_chars = int((est - budget_tokens) * CHARS_PER_TOKEN)
+
+    # 收集 tool 消息的索引和大小
+    tool_indices: list[tuple[int, int]] = []
+    for i, m in enumerate(messages):
+        if m.get("role") == "tool":
+            tool_indices.append((i, len(m.get("content", ""))))
+
+    if not tool_indices:
+        return messages, False
+
+    total_tool_chars = sum(s for _, s in tool_indices)
+    result = list(messages)
+    for i, size in tool_indices:
+        cut = int(excess_chars * size / total_tool_chars) if total_tool_chars > 0 else 0
+        new_size = max(size - cut, 1000)
+        if new_size < size:
+            content = result[i]["content"][:new_size]
+            content += f"\n\n...[截断以适应上下文窗口，原长度 {size} 字符]"
+            result[i] = {**result[i], "content": content}
+
+    return result, True
 
 
 SYSTEM_PROMPT = """你是一个专业的 Telegram 聊天记录分析助手。用户可能会问各种关于群聊记录的问题：技术讨论、商业信息、某人的观点、某事件的来龙去脉等。
@@ -220,6 +272,25 @@ async def run_agent(
     for step in range(1, MAX_STEPS + 1):
         yield {"type": "step_start", "step": step}
 
+        # 上下文预算管理：在调用 LLM 前检查并截断
+        model = settings.llm_model_qa
+        messages, was_trimmed = _trim_messages_to_budget(messages, model)
+        if was_trimmed:
+            # 发送估算的 usage 事件，让前端 ContextBadge 及时更新
+            est_tokens = _estimate_tokens(messages)
+            max_ctx = llm_adapter.get_context_window(model)
+            yield {
+                "type": "usage",
+                "step": step,
+                "prompt_tokens": est_tokens,
+                "completion_tokens": 0,
+                "total_tokens": est_tokens,
+                "max_context": max_ctx,
+                "percent": round(est_tokens / max_ctx, 4) if max_ctx else 0.0,
+                "model": model,
+            }
+            yield {"type": "status", "message": f"上下文已截断以适应 {model} 窗口（估算 {est_tokens} tokens）"}
+
         # 本轮要收集的文本 & tool_calls & 思考链
         step_text = ""
         step_tool_calls: list[dict] = []
@@ -242,6 +313,13 @@ async def run_agent(
                 elif ev["type"] == "done":
                     break
         except Exception as e:
+            # 如果有工具结果积累，尝试强制总结而非直接失败
+            if step > 1 or any(m.get("role") == "tool" for m in messages):
+                yield {"type": "status", "message": f"LLM 调用失败({e})，尝试缩减上下文后强制总结..."}
+                recovery_text = await _force_summarize_recovery(messages, cited_message_ids)
+                if recovery_text:
+                    final_text_parts.append(recovery_text)
+                    break
             yield {"type": "error", "error": f"LLM 调用失败: {e}"}
             return
 
@@ -350,8 +428,10 @@ async def run_agent(
                        "**不要再调用任何工具**。如果信息不足，明确说明'根据已检索信息无法完整回答'，"
                        "并总结已找到的相关内容。",
         })
+        # 截断上下文
+        _model = settings.llm_model_qa
+        messages, _ = _trim_messages_to_budget(messages, _model)
         try:
-            _model = settings.llm_model_qa
             _client = llm_adapter.get_client_for_model(_model)
             _force_kwargs = dict(
                 model=_model,
@@ -383,6 +463,59 @@ async def run_agent(
         "answer": "".join(final_text_parts),
         "sources": sources,
     }
+
+
+async def _force_summarize_recovery(messages: list[dict], cited_ids: set[int]) -> str:
+    """LLM 调用失败后的恢复策略：激进截断工具输出后强制总结。"""
+    model = settings.llm_model_qa
+
+    # 只保留 system + user + 大幅截断的工具结果
+    recovery_msgs: list[dict] = []
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            recovery_msgs.append(m)
+        elif role == "user":
+            recovery_msgs.append(m)
+        elif role == "tool":
+            content = m.get("content", "")
+            # 每个工具结果最多保留 3000 字符
+            if len(content) > 3000:
+                content = content[:3000] + "\n...[截断]"
+            recovery_msgs.append({**m, "content": content})
+        elif role == "assistant":
+            # 保留 assistant 消息但去掉 reasoning_content
+            slim = {"role": "assistant", "content": m.get("content")}
+            if m.get("tool_calls"):
+                slim["tool_calls"] = m["tool_calls"]
+            recovery_msgs.append(slim)
+
+    recovery_msgs.append({
+        "role": "user",
+        "content": "之前的 LLM 调用因上下文过长失败了。请基于上面已收集到的工具结果（可能被截断），"
+                   "给出最终答案。**不要再调用任何工具**。",
+    })
+
+    # 再次做预算检查
+    recovery_msgs, _ = _trim_messages_to_budget(recovery_msgs, model)
+
+    try:
+        client = llm_adapter.get_client_for_model(model)
+        kwargs = dict(
+            model=model,
+            messages=recovery_msgs,
+            max_tokens=32768 if llm_adapter.is_kimi_model(model) else 2048,
+            stream=False,
+        )
+        if llm_adapter.is_kimi_model(model):
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            kwargs["temperature"] = 0.6
+        else:
+            kwargs["temperature"] = 0.3
+        resp = await client.chat.completions.create(**kwargs)
+        return resp.choices[0].message.content or ""
+    except Exception:
+        return ""
 
 
 def _collect_ids(result: dict, acc: set[int]) -> None:
