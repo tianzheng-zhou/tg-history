@@ -136,6 +136,17 @@ function applyEvent(run, ev) {
     out.agentSteps = steps;
     return out;
   }
+  if (t === "sub_agent_event") {
+    // 子 Agent 进度事件 — 挂到当前 step 的 subEvents 数组
+    const steps = [...out.agentSteps];
+    const idx = steps.findIndex((s) => s.step === ev.step);
+    if (idx !== -1) {
+      const sub = steps[idx].subEvents || [];
+      steps[idx] = { ...steps[idx], subEvents: [...sub, ev] };
+    }
+    out.agentSteps = steps;
+    return out;
+  }
   if (t === "step_done") {
     const steps = [...out.agentSteps];
     const idx = steps.findIndex((s) => s.step === ev.step);

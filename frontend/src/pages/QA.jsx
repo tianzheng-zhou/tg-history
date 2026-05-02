@@ -276,6 +276,7 @@ function ToolCallCard({ toolCall }) {
           <span className="text-[10px] text-muted-foreground">
             {toolCall.durationMs ?? toolCall.duration_ms}ms
             {toolCall.preview?.count !== undefined && ` · ${toolCall.preview.count} 条`}
+            {toolCall.preview?.summary && ` · ${toolCall.preview.summary}`}
           </span>
         )}
         {err && <span className="text-[10px] text-red-500">失败</span>}
@@ -294,11 +295,16 @@ function ToolCallCard({ toolCall }) {
           {done && toolCall.preview && (
             <div>
               <div className="text-muted-foreground mb-1">
-                结果预览{toolCall.preview.summary && ` · ${toolCall.preview.summary}`}：
+                结果预览{toolCall.preview.summary && !toolCall.preview.report_preview && ` · ${toolCall.preview.summary}`}：
               </div>
               {toolCall.preview.error ? (
                 <div className="bg-red-50 text-red-700 rounded p-1.5">
-                  ❌ {toolCall.preview.error}
+                  {toolCall.preview.error}
+                </div>
+              ) : toolCall.preview.report_preview ? (
+                <div className="bg-muted/40 rounded p-1.5 whitespace-pre-wrap text-foreground/80">
+                  {toolCall.preview.report_preview}
+                  {toolCall.preview.report_preview.length >= 300 && "..."}
                 </div>
               ) : toolCall.preview.items && toolCall.preview.items.length > 0 ? (
                 <ul className="bg-muted/40 rounded p-1.5 space-y-1">

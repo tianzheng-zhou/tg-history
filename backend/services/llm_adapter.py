@@ -5,8 +5,9 @@ from openai import AsyncOpenAI
 
 from backend.config import settings
 
-# 全局并发控制
-_CHAT_SEM = asyncio.Semaphore(30)
+# 分 Provider 并发控制（月之暗面并发限制 = 3）
+_DASHSCOPE_CHAT_SEM = asyncio.Semaphore(10)
+_MOONSHOT_CHAT_SEM = asyncio.Semaphore(3)
 _EMBED_SEM = asyncio.Semaphore(20)
 
 # ---------- 多 Provider 单例 client ----------
@@ -66,6 +67,11 @@ def get_client_for_model(model: str) -> AsyncOpenAI:
     if is_kimi_model(model):
         return _get_moonshot_client()
     return _get_client()
+
+
+def get_chat_semaphore(model: str) -> asyncio.Semaphore:
+    """获取模型对应 provider 的 chat 并发 semaphore"""
+    return _MOONSHOT_CHAT_SEM if is_kimi_model(model) else _DASHSCOPE_CHAT_SEM
 
 
 # ---------- 模型上下文窗口 ----------
@@ -161,7 +167,7 @@ async def chat(
         kwargs.update(_kimi_chat_kwargs(model, temperature, enable_thinking))
     elif enable_thinking is not None:
         kwargs["extra_body"] = {"enable_thinking": enable_thinking}
-    async with _CHAT_SEM:
+    async with get_chat_semaphore(model):
         resp = await client.chat.completions.create(**kwargs)
     return resp.choices[0].message.content or ""
 
@@ -184,11 +190,12 @@ async def chat_stream(
     )
     if is_kimi_model(model):
         kwargs.update(_kimi_chat_kwargs(model, temperature, False))
-    stream = await client.chat.completions.create(**kwargs)
-    async for chunk in stream:
-        delta = chunk.choices[0].delta
-        if delta.content:
-            yield delta.content
+    async with get_chat_semaphore(model):
+        stream = await client.chat.completions.create(**kwargs)
+        async for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                yield delta.content
 
 
 async def embed(texts: list[str], model: str | None = None) -> list[list[float]]:

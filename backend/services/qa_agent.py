@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import AsyncIterator
@@ -28,6 +29,12 @@ from backend.config import settings
 from backend.models.database import Message
 from backend.services import llm_adapter
 from backend.services.qa_tools import TOOL_SCHEMAS, dispatch_tool
+
+# Orchestrator 只需要 research + list_chats 两个工具
+ORCHESTRATOR_TOOL_SCHEMAS = [
+    t for t in TOOL_SCHEMAS
+    if t["function"]["name"] in ("research", "list_chats")
+]
 
 MAX_STEPS = 30  # 最大 agent 迭代轮数，防止死循环
 MAX_TOOL_OUTPUT_CHARS = 50000  # 塞回 LLM 的单次工具输出最大字符数（降低防止上下文溢出）
@@ -85,25 +92,26 @@ def _trim_messages_to_budget(messages: list[dict], model: str) -> tuple[list[dic
     return result, True
 
 
-SYSTEM_PROMPT = """你是一个专业的 Telegram 聊天记录分析助手。用户可能会问各种关于群聊记录的问题：技术讨论、商业信息、某人的观点、某事件的来龙去脉等。
+SYSTEM_PROMPT = """你是一个 Telegram 聊天记录分析的 Orchestrator。你的工作是：
 
-你被授予一组检索工具来查询聊天数据库。你的工作流程应当：
+1. **分析用户问题**，判断复杂度
+2. **拆分为具体的检索子任务**，每个子任务有明确的目标和边界
+3. **通过 research 工具将子任务委派给检索子 Agent**（每个子 Agent 拥有独立上下文窗口）
+4. **收集所有子 Agent 的报告，合并去重，生成最终答案**
 
-1. **理解问题**：先思考用户真正想知道什么；如不确定数据范围，可用 list_chats 了解可用群聊
-2. **制定检索计划**：复杂问题应拆成多步，每步用合适的工具
-3. **执行工具**：
-   - **semantic_search** 是首选——用自然语言描述你要找什么
-   - **检索数量要够**：调研型问题（梳理/统计/对比）建议 top_k=80~150；精确事实型问题 top_k=15~30
-   - **keyword_search** 用于精确关键词（型号、URL、代码等）
-   - 结果不够充分时调整查询再搜一次，或换工具
-   - 找到相关的 message_ids / topic_id 后用 fetch_messages / fetch_topic_context 读完整内容
-4. **综合答案**：基于工具返回的真实证据回答，**引用具体发言人和日期**
+任务拆分原则：
+- **简单事实型问题**（“XX 说了什么”）：1 个 research 子任务
+- **对比/列举型问题**（“讨论过哪些方案”）：2-3 个 research 子任务，按维度分
+- **复杂调研型问题**（“全面梳理 XX 话题”）：3-5 个 research 子任务，按子主题分
 
-关键原则：
-- 如果信息不足，大方承认"根据现有记录未找到"，不要编造
-- 简短问题可以一次搜索就回答，复杂问题多次迭代
-- **宁可多检索一些再筛选，也不要因为样本太少而遗漏关键信息**
+**重要规则**：
+- 一次性发起多个 research 调用来并行执行（放在同一轮 tool_calls 中）
+- 每个子任务描述要详细，包含：要搜什么、关注哪些方面、预期返回什么信息
+- 如果不确定数据范围，可先用 list_chats 了解可用群聊
+- 收到子 Agent 报告后，综合所有报告生成结构化最终答案
+- 如果某个子任务报告信息不足，可以发起补充 research
 - 最终答案用 Markdown 格式，**标注来源**（发言人 + 日期）
+- 如果信息不足，大方承认“根据现有记录未找到”，不要编造
 
 你最多可以进行 {max_steps} 轮工具调用。请高效完成任务。
 """.format(max_steps=MAX_STEPS)
@@ -135,9 +143,8 @@ async def _stream_llm_step(
     kwargs = dict(
         model=model,
         messages=messages,
-        tools=TOOL_SCHEMAS,
+        tools=ORCHESTRATOR_TOOL_SCHEMAS,
         tool_choice="auto",
-        max_tokens=32768 if is_kimi else 2048,
         stream=True,
         # 启用 usage 统计（最后一个 chunk 会带 usage 字段）
         stream_options={"include_usage": True},
@@ -152,60 +159,62 @@ async def _stream_llm_step(
         kwargs["parallel_tool_calls"] = True
         kwargs["temperature"] = 0.3
 
-    stream = await client.chat.completions.create(**kwargs)
-
-    # 需要把 streaming tool_calls 聚合
+    # semaphore 覆盖 create + 整个流式迭代（HTTP 连接期间占用并发 slot）
+    sem = llm_adapter.get_chat_semaphore(model)
     tool_calls_acc: dict[int, dict] = {}
     reasoning_parts: list[str] = []
     last_usage: dict | None = None
 
-    async for chunk in stream:
-        # 捕获 usage（通常在最后一个 chunk，choices 可能为空）
-        usage = getattr(chunk, "usage", None)
-        if usage is not None:
-            last_usage = {
-                "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-                "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
-                "total_tokens": getattr(usage, "total_tokens", 0) or 0,
-                "model": model,
-            }
+    async with sem:
+        stream = await client.chat.completions.create(**kwargs)
 
-        choice = chunk.choices[0] if chunk.choices else None
-        if not choice:
-            continue
-        delta = choice.delta
+        async for chunk in stream:
+            # 捕获 usage（通常在最后一个 chunk，choices 可能为空）
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                last_usage = {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                    "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                    "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+                    "model": model,
+                }
 
-        # Kimi reasoning_content（思考链 token）
-        rc = getattr(delta, "reasoning_content", None)
-        if rc:
-            reasoning_parts.append(rc)
-            yield {"type": "reasoning_delta", "text": rc}
+            choice = chunk.choices[0] if chunk.choices else None
+            if not choice:
+                continue
+            delta = choice.delta
 
-        # 文本 token
-        if delta.content:
-            yield {"type": "text_delta", "text": delta.content}
+            # Kimi reasoning_content（思考链 token）
+            rc = getattr(delta, "reasoning_content", None)
+            if rc:
+                reasoning_parts.append(rc)
+                yield {"type": "reasoning_delta", "text": rc}
 
-        # 工具调用分片聚合
-        if delta.tool_calls:
-            for tc in delta.tool_calls:
-                idx = tc.index
-                if idx not in tool_calls_acc:
-                    tool_calls_acc[idx] = {
-                        "id": tc.id or "",
-                        "name": "",
-                        "arguments": "",
-                    }
-                slot = tool_calls_acc[idx]
-                if tc.id:
-                    slot["id"] = tc.id
-                if tc.function:
-                    if tc.function.name:
-                        slot["name"] += tc.function.name
-                    if tc.function.arguments:
-                        slot["arguments"] += tc.function.arguments
+            # 文本 token
+            if delta.content:
+                yield {"type": "text_delta", "text": delta.content}
 
-        # 注意：有 stream_options.include_usage 时，usage 事件在 finish_reason
-        # 之后的下一个 chunk 才出现，所以不能 break on finish_reason
+            # 工具调用分片聚合
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_calls_acc:
+                        tool_calls_acc[idx] = {
+                            "id": tc.id or "",
+                            "name": "",
+                            "arguments": "",
+                        }
+                    slot = tool_calls_acc[idx]
+                    if tc.id:
+                        slot["id"] = tc.id
+                    if tc.function:
+                        if tc.function.name:
+                            slot["name"] += tc.function.name
+                        if tc.function.arguments:
+                            slot["arguments"] += tc.function.arguments
+
+            # 注意：有 stream_options.include_usage 时，usage 事件在 finish_reason
+            # 之后的下一个 chunk 才出现，所以不能 break on finish_reason
 
     # 聚合完成，yield 完整 tool_calls
     if tool_calls_acc:
@@ -353,6 +362,8 @@ async def run_agent(
         yield {"type": "step_done", "step": step, "had_tool_calls": True,
                "tool_count": len(step_tool_calls)}
 
+        # 解析所有 tool_calls 的参数
+        parsed_calls: list[tuple[dict, dict]] = []  # (call, args)
         for call in step_tool_calls:
             name = call["name"]
             args_str = call["arguments"] or "{}"
@@ -384,18 +395,77 @@ async def run_agent(
                     "content": json.dumps(err_result, ensure_ascii=False),
                 })
                 continue
+            parsed_calls.append((call, args))
 
+        # 发射所有 tool_call 事件
+        for call, args in parsed_calls:
             yield {
                 "type": "tool_call",
                 "step": step,
                 "id": call["id"],
-                "name": name,
+                "name": call["name"],
                 "args": args,
             }
 
+        # 收集子 Agent 进度事件，稍后统一 yield（因为 asyncio.gather 中不能 yield）
+        sub_events: list[dict] = []
+
+        async def _sub_event_cb(ev: dict):
+            sub_events.append(ev)
+
+        # 并发执行所有 research 调用（semaphore 自动限流），其他工具顺序执行
+        async def _exec_one(call: dict, args: dict) -> tuple[dict, dict, int]:
+            """执行单个工具，返回 (call, result, duration_ms)"""
             t0 = time.time()
-            result = await dispatch_tool(db, name, args)
+            cb = _sub_event_cb if call["name"] == "research" else None
+            result = await dispatch_tool(db, call["name"], args, event_callback=cb)
             duration_ms = int((time.time() - t0) * 1000)
+            return call, result, duration_ms
+
+        # 判断是否有 research 调用 → 并发执行全部（包括 list_chats 等轻量工具）
+        has_research = any(c["name"] == "research" for c, _ in parsed_calls)
+        if has_research and len(parsed_calls) > 1:
+            # 并发执行所有工具调用，由 semaphore 自然限流
+            exec_results = await asyncio.gather(
+                *[_exec_one(c, a) for c, a in parsed_calls],
+                return_exceptions=True,
+            )
+        else:
+            # 单个或无 research：顺序执行（同样捕获异常，保持与 gather 行为一致）
+            exec_results = []
+            for c, a in parsed_calls:
+                try:
+                    exec_results.append(await _exec_one(c, a))
+                except Exception as exc:
+                    exec_results.append(exc)
+
+        # 先 yield 子 Agent 进度事件
+        for ev in sub_events:
+            yield {"type": "sub_agent_event", "step": step, **ev}
+
+        # 处理执行结果
+        for i, item in enumerate(exec_results):
+            if isinstance(item, Exception):
+                # asyncio.gather return_exceptions=True
+                err_call = parsed_calls[i][0]
+                err_result = {"error": f"工具执行异常: {item}"}
+                yield {
+                    "type": "tool_result",
+                    "step": step,
+                    "id": err_call["id"],
+                    "name": err_call["name"],
+                    "output_preview": err_result,
+                    "duration_ms": 0,
+                    "error": True,
+                }
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": err_call["id"],
+                    "content": json.dumps(err_result, ensure_ascii=False),
+                })
+                continue
+
+            call, result, duration_ms = item
 
             # 收集消息 ID 用于后续引用
             _collect_ids(result, cited_message_ids)
@@ -407,7 +477,7 @@ async def run_agent(
                 "type": "tool_result",
                 "step": step,
                 "id": call["id"],
-                "name": name,
+                "name": call["name"],
                 "output_preview": _make_preview(result),
                 "duration_ms": duration_ms,
                 "error": "error" in result,
@@ -436,7 +506,6 @@ async def run_agent(
             _force_kwargs = dict(
                 model=_model,
                 messages=messages,
-                max_tokens=32768 if llm_adapter.is_kimi_model(_model) else 2048,
                 stream=True,
             )
             if llm_adapter.is_kimi_model(_model):
@@ -444,13 +513,15 @@ async def run_agent(
                 _force_kwargs["temperature"] = 0.6
             else:
                 _force_kwargs["temperature"] = 0.3
-            stream = await _client.chat.completions.create(**_force_kwargs)
+            _sem = llm_adapter.get_chat_semaphore(_model)
             forced_text = ""
-            async for chunk in stream:
-                choice = chunk.choices[0] if chunk.choices else None
-                if choice and choice.delta.content:
-                    forced_text += choice.delta.content
-                    yield {"type": "thinking_delta", "step": MAX_STEPS + 1, "text": choice.delta.content}
+            async with _sem:
+                stream = await _client.chat.completions.create(**_force_kwargs)
+                async for chunk in stream:
+                    choice = chunk.choices[0] if chunk.choices else None
+                    if choice and choice.delta.content:
+                        forced_text += choice.delta.content
+                        yield {"type": "thinking_delta", "step": MAX_STEPS + 1, "text": choice.delta.content}
             final_text_parts.append(forced_text)
         except Exception as e:
             yield {"type": "error", "error": f"强制总结失败: {e}"}
@@ -501,10 +572,10 @@ async def _force_summarize_recovery(messages: list[dict], cited_ids: set[int]) -
 
     try:
         client = llm_adapter.get_client_for_model(model)
+        sem = llm_adapter.get_chat_semaphore(model)
         kwargs = dict(
             model=model,
             messages=recovery_msgs,
-            max_tokens=32768 if llm_adapter.is_kimi_model(model) else 2048,
             stream=False,
         )
         if llm_adapter.is_kimi_model(model):
@@ -512,7 +583,8 @@ async def _force_summarize_recovery(messages: list[dict], cited_ids: set[int]) -
             kwargs["temperature"] = 0.6
         else:
             kwargs["temperature"] = 0.3
-        resp = await client.chat.completions.create(**kwargs)
+        async with sem:
+            resp = await client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content or ""
     except Exception:
         return ""
@@ -522,6 +594,12 @@ def _collect_ids(result: dict, acc: set[int]) -> None:
     """从工具结果中提取所有 message_id，用来构建最终引用"""
     if not isinstance(result, dict):
         return
+    # sub_agent 返回的 message_ids 列表（research 工具）
+    mids_top = result.get("message_ids")
+    if isinstance(mids_top, list):
+        for x in mids_top:
+            if isinstance(x, int):
+                acc.add(x)
     # 直接的 messages 列表
     for key in ("messages", "results"):
         items = result.get(key)
@@ -546,6 +624,16 @@ def _make_preview(result: dict) -> dict:
 
     if "error" in result:
         return {"error": result["error"]}
+
+    # research 工具（子 Agent）返回
+    if "report" in result:
+        report_text = result["report"] or ""
+        return {
+            "summary": f"子 Agent 报告 ({result.get('steps', '?')} 步, "
+                       f"{result.get('tool_calls_count', '?')} 次工具调用, "
+                       f"{len(result.get('message_ids', []))} 条引用)",
+            "report_preview": report_text[:300],
+        }
 
     # 根据不同工具返回，生成简洁摘要
     preview: dict = {}

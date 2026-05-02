@@ -369,6 +369,31 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "research",
+            "description": "委派一个独立的检索子任务给子 Agent。子 Agent 拥有独立上下文窗口，"
+                           "会自主执行多轮搜索和分析，返回详细报告。"
+                           "你应该将复杂问题拆分为多个子任务，并行发起多个 research 调用。"
+                           "每个子任务描述要详细，包含：要搜什么、关注哪些方面、预期返回什么信息。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "详细的检索任务描述（要搜什么、关注哪些方面、预期返回什么）",
+                    },
+                    "chat_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选：限定搜索范围的群聊 ID 列表",
+                    },
+                },
+                "required": ["task"],
+            },
+        },
+    },
 ]
 
 
@@ -382,11 +407,27 @@ TOOL_HANDLERS = {
     "fetch_topic_context": tool_fetch_topic_context,
     "search_by_sender": tool_search_by_sender,
     "search_by_date": tool_search_by_date,
+    # research 工具在 dispatch_tool 中特殊处理（调用 sub_agent）
 }
 
 
-async def dispatch_tool(db: Session, name: str, args: dict) -> dict:
+async def dispatch_tool(db: Session, name: str, args: dict, event_callback=None) -> dict:
     """根据名字 dispatch 到对应 handler，统一错误处理"""
+    # research 工具特殊处理：调用子 Agent
+    if name == "research":
+        from backend.services.sub_agent import run_sub_agent
+        try:
+            return await run_sub_agent(
+                db=db,
+                task=args.get("task", ""),
+                chat_ids=args.get("chat_ids"),
+                event_callback=event_callback,
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return {"error": f"子 Agent 执行失败: {e}"}
+
     handler = TOOL_HANDLERS.get(name)
     if not handler:
         return {"error": f"未知工具: {name}"}
