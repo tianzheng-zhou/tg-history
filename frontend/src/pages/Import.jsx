@@ -213,6 +213,7 @@ export default function Import() {
                   <th className="text-left px-4 py-2 font-medium">消息数</th>
                   <th className="text-left px-4 py-2 font-medium">时间范围</th>
                   <th className="text-left px-4 py-2 font-medium">导入时间</th>
+                  <th className="text-left px-4 py-2 font-medium">索引状态</th>
                 </tr>
               </thead>
               <tbody>
@@ -227,6 +228,19 @@ export default function Import() {
                     </td>
                     <td className="px-4 py-2.5 text-muted-foreground">
                       {new Date(imp.imported_at).toLocaleString("zh-CN")}
+                    </td>
+                    <td className="px-4 py-2.5">
+                      {imp.index_built ? (
+                        <span className="inline-flex items-center gap-1 text-xs text-green-700 bg-green-50 px-2 py-0.5 rounded-full">
+                          <span className="w-1.5 h-1.5 rounded-full bg-green-500" />
+                          已索引
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 text-xs text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full">
+                          <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                          待索引
+                        </span>
+                      )}
                     </td>
                   </tr>
                 ))}

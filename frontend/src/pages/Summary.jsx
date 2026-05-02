@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { FileText, Loader2, RefreshCw } from "lucide-react";
 import { getChats, getSummaries, getSummaryProgress, triggerSummarize } from "@/lib/api";
@@ -32,9 +32,18 @@ export default function Summary() {
   useEffect(() => {
     getChats().then((data) => {
       setChats(data);
-      if (data.length > 0) setSelectedChat(data[0].chat_id);
+      const sorted = [...data].sort((a, b) => b.message_count - a.message_count);
+      if (sorted.length > 0) setSelectedChat(sorted[0].chat_id);
     });
   }, []);
+
+  const sortedChats = useMemo(() => {
+    return [...chats].sort((a, b) => b.message_count - a.message_count);
+  }, [chats]);
+
+  const maxCount = useMemo(() => {
+    return sortedChats.length > 0 ? sortedChats[0].message_count : 1;
+  }, [sortedChats]);
 
   useEffect(() => {
     if (selectedChat) {
@@ -94,22 +103,13 @@ export default function Summary() {
 
   const activeSummary = summaries.find((s) => s.category === activeTab);
 
+  const selectedChatObj = chats.find((c) => c.chat_id === selectedChat);
+
   return (
     <div>
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex items-center justify-between mb-4">
         <h1 className="text-2xl font-bold">摘要报告</h1>
-        <div className="flex items-center gap-3">
-          <select
-            className="border border-border rounded-md px-3 py-1.5 bg-card text-sm"
-            value={selectedChat || ""}
-            onChange={(e) => setSelectedChat(e.target.value)}
-          >
-            {chats.map((c) => (
-              <option key={c.chat_id} value={c.chat_id}>
-                {c.chat_name}
-              </option>
-            ))}
-          </select>
+        <div className="flex items-center gap-2">
           <button
             onClick={() => handleGenerate(false)}
             disabled={generating || !selectedChat}
@@ -133,6 +133,29 @@ export default function Summary() {
             </button>
           )}
         </div>
+      </div>
+
+      {/* 群聊选择卡片 */}
+      <div className="flex gap-2 overflow-x-auto pb-2 mb-4">
+        {sortedChats.map((c) => (
+          <button
+            key={c.chat_id}
+            onClick={() => setSelectedChat(c.chat_id)}
+            className={`shrink-0 text-left px-3 py-2 rounded-lg border-y border-r border-l-4 text-sm transition-all ${
+              selectedChat === c.chat_id
+                ? "border-y-primary border-r-primary bg-primary/5 ring-1 ring-primary"
+                : "border-y-border border-r-border bg-card hover:bg-accent"
+            }`}
+            style={{
+              borderLeftColor: `rgba(37, 99, 235, ${0.15 + 0.85 * (c.message_count / maxCount)})`,
+            }}
+          >
+            <span className="font-medium">{c.chat_name}</span>
+            <span className="text-xs text-muted-foreground ml-2">
+              {c.message_count.toLocaleString()}
+            </span>
+          </button>
+        ))}
       </div>
 
       {error && (

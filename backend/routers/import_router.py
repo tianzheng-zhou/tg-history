@@ -99,9 +99,6 @@ def _import_single_chat(parsed: dict, db: Session) -> ImportResult:
 
     db.commit()
 
-    # 构建话题树
-    build_topics(db, chat_id)
-
     return ImportResult(
         chat_id=chat_id,
         chat_name=chat_name,
@@ -111,20 +108,22 @@ def _import_single_chat(parsed: dict, db: Session) -> ImportResult:
 
 
 _index_lock = threading.Lock()
-_index_queue: list[str] = []  # 等待构建的 chat_id
+_index_queue: list[str] = []
 _index_progress: dict = {
     "running": False,
     "total": 0,
     "completed": 0,
     "current_chat": "",
+    "active_chats": [],
+    "chat_details": {},       # chat_name → {stage, topic_done, topic_total, index_done, index_total}
     "results": [],
 }
 
+MAX_PARALLEL = 16  # 群聊级并发上限（实际 LLM/embed 并发由 llm_adapter 全局 semaphore 控制）
+
 
 def _enqueue_index(chat_ids: list[str]):
-    """将 chat_id 加入队列，如果没有工作线程在跑则启动一个"""
     with _index_lock:
-        # 去重：跳过已在队列中的
         existing = set(_index_queue)
         for cid in chat_ids:
             if cid not in existing:
@@ -132,40 +131,46 @@ def _enqueue_index(chat_ids: list[str]):
                 existing.add(cid)
 
         if _index_progress["running"]:
-            # 已有工作线程，更新 total
             _index_progress["total"] = _index_progress["completed"] + len(_index_queue)
             return
 
-    # 没有工作线程，启动一个
     t = threading.Thread(target=_index_worker, daemon=True)
     t.start()
 
 
 def _index_worker():
-    """单线程索引工作者，持续消费队列直到为空"""
     with _index_lock:
         _index_progress["running"] = True
         _index_progress["completed"] = 0
         _index_progress["total"] = len(_index_queue)
         _index_progress["current_chat"] = ""
+        _index_progress["active_chats"] = []
+        _index_progress["chat_details"] = {}
         _index_progress["results"] = []
 
-    async def _run():
-        db = SessionLocal()
-        try:
-            while True:
-                with _index_lock:
-                    if not _index_queue:
-                        break
-                    chat_id = _index_queue.pop(0)
-                    _index_progress["total"] = _index_progress["completed"] + len(_index_queue) + 1
-
+    async def _process_one(chat_id: str, sem: asyncio.Semaphore):
+        async with sem:
+            db = SessionLocal()
+            try:
                 imp = db.query(Import).filter(Import.chat_id == chat_id).first()
                 chat_name = imp.chat_name if imp else chat_id
-                _index_progress["current_chat"] = chat_name
+
+                detail = {"stage": "topics", "topic_done": 0, "topic_total": 0,
+                          "index_done": 0, "index_total": 0}
+                with _index_lock:
+                    _index_progress["active_chats"].append(chat_name)
+                    _index_progress["chat_details"][chat_name] = detail
+                    _index_progress["current_chat"] = chat_name
 
                 try:
-                    indexed = await build_index_for_chat(db, chat_id)
+                    logger.info(f"话题构建中: {chat_name}")
+                    detail["stage"] = "topics"
+                    await build_topics(db, chat_id, progress=detail)
+
+                    logger.info(f"向量索引构建中: {chat_name}")
+                    detail["stage"] = "indexing"
+                    indexed = await build_index_for_chat(db, chat_id, progress=detail)
+
                     if imp:
                         imp.index_built = True
                         db.commit()
@@ -175,9 +180,9 @@ def _index_worker():
                         "status": "ok",
                         "topics": indexed,
                     })
-                    logger.info(f"向量索引构建完成: {chat_name} ({indexed} chunks)")
+                    logger.info(f"构建完成: {chat_name} ({indexed} chunks)")
                 except Exception as e:
-                    logger.warning(f"向量索引构建失败({chat_name}): {e}")
+                    logger.warning(f"构建失败({chat_name}): {e}")
                     _index_progress["results"].append({
                         "chat_id": chat_id,
                         "chat_name": chat_name,
@@ -185,12 +190,42 @@ def _index_worker():
                         "error": str(e)[:200],
                     })
                     db.rollback()
+                    # 标记为未索引（重建失败时旧的索引状态需失效）
+                    try:
+                        imp_fail = db.query(Import).filter(Import.chat_id == chat_id).first()
+                        if imp_fail:
+                            imp_fail.index_built = False
+                            db.commit()
+                    except Exception:
+                        db.rollback()
+                finally:
+                    with _index_lock:
+                        _index_progress["completed"] += 1
+                        if chat_name in _index_progress["active_chats"]:
+                            _index_progress["active_chats"].remove(chat_name)
+                        _index_progress["chat_details"].pop(chat_name, None)
+                        _index_progress["current_chat"] = (
+                            _index_progress["active_chats"][0]
+                            if _index_progress["active_chats"] else ""
+                        )
+            finally:
+                db.close()
 
-                _index_progress["completed"] += 1
-        finally:
-            _index_progress["running"] = False
-            _index_progress["current_chat"] = ""
-            db.close()
+    async def _run():
+        sem = asyncio.Semaphore(MAX_PARALLEL)
+        with _index_lock:
+            all_ids = list(_index_queue)
+            _index_queue.clear()
+            _index_progress["total"] = _index_progress["completed"] + len(all_ids)
+
+        tasks = [asyncio.create_task(_process_one(cid, sem)) for cid in all_ids]
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        _index_progress["running"] = False
+        _index_progress["current_chat"] = ""
+        _index_progress["active_chats"] = []
+        _index_progress["chat_details"] = {}
 
     asyncio.run(_run())
 

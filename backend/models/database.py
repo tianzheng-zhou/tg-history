@@ -66,7 +66,7 @@ class Import(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     chat_name = Column(String)
     chat_id = Column(String, unique=True)
-    imported_at = Column(DateTime, default=datetime.utcnow)
+    imported_at = Column(DateTime, default=datetime.now)
     message_count = Column(Integer, default=0)
     date_range = Column(String)  # "2024-01-01 ~ 2024-06-30"
     index_built = Column(Boolean, default=False)  # 向量索引是否已构建
@@ -105,7 +105,11 @@ def get_engine():
     _ensure_data_dir()
     engine = create_engine(
         settings.db_url,
-        connect_args={"check_same_thread": False},
+        connect_args={"check_same_thread": False, "timeout": 30},
+        pool_size=30,
+        max_overflow=50,
+        pool_timeout=60,
+        pool_recycle=1800,
         echo=False,
     )
 

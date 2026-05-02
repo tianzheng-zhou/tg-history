@@ -108,11 +108,11 @@ export default function IndexManager() {
           <div className="flex items-center gap-2 mb-2">
             <Loader2 size={18} className="text-blue-600 animate-spin" />
             <span className="font-medium text-blue-800">
-              正在构建向量索引 ({progress.completed}/{progress.total})
+              正在构建索引 ({progress.completed}/{progress.total})
               {progress.queued > 0 && ` · 排队中 ${progress.queued}`}
             </span>
           </div>
-          <div className="w-full bg-blue-100 rounded-full h-2 mb-2">
+          <div className="w-full bg-blue-100 rounded-full h-2 mb-3">
             <div
               className="bg-blue-500 h-2 rounded-full transition-all duration-500"
               style={{
@@ -122,10 +122,34 @@ export default function IndexManager() {
               }}
             />
           </div>
-          {progress.current_chat && (
-            <p className="text-xs text-blue-600">
-              当前: {progress.current_chat}
-            </p>
+          {progress.chat_details && Object.keys(progress.chat_details).length > 0 && (
+            <div className="space-y-2">
+              {Object.entries(progress.chat_details).map(([name, d]) => {
+                const isTopics = d.stage === "topics";
+                const pct = isTopics
+                  ? (d.topic_total > 0 ? (d.topic_done / d.topic_total) * 100 : 0)
+                  : (d.index_total > 0 ? (d.index_done / d.index_total) * 100 : 0);
+                const label = isTopics
+                  ? `语义切分 ${d.topic_done}/${d.topic_total}`
+                  : `向量索引 ${d.index_done}/${d.index_total}`;
+                return (
+                  <div key={name} className="flex items-center gap-2">
+                    <span className="text-xs text-blue-700 w-36 truncate shrink-0" title={name}>{name}</span>
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${
+                      isTopics ? "bg-purple-100 text-purple-700" : "bg-green-100 text-green-700"
+                    }`}>{label}</span>
+                    <div className="flex-1 bg-blue-100 rounded-full h-1.5">
+                      <div
+                        className={`h-full rounded-full transition-all duration-300 ${
+                          isTopics ? "bg-purple-500" : "bg-green-500"
+                        }`}
+                        style={{ width: `${Math.min(pct, 100)}%` }}
+                      />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           )}
         </div>
       )}

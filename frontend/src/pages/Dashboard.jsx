@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   MessageSquare,
@@ -6,6 +6,9 @@ import {
   Calendar,
   FolderOpen,
   ArrowRight,
+  Search,
+  Database,
+  CheckCircle2,
 } from "lucide-react";
 import {
   BarChart,
@@ -39,6 +42,7 @@ export default function Dashboard() {
   const [stats, setStats] = useState(null);
   const [selectedChat, setSelectedChat] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
 
   useEffect(() => {
     getChats()
@@ -59,6 +63,20 @@ export default function Dashboard() {
         .catch(() => setStats(null));
     }
   }, [selectedChat]);
+
+  const sorted = useMemo(() => {
+    return [...chats].sort((a, b) => b.message_count - a.message_count);
+  }, [chats]);
+
+  const maxCount = useMemo(() => {
+    return sorted.length > 0 ? sorted[0].message_count : 1;
+  }, [sorted]);
+
+  const filtered = useMemo(() => {
+    if (!search.trim()) return sorted;
+    const q = search.toLowerCase();
+    return sorted.filter((c) => c.chat_name.toLowerCase().includes(q));
+  }, [sorted, search]);
 
   if (loading) {
     return (
@@ -90,18 +108,54 @@ export default function Dashboard() {
 
       {/* 群聊选择 */}
       <div className="mb-6">
-        <label className="text-sm text-muted-foreground mb-2 block">选择群聊</label>
-        <select
-          className="border border-border rounded-md px-3 py-2 bg-card text-sm w-full max-w-xs"
-          value={selectedChat || ""}
-          onChange={(e) => setSelectedChat(e.target.value)}
-        >
-          {chats.map((c) => (
-            <option key={c.chat_id} value={c.chat_id}>
-              {c.chat_name} ({c.message_count} 条消息)
-            </option>
+        <div className="flex items-center gap-2 mb-3">
+          <label className="text-sm font-medium">选择群聊</label>
+          <span className="text-xs text-muted-foreground">({chats.length} 个群聊)</span>
+        </div>
+        {chats.length > 6 && (
+          <div className="relative mb-2 max-w-xs">
+            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
+            <input
+              type="text"
+              placeholder="搜索群聊..."
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className="w-full border border-border rounded-md pl-8 pr-3 py-1.5 bg-card text-sm focus:outline-none focus:ring-1 focus:ring-primary"
+            />
+          </div>
+        )}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 max-h-64 overflow-y-auto pr-1">
+          {filtered.map((c) => (
+            <button
+              key={c.chat_id}
+              onClick={() => setSelectedChat(c.chat_id)}
+              className={`text-left px-3 py-2.5 rounded-lg border-y border-r transition-all border-l-4 ${
+                selectedChat === c.chat_id
+                  ? "border-y-primary border-r-primary bg-primary/5 ring-1 ring-primary"
+                  : "border-y-border border-r-border bg-card hover:bg-accent"
+              }`}
+              style={{
+                borderLeftColor: `rgba(37, 99, 235, ${0.15 + 0.85 * (c.message_count / maxCount)})`,
+              }}
+            >
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-medium truncate">{c.chat_name}</span>
+                {c.index_built ? (
+                  <CheckCircle2 size={14} className="text-green-500 shrink-0" />
+                ) : (
+                  <Database size={14} className="text-amber-400 shrink-0" />
+                )}
+              </div>
+              <div className="flex items-center gap-2 mt-0.5">
+                <span className="text-xs text-muted-foreground">
+                  {c.message_count.toLocaleString()} 条消息
+                </span>
+                <span className="text-xs text-muted-foreground">·</span>
+                <span className="text-xs text-muted-foreground">{c.date_range}</span>
+              </div>
+            </button>
           ))}
-        </select>
+        </div>
       </div>
 
       {stats && (

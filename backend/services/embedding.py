@@ -1,5 +1,6 @@
 """向量嵌入服务 — ChromaDB 集成"""
 
+import asyncio
 from pathlib import Path
 
 import chromadb
@@ -33,23 +34,34 @@ async def add_documents(
     texts: list[str],
     metadatas: list[dict] | None = None,
     batch_size: int = 10,
+    progress: dict | None = None,
 ):
-    """批量添加文档到向量索引"""
+    """批量添加文档到向量索引（并发 embedding）"""
     collection = get_or_create_collection()
 
-    for i in range(0, len(texts), batch_size):
-        batch_ids = ids[i : i + batch_size]
-        batch_texts = texts[i : i + batch_size]
-        batch_meta = metadatas[i : i + batch_size] if metadatas else None
-
+    async def _embed_batch(start: int) -> tuple[int, list[list[float]]]:
+        batch_texts = texts[start : start + batch_size]
         embeddings = await llm_adapter.embed(batch_texts)
+        return start, embeddings
 
+    starts = list(range(0, len(texts), batch_size))
+    # 并发计算所有 batch 的 embedding（受 _EMBED_SEM 限流）
+    embed_tasks = [_embed_batch(s) for s in starts]
+
+    # 按完成顺序写入 chroma，及时更新进度
+    for coro in asyncio.as_completed(embed_tasks):
+        start, embeddings = await coro
+        batch_ids = ids[start : start + batch_size]
+        batch_texts = texts[start : start + batch_size]
+        batch_meta = metadatas[start : start + batch_size] if metadatas else None
         collection.upsert(
             ids=batch_ids,
             embeddings=embeddings,
             documents=batch_texts,
             metadatas=batch_meta,
         )
+        if progress is not None:
+            progress["index_done"] = progress.get("index_done", 0) + len(batch_ids)
 
 
 async def search_similar(
@@ -118,7 +130,7 @@ def _chunk_lines(lines: list[str], msg_ids: list[int]) -> list[tuple[str, list[i
     return chunks
 
 
-async def build_index_for_chat(db_session, chat_id: str):
+async def build_index_for_chat(db_session, chat_id: str, progress: dict | None = None):
     """为指定群聊构建向量索引（大话题自动切分）"""
     from backend.models.database import Message, Topic
 
@@ -172,7 +184,11 @@ async def build_index_for_chat(db_session, chat_id: str):
                 "message_count": len(chunk_ids),
             })
 
+    if progress is not None:
+        progress["index_total"] = len(ids)
+        progress["index_done"] = 0
+
     if ids:
-        await add_documents(ids, texts, metadatas)
+        await add_documents(ids, texts, metadatas, progress=progress)
 
     return len(ids)
