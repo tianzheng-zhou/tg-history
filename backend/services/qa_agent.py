@@ -73,6 +73,7 @@ async def _stream_llm_step(
        - {"type": "reasoning_delta", "text": str}  (Kimi 思考链)
        - {"type": "tool_calls", "calls": [{"id", "name", "arguments"}]}  (完整聚合后)
        - {"type": "reasoning_content", "text": str}  (完整思考内容，供回传上下文)
+       - {"type": "usage", "prompt_tokens", "completion_tokens", "total_tokens", "model"}
        - {"type": "done"}
     """
     model = settings.llm_model_qa
@@ -86,6 +87,8 @@ async def _stream_llm_step(
         tool_choice="auto",
         max_tokens=32768 if is_kimi else 2048,
         stream=True,
+        # 启用 usage 统计（最后一个 chunk 会带 usage 字段）
+        stream_options={"include_usage": True},
     )
 
     if is_kimi:
@@ -102,8 +105,19 @@ async def _stream_llm_step(
     # 需要把 streaming tool_calls 聚合
     tool_calls_acc: dict[int, dict] = {}
     reasoning_parts: list[str] = []
+    last_usage: dict | None = None
 
     async for chunk in stream:
+        # 捕获 usage（通常在最后一个 chunk，choices 可能为空）
+        usage = getattr(chunk, "usage", None)
+        if usage is not None:
+            last_usage = {
+                "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+                "model": model,
+            }
+
         choice = chunk.choices[0] if chunk.choices else None
         if not choice:
             continue
@@ -138,8 +152,8 @@ async def _stream_llm_step(
                     if tc.function.arguments:
                         slot["arguments"] += tc.function.arguments
 
-        if choice.finish_reason:
-            break
+        # 注意：有 stream_options.include_usage 时，usage 事件在 finish_reason
+        # 之后的下一个 chunk 才出现，所以不能 break on finish_reason
 
     # 聚合完成，yield 完整 tool_calls
     if tool_calls_acc:
@@ -154,6 +168,19 @@ async def _stream_llm_step(
     # Kimi 要求多步工具调用时 assistant message 必须保留 reasoning_content
     if reasoning_parts:
         yield {"type": "reasoning_content", "text": "".join(reasoning_parts)}
+
+    # yield usage（供上层记录当前上下文占比）
+    if last_usage is not None:
+        max_ctx = llm_adapter.get_context_window(model)
+        yield {
+            "type": "usage",
+            "prompt_tokens": last_usage["prompt_tokens"],
+            "completion_tokens": last_usage["completion_tokens"],
+            "total_tokens": last_usage["total_tokens"],
+            "max_context": max_ctx,
+            "percent": round(last_usage["prompt_tokens"] / max_ctx, 4) if max_ctx else 0.0,
+            "model": model,
+        }
 
     yield {"type": "done"}
 
@@ -209,6 +236,9 @@ async def run_agent(
                     step_reasoning = ev["text"]
                 elif ev["type"] == "tool_calls":
                     step_tool_calls = ev["calls"]
+                elif ev["type"] == "usage":
+                    # 向上透传 usage（上下文占比显示）
+                    yield {**ev, "step": step}
                 elif ev["type"] == "done":
                     break
         except Exception as e:

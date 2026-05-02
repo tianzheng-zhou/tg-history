@@ -102,11 +102,92 @@ class AskResponse(BaseModel):
     confidence: str = "medium"
 
 
-class QAHistoryItem(BaseModel):
-    id: int
-    question: str
-    answer: str | None
+class UsageInfo(BaseModel):
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    max_context: int = 131072
+    percent: float = 0.0
+    model: str | None = None
+
+
+# ---------- Chat Sessions ----------
+
+class SessionCreateRequest(BaseModel):
+    title: str | None = None
+    mode: str = "agent"  # "agent" | "rag"
+    chat_ids: list[str] | None = None
+
+
+class SessionUpdateRequest(BaseModel):
+    title: str | None = None
+    pinned: bool | None = None
+    archived: bool | None = None
+    mode: str | None = None
+    chat_ids: list[str] | None = None
+
+
+class SessionSummary(BaseModel):
+    id: str
+    title: str
+    mode: str
+    chat_ids: list[str] | None = None
+    pinned: bool = False
+    archived: bool = False
+    turn_count: int = 0
+    last_preview: str | None = None
     created_at: datetime
+    updated_at: datetime
+
+
+class SessionListResponse(BaseModel):
+    sessions: list[SessionSummary]
+    total: int
+
+
+class TurnItem(BaseModel):
+    id: int
+    seq: int
+    role: str
+    content: str | None = None
+    sources: list[SourceItem] | None = None
+    trajectory: dict | None = None
+    mode: str | None = None
+    meta: dict | None = None
+    created_at: datetime
+
+
+class SessionDetailResponse(BaseModel):
+    session: SessionSummary
+    turns: list[TurnItem]
+
+
+# ---------- Runs ----------
+
+class RunStartRequest(BaseModel):
+    question: str
+    session_id: str | None = None
+    mode: str = "agent"  # "agent" | "rag"
+    chat_ids: list[str] | None = None
+    date_range: list[str] | None = None
+    sender: str | None = None
+
+
+class RunStartResponse(BaseModel):
+    run_id: str
+    session_id: str
+    title: str
+    already_running: bool = False  # 如果 session 已有进行中的 run，直接返回它
+
+
+class RunInfo(BaseModel):
+    run_id: str
+    session_id: str
+    mode: str
+    question: str
+    status: str  # pending | running | completed | aborted | failed | lost
+    started_at: datetime
+    completed_at: datetime | None = None
 
 
 # ---------- Settings ----------
@@ -125,6 +206,7 @@ class SettingsResponse(BaseModel):
     llm_model_map: str
     llm_model_reduce: str
     llm_model_qa: str
+    qa_context_window: int = 131072  # 当前 QA 模型的最大上下文窗口
     embedding_model: str
     rerank_model: str
     has_api_key: bool

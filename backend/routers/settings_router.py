@@ -4,22 +4,28 @@ from fastapi import APIRouter
 
 from backend.config import settings
 from backend.models.schemas import SettingsResponse, SettingsUpdate
+from backend.services import llm_adapter
 
 router = APIRouter(prefix="/api", tags=["settings"])
 
 
-@router.get("/settings", response_model=SettingsResponse)
-def get_settings():
-    """获取当前配置"""
+def _build_response() -> SettingsResponse:
     return SettingsResponse(
         llm_model_map=settings.llm_model_map,
         llm_model_reduce=settings.llm_model_reduce,
         llm_model_qa=settings.llm_model_qa,
+        qa_context_window=llm_adapter.get_context_window(settings.llm_model_qa),
         embedding_model=settings.embedding_model,
         rerank_model=settings.rerank_model,
         has_api_key=bool(settings.dashscope_api_key),
         has_moonshot_key=bool(settings.moonshot_api_key),
     )
+
+
+@router.get("/settings", response_model=SettingsResponse)
+def get_settings():
+    """获取当前配置"""
+    return _build_response()
 
 
 @router.put("/settings", response_model=SettingsResponse)
@@ -46,15 +52,7 @@ def update_settings(req: SettingsUpdate):
     # 持久化到 .env
     _persist_env()
 
-    return SettingsResponse(
-        llm_model_map=settings.llm_model_map,
-        llm_model_reduce=settings.llm_model_reduce,
-        llm_model_qa=settings.llm_model_qa,
-        embedding_model=settings.embedding_model,
-        rerank_model=settings.rerank_model,
-        has_api_key=bool(settings.dashscope_api_key),
-        has_moonshot_key=bool(settings.moonshot_api_key),
-    )
+    return _build_response()
 
 
 def _persist_env():

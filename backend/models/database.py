@@ -84,14 +84,37 @@ class SummaryReport(Base):
     stale = Column(Boolean, default=False)  # 新数据导入后标记过期
 
 
-class QAHistory(Base):
-    __tablename__ = "qa_history"
+class ChatSession(Base):
+    """智能问答的会话（多轮对话容器）"""
+
+    __tablename__ = "chat_sessions"
+
+    id = Column(String, primary_key=True)  # UUID hex
+    title = Column(String, default="新对话")
+    mode = Column(String, default="agent")  # "agent" | "rag"
+    chat_ids = Column(Text)  # JSON：session 默认群聊过滤
+    pinned = Column(Boolean, default=False, index=True)
+    archived = Column(Boolean, default=False, index=True)
+    turn_count = Column(Integer, default=0)
+    last_preview = Column(String)  # 最后一条消息 80 字预览
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ChatTurn(Base):
+    """会话中的一轮消息（user 或 assistant）"""
+
+    __tablename__ = "chat_turns"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    question = Column(Text, nullable=False)
-    answer = Column(Text)
-    sources = Column(Text)  # JSON
-    chat_ids = Column(Text)  # JSON
+    session_id = Column(String, index=True, nullable=False)
+    seq = Column(Integer, nullable=False)  # session 内 0 基序号
+    role = Column(String, nullable=False)  # "user" | "assistant"
+    content = Column(Text)
+    sources = Column(Text)  # JSON，仅 assistant
+    trajectory = Column(Text)  # JSON，仅 assistant，完整 agent 推理链
+    mode = Column(String)  # "agent" | "rag" 本轮实际模式
+    meta = Column(Text)  # JSON：usage/confidence/aborted/run_id/...
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -129,6 +152,11 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 def init_db():
     """创建所有表 + FTS5 虚拟表（trigram tokenizer，对中文友好）"""
+    # 丢弃旧 QAHistory 表（已被 chat_sessions + chat_turns 替代）
+    with engine.connect() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS qa_history"))
+        conn.commit()
+
     Base.metadata.create_all(bind=engine)
     with engine.connect() as conn:
         # 检查现有 FTS 表的 tokenizer：trigram 对中文/CJK 远好于默认 unicode61

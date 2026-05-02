@@ -70,11 +70,16 @@ export async function getSummaryProgress() {
   return data;
 }
 
-// ---------- QA ----------
+// ---------- QA: 启动 Run ----------
 
-export async function askQuestion(question, options = {}) {
-  const { data } = await api.post("/ask", {
+/**
+ * 启动一个 Agent 模式 run，立刻返回 {run_id, session_id, title, already_running}。
+ */
+export async function startAgentRun(question, options = {}) {
+  const { data } = await api.post("/ask/agent", {
     question,
+    session_id: options.sessionId || null,
+    mode: "agent",
     chat_ids: options.chatIds || null,
     date_range: options.dateRange || null,
     sender: options.sender || null,
@@ -83,29 +88,46 @@ export async function askQuestion(question, options = {}) {
 }
 
 /**
- * 流式 RAG 问答。逐事件推送 RAG 各阶段状态。
- * @param {string} question
- * @param {object} options - { chatIds, dateRange, sender, signal, onEvent }
- *   - onEvent(ev): 每收到一个事件回调，ev 形如 { type, ... }
+ * 启动一个 RAG 模式 run。
  */
-export async function askQuestionStream(question, options = {}) {
-  const body = {
+export async function startRagRun(question, options = {}) {
+  const { data } = await api.post("/ask/stream", {
     question,
+    session_id: options.sessionId || null,
+    mode: "rag",
     chat_ids: options.chatIds || null,
     date_range: options.dateRange || null,
     sender: options.sender || null,
-  };
+  });
+  return data;
+}
 
-  const resp = await fetch("/api/ask/stream", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+/**
+ * 订阅一个 run 的 SSE 事件流。
+ *
+ * @param {string} runId
+ * @param {object} options - { lastEventId?, signal?, onEvent? }
+ *   - lastEventId: 从此 seq 之后续播（默认 -1 = 从头开始）
+ *   - signal: AbortSignal
+ *   - onEvent(ev): 每收到一个事件回调
+ *
+ * 收到 `{type: "__end__", status}` 表示流结束。
+ */
+export async function streamRunEvents(runId, options = {}) {
+  const lastEventId = options.lastEventId ?? -1;
+  const url = `/api/runs/${encodeURIComponent(runId)}/events?last_event_id=${lastEventId}`;
+
+  const resp = await fetch(url, {
+    method: "GET",
+    headers: { Accept: "text/event-stream" },
     signal: options.signal,
   });
 
   if (!resp.ok) {
-    const errText = await resp.text();
-    throw new Error(`HTTP ${resp.status}: ${errText}`);
+    const errText = await resp.text().catch(() => "");
+    const err = new Error(`HTTP ${resp.status}: ${errText}`);
+    err.status = resp.status;
+    throw err;
   }
 
   const reader = resp.body.getReader();
@@ -117,83 +139,97 @@ export async function askQuestionStream(question, options = {}) {
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
 
-    // 按 SSE 事件分隔（\n\n）
     let idx;
     while ((idx = buffer.indexOf("\n\n")) !== -1) {
       const rawEvent = buffer.slice(0, idx);
       buffer = buffer.slice(idx + 2);
 
-      const dataLine = rawEvent
+      // 取出 data: 部分（可能多行）
+      const dataLines = rawEvent
         .split("\n")
         .filter((l) => l.startsWith("data:"))
-        .map((l) => l.slice(5).trim())
-        .join("");
+        .map((l) => l.slice(5).trimStart());
+      if (dataLines.length === 0) continue;
+      const dataStr = dataLines.join("\n");
+      if (!dataStr) continue;
 
-      if (!dataLine) continue;
       try {
-        const ev = JSON.parse(dataLine);
+        const ev = JSON.parse(dataStr);
         options.onEvent?.(ev);
+        // 收到 __end__ 后服务端会主动关闭流，下一轮 read 返回 done
       } catch (e) {
-        console.warn("SSE parse error:", e, dataLine);
+        console.warn("SSE parse error:", e, dataStr);
       }
     }
   }
 }
 
-/**
- * Agent 式问答：LLM 自主调用工具。事件类型更丰富。
- * @param {string} question
- * @param {object} options - { chatIds, signal, onEvent }
- */
-export async function askAgentStream(question, options = {}) {
-  const body = {
-    question,
-    chat_ids: options.chatIds || null,
-    history: options.history || null,
-  };
-
-  const resp = await fetch("/api/ask/agent", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal: options.signal,
-  });
-
-  if (!resp.ok) {
-    throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
-  }
-
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let idx;
-    while ((idx = buffer.indexOf("\n\n")) !== -1) {
-      const rawEvent = buffer.slice(0, idx);
-      buffer = buffer.slice(idx + 2);
-      const dataLine = rawEvent
-        .split("\n")
-        .filter((l) => l.startsWith("data:"))
-        .map((l) => l.slice(5).trim())
-        .join("");
-      if (!dataLine) continue;
-      try {
-        const ev = JSON.parse(dataLine);
-        options.onEvent?.(ev);
-      } catch (e) {
-        console.warn("SSE parse error:", e, dataLine);
-      }
-    }
-  }
-}
-
-export async function getQAHistory(limit = 50) {
-  const { data } = await api.get("/ask/history", { params: { limit } });
+export async function abortRun(runId) {
+  const { data } = await api.post(`/runs/${encodeURIComponent(runId)}/abort`);
   return data;
+}
+
+export async function listActiveRuns() {
+  const { data } = await api.get("/runs/active");
+  return data;
+}
+
+export async function getSessionActiveRun(sessionId) {
+  try {
+    const { data } = await api.get(`/sessions/${encodeURIComponent(sessionId)}/active-run`);
+    return data;
+  } catch (err) {
+    if (err.response?.status === 404) return null;
+    throw err;
+  }
+}
+
+// ---------- Sessions ----------
+
+export async function createSession(payload = {}) {
+  const { data } = await api.post("/sessions", {
+    title: payload.title || null,
+    mode: payload.mode || "agent",
+    chat_ids: payload.chatIds || null,
+  });
+  return data;
+}
+
+export async function listSessions(params = {}) {
+  const { data } = await api.get("/sessions", {
+    params: {
+      archived: params.archived ?? false,
+      pinned: params.pinned,
+      q: params.q || undefined,
+      limit: params.limit ?? 30,
+      offset: params.offset ?? 0,
+    },
+  });
+  return data;
+}
+
+export async function getSession(sessionId) {
+  const { data } = await api.get(`/sessions/${encodeURIComponent(sessionId)}`);
+  return data;
+}
+
+export async function patchSession(sessionId, fields) {
+  const { data } = await api.patch(`/sessions/${encodeURIComponent(sessionId)}`, fields);
+  return data;
+}
+
+export async function deleteSession(sessionId) {
+  const { data } = await api.delete(`/sessions/${encodeURIComponent(sessionId)}`);
+  return data;
+}
+
+export async function autotitleSession(sessionId) {
+  const { data } = await api.post(`/sessions/${encodeURIComponent(sessionId)}/autotitle`);
+  return data;
+}
+
+export function exportSessionUrl(sessionId, format = "md") {
+  return `/api/sessions/${encodeURIComponent(sessionId)}/export?format=${format}`;
 }
 
 // ---------- Settings ----------

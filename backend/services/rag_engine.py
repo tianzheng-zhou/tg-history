@@ -308,24 +308,61 @@ async def answer_question_stream(
             ],
         }
 
-        # ---------- 7. LLM 流式生成 ----------
+        # ---------- 7. LLM 流式生成（带 usage 捕获） ----------
         yield {"type": "status", "stage": "generating",
                "message": "正在生成回答..."}
         prompt_template = _load_prompt("qa_answer.txt")
         chunks_text = _format_chunk(final_ctx)
         prompt = prompt_template.replace("{retrieved_chunks}", chunks_text).replace("{question}", question)
 
-        full_answer_parts: list[str] = []
-        async for token in llm_adapter.chat_stream(
+        model = settings.llm_model_qa
+        client = llm_adapter.get_client_for_model(model)
+        is_kimi = llm_adapter.is_kimi_model(model)
+        kwargs = dict(
+            model=model,
             messages=[{"role": "user", "content": prompt}],
-            model=settings.llm_model_qa,
-            temperature=0.3,
             max_tokens=2048,
-        ):
-            full_answer_parts.append(token)
-            yield {"type": "token", "text": token}
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        if is_kimi:
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            kwargs["temperature"] = 0.6
+        else:
+            kwargs["temperature"] = 0.3
+
+        stream = await client.chat.completions.create(**kwargs)
+        full_answer_parts: list[str] = []
+        last_usage: dict | None = None
+        async for chunk in stream:
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                last_usage = {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                    "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                    "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+                }
+            choice = chunk.choices[0] if chunk.choices else None
+            if not choice:
+                continue
+            if choice.delta.content:
+                full_answer_parts.append(choice.delta.content)
+                yield {"type": "token", "text": choice.delta.content}
 
         full_answer = "".join(full_answer_parts)
+
+        # 推送 usage 事件（供前端 ContextBadge 更新）
+        if last_usage is not None:
+            max_ctx = llm_adapter.get_context_window(model)
+            yield {
+                "type": "usage",
+                "prompt_tokens": last_usage["prompt_tokens"],
+                "completion_tokens": last_usage["completion_tokens"],
+                "total_tokens": last_usage["total_tokens"],
+                "max_context": max_ctx,
+                "percent": round(last_usage["prompt_tokens"] / max_ctx, 4) if max_ctx else 0.0,
+                "model": model,
+            }
 
         # ---------- 8. 构建来源 ----------
         sources: list[dict] = []

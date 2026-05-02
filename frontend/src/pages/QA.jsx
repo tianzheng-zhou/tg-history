@@ -1,11 +1,38 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { useNavigate, useParams } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Send, Loader2, History, Filter, Search, Database, FileSearch, Brain, CheckCircle2, AlertCircle, Square, Wrench, Sparkles, ChevronDown, ChevronRight } from "lucide-react";
-import { askQuestionStream, askAgentStream, getChats, getQAHistory } from "@/lib/api";
+import {
+  Send,
+  Loader2,
+  Filter,
+  Search,
+  Database,
+  FileSearch,
+  Brain,
+  CheckCircle2,
+  AlertCircle,
+  Square,
+  Wrench,
+  Sparkles,
+  ChevronDown,
+  ChevronRight,
+  XCircle,
+} from "lucide-react";
+import {
+  getChats,
+  getSession,
+  getSettings,
+  patchSession,
+  autotitleSession,
+} from "@/lib/api";
 import SourceCard from "@/components/SourceCard";
+import ContextBadge from "@/components/ContextBadge";
+import SessionSidebar from "@/components/SessionSidebar";
+import { useRuns, findActiveRunForSession } from "@/lib/runsStore";
 
-// RAG 阶段图标
+// ---------- 阶段图标（RAG 模式时间线） ----------
+
 const STAGE_ICONS = {
   semantic_search: Database,
   keyword_search: Search,
@@ -27,7 +54,6 @@ const STAGE_LABELS = {
 function RAGTimeline({ events, streaming, currentStage }) {
   const [expanded, setExpanded] = useState(true);
 
-  // 把 events 按状态阶段分组：每个 status 事件后跟随的 search/rerank/context
   const groups = [];
   let curGroup = null;
   for (const ev of events) {
@@ -38,6 +64,8 @@ function RAGTimeline({ events, streaming, currentStage }) {
       curGroup.items.push(ev);
     }
   }
+
+  if (groups.length === 0) return null;
 
   return (
     <div className="ml-2 mb-2 max-w-[80%]">
@@ -55,22 +83,19 @@ function RAGTimeline({ events, streaming, currentStage }) {
           {groups.map((g, idx) => {
             const Icon = STAGE_ICONS[g.stage] || Loader2;
             const isActive = streaming && g.stage === currentStage;
-            const isDone = !isActive;
             return (
               <div key={idx} className="text-xs">
                 <div className="flex items-center gap-1.5 font-medium text-foreground/80">
                   {isActive ? (
                     <Loader2 size={12} className="animate-spin text-primary shrink-0" />
-                  ) : isDone ? (
-                    <CheckCircle2 size={12} className="text-green-600 shrink-0" />
                   ) : (
-                    <Icon size={12} className="shrink-0" />
+                    <CheckCircle2 size={12} className="text-green-600 shrink-0" />
                   )}
+                  <Icon size={12} className="shrink-0" />
                   <span>{STAGE_LABELS[g.stage] || g.stage}</span>
                   <span className="text-muted-foreground font-normal">— {g.message}</span>
                 </div>
 
-                {/* 子事件：检索结果、rerank、context */}
                 {g.items.length > 0 && (
                   <div className="mt-1.5 ml-5 space-y-1.5">
                     {g.items.map((item, j) => (
@@ -103,7 +128,7 @@ function RAGEventDetail({ item }) {
                 · {p.sender ? `${p.sender}: ` : ""}{p.snippet}
                 {p.distance !== undefined && (
                   <span className="text-muted-foreground ml-1">
-                    (dist: {p.distance?.toFixed(3)})
+                    (dist: {p.distance?.toFixed?.(3)})
                   </span>
                 )}
               </li>
@@ -116,9 +141,7 @@ function RAGEventDetail({ item }) {
   if (item.kind === "rerank") {
     return (
       <div className="bg-muted/40 rounded p-1.5 text-[11px]">
-        <span className="text-muted-foreground">
-          {item.before} → {item.after} 条
-        </span>
+        <span className="text-muted-foreground">{item.before} → {item.after} 条</span>
         {item.top_scores && item.top_scores.length > 0 && (
           <span className="ml-2 text-muted-foreground">
             top scores: {item.top_scores.join(", ")}
@@ -148,10 +171,9 @@ function RAGEventDetail({ item }) {
   return null;
 }
 
-// ---------- Agent 模式的步骤时间线 ----------
+// ---------- Agent 模式时间线 ----------
 
 function AgentTimeline({ steps, streaming }) {
-  // 过滤掉"最终答案 step"（其内容会渲染在主气泡里，避免重复展示）
   const visibleSteps = steps.filter((s) => !s.isFinalStep);
   if (visibleSteps.length === 0) return null;
   return (
@@ -170,7 +192,7 @@ function AgentTimeline({ steps, streaming }) {
 function AgentStep({ step, streaming }) {
   const [expanded, setExpanded] = useState(true);
   const isActive = streaming && !step.done;
-  const hasToolCalls = step.toolCalls && step.toolCalls.length > 0;
+  const hasToolCalls = step.tool_calls && step.tool_calls.length > 0;
 
   return (
     <div className="border-l-2 border-primary/30 pl-3">
@@ -189,7 +211,7 @@ function AgentStep({ step, streaming }) {
         )}
         <span className="text-muted-foreground font-normal">
           {hasToolCalls
-            ? `调用 ${step.toolCalls.length} 个工具`
+            ? `调用 ${step.tool_calls.length} 个工具`
             : step.thinking
               ? "思考/回答"
               : "..."}
@@ -198,13 +220,14 @@ function AgentStep({ step, streaming }) {
 
       {expanded && (
         <div className="mt-1.5 space-y-2">
-          {/* Kimi 深度思考链 */}
           {step.reasoning && (
             <details className="text-xs text-foreground/60 bg-purple-50 rounded p-2">
               <summary className="cursor-pointer flex items-center gap-1 text-[10px] text-purple-600 font-medium">
                 <Sparkles size={10} />
                 <span>深度思考</span>
-                <span className="text-[9px] text-muted-foreground ml-1">({step.reasoning.length} 字符)</span>
+                <span className="text-[9px] text-muted-foreground ml-1">
+                  ({step.reasoning.length} 字符)
+                </span>
               </summary>
               <div className="mt-1 whitespace-pre-wrap text-foreground/70 max-h-48 overflow-auto">
                 {step.reasoning}
@@ -212,7 +235,6 @@ function AgentStep({ step, streaming }) {
             </details>
           )}
 
-          {/* 思考/回答文本 */}
           {step.thinking && (
             <div className="text-xs text-foreground/80 bg-muted/30 rounded p-2 whitespace-pre-wrap">
               <div className="flex items-center gap-1 text-[10px] text-muted-foreground mb-1">
@@ -225,8 +247,7 @@ function AgentStep({ step, streaming }) {
             </div>
           )}
 
-          {/* 工具调用 */}
-          {step.toolCalls?.map((tc, j) => (
+          {step.tool_calls?.map((tc, j) => (
             <ToolCallCard key={j} toolCall={tc} />
           ))}
         </div>
@@ -237,7 +258,7 @@ function AgentStep({ step, streaming }) {
 
 function ToolCallCard({ toolCall }) {
   const [expanded, setExpanded] = useState(false);
-  const done = toolCall.resultReady;
+  const done = toolCall.resultReady ?? toolCall.preview !== undefined;
   const err = toolCall.error;
 
   return (
@@ -253,7 +274,7 @@ function ToolCallCard({ toolCall }) {
         </code>
         {done && !err && (
           <span className="text-[10px] text-muted-foreground">
-            {toolCall.durationMs}ms
+            {toolCall.durationMs ?? toolCall.duration_ms}ms
             {toolCall.preview?.count !== undefined && ` · ${toolCall.preview.count} 条`}
           </span>
         )}
@@ -263,7 +284,6 @@ function ToolCallCard({ toolCall }) {
 
       {expanded && (
         <div className="mt-2 space-y-2 text-[11px]">
-          {/* 参数 */}
           <div>
             <div className="text-muted-foreground mb-1">参数：</div>
             <pre className="bg-muted/40 rounded p-1.5 overflow-x-auto text-[10px]">
@@ -271,7 +291,6 @@ function ToolCallCard({ toolCall }) {
             </pre>
           </div>
 
-          {/* 结果预览 */}
           {done && toolCall.preview && (
             <div>
               <div className="text-muted-foreground mb-1">
@@ -305,267 +324,203 @@ function ToolCallCard({ toolCall }) {
   );
 }
 
+// ---------- 把 turn 持久化的 trajectory + agentSteps 形态统一 ----------
+// 持久化字段：tool_calls, had_tool_calls
+// runStore 字段：toolCalls (动态时用)
+// 显示时统一读 step.tool_calls 即可（runStore 也用 toolCalls，需要做 alias）
+
+function normalizeAgentSteps(steps) {
+  // steps 来自两个源：runStore（实时）或 trajectory（持久化）。统一字段名。
+  return (steps || []).map((s) => {
+    const tc = s.tool_calls || s.toolCalls || [];
+    const hadTC = s.had_tool_calls ?? s.toolCalls?.length > 0 ?? tc.length > 0;
+    return {
+      ...s,
+      tool_calls: tc,
+      had_tool_calls: hadTC,
+      isFinalStep: s.isFinalStep ?? !hadTC,
+      done: s.done ?? true, // 持久化的 trajectory 都视为 done
+    };
+  });
+}
+
+function normalizeRagEvents(rag_events) {
+  // 持久化字段同名，直接返回
+  return rag_events || [];
+}
+
+// ---------- 主组件 ----------
+
 export default function QA() {
+  const navigate = useNavigate();
+  const { sessionId: routeSessionId } = useParams();
+
+  const { runs, startRun, abortRun, dropRun } = useRuns();
+
   const [chats, setChats] = useState([]);
   const [selectedChats, setSelectedChats] = useState([]);
   const [question, setQuestion] = useState("");
-  const [conversation, setConversation] = useState([]);
-  const [loading, setLoading] = useState(false);
   const [showFilters, setShowFilters] = useState(false);
-  const [showHistory, setShowHistory] = useState(false);
-  const [history, setHistory] = useState([]);
-  const [mode, setMode] = useState("agent"); // "rag" | "agent"
+  const [mode, setMode] = useState("agent");
+
+  // 持久化的对话（来自 GET /api/sessions/:id）
+  const [persistedTurns, setPersistedTurns] = useState([]);
+  const [sessionMeta, setSessionMeta] = useState(null); // 当前 session 的元信息
+  const [sessionLoading, setSessionLoading] = useState(false);
+
+  // 当前活跃 run id（前端发起的或从 url 恢复的）
+  const [activeRunId, setActiveRunId] = useState(null);
+  // 上一次的 usage（即使 run 完成了也保留显示）
+  const [stickyUsage, setStickyUsage] = useState(null);
+  // 当前 QA 模型 + 其上下文窗口（来自后端 /api/settings，给 ContextBadge 占位用）
+  const [qaSettings, setQaSettings] = useState({ model: null, contextWindow: null });
+
   const bottomRef = useRef(null);
 
+  // 加载群聊列表（用于 filter）+ 当前 QA 模型设置
   useEffect(() => {
-    getChats().then(setChats);
-    getQAHistory().then(setHistory).catch(() => {});
+    getChats().then(setChats).catch(() => {});
+    getSettings()
+      .then((s) => setQaSettings({
+        model: s.llm_model_qa,
+        contextWindow: s.qa_context_window,
+      }))
+      .catch(() => {});
   }, []);
 
+  // 路由切换 → 加载 session
+  useEffect(() => {
+    if (!routeSessionId) {
+      setPersistedTurns([]);
+      setSessionMeta(null);
+      setActiveRunId(null);
+      setStickyUsage(null);
+      return;
+    }
+    let cancelled = false;
+    setSessionLoading(true);
+    getSession(routeSessionId)
+      .then((data) => {
+        if (cancelled) return;
+        setSessionMeta(data.session);
+        setPersistedTurns(data.turns || []);
+        // 恢复 chat_ids 选项
+        if (data.session.chat_ids && Array.isArray(data.session.chat_ids)) {
+          setSelectedChats(data.session.chat_ids);
+        }
+        if (data.session.mode) setMode(data.session.mode);
+        // 恢复 ContextBadge 的 sticky usage（取最后一条 assistant turn 的 meta.usage）
+        const lastAssistant = [...(data.turns || [])].reverse()
+          .find((t) => t.role === "assistant" && t.meta?.usage);
+        if (lastAssistant?.meta?.usage) setStickyUsage(lastAssistant.meta.usage);
+      })
+      .catch((err) => {
+        console.error("加载 session 失败", err);
+        if (!cancelled) navigate("/qa", { replace: true });
+      })
+      .finally(() => {
+        if (!cancelled) setSessionLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [routeSessionId, navigate]);
+
+  // 自动绑定 session 的活跃 run（切回 QA 页时接上）
+  useEffect(() => {
+    if (!routeSessionId) {
+      if (activeRunId) setActiveRunId(null);
+      return;
+    }
+    const r = findActiveRunForSession(runs, routeSessionId);
+    if (r && r.run_id !== activeRunId) {
+      setActiveRunId(r.run_id);
+    }
+  }, [routeSessionId, runs, activeRunId]);
+
+  // 当前活跃 run（来自 store）
+  const activeRun = activeRunId ? runs[activeRunId] : null;
+
+  // 同步 sticky usage（每次 run 推 usage 事件就更新）
+  useEffect(() => {
+    if (activeRun?.usage) setStickyUsage(activeRun.usage);
+  }, [activeRun?.usage]);
+
+  // run 终止后自动刷新 session 数据（持久化的 assistant turn 已落库）
+  const wasStreaming = useRef(false);
+  useEffect(() => {
+    const streaming = activeRun && (activeRun.status === "running" || activeRun.status === "pending");
+    const justEnded = wasStreaming.current && !streaming && activeRun;
+    wasStreaming.current = !!streaming;
+    if (justEnded && routeSessionId) {
+      // 刷新持久化数据 + 触发自动 title（如果是首轮）
+      getSession(routeSessionId).then((data) => {
+        setSessionMeta(data.session);
+        setPersistedTurns(data.turns || []);
+        // 首轮答完 → 异步生成 title
+        if ((data.turns || []).length === 2 && (data.session.title === "新对话" || data.session.title?.endsWith("…"))) {
+          autotitleSession(routeSessionId).then((updated) => {
+            setSessionMeta(updated);
+          }).catch(() => {});
+        }
+      }).catch(() => {});
+    }
+  }, [activeRun, routeSessionId]);
+
+  // 滚动到底部
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [conversation]);
+  }, [persistedTurns.length, activeRun?.agentSteps?.length, activeRun?.answer]);
 
-  const abortRef = useRef(null);
+  // 同步 chat_ids 到 session（用户手动改 filter 时）
+  const handleToggleChat = useCallback((chatId, on) => {
+    setSelectedChats((prev) => {
+      const next = on ? [...prev, chatId] : prev.filter((x) => x !== chatId);
+      if (routeSessionId) {
+        patchSession(routeSessionId, { chat_ids: next }).catch(() => {});
+      }
+      return next;
+    });
+  }, [routeSessionId]);
 
   const handleAsk = async () => {
     const q = question.trim();
-    if (!q || loading) return;
-
-    // 添加用户消息 + 占位 assistant 消息
-    setConversation((prev) => [
-      ...prev,
-      { role: "user", content: q },
-      {
-        role: "assistant",
-        mode,
-        content: "",
-        sources: [],
-        events: [],        // RAG 模式用
-        agentSteps: [],    // Agent 模式用
-        currentStage: null,
-        streaming: true,
-      },
-    ]);
+    if (!q) return;
+    if (activeRun && (activeRun.status === "running" || activeRun.status === "pending")) {
+      // 当前 session 已有进行中的 run，禁止再发
+      return;
+    }
     setQuestion("");
-    setLoading(true);
-
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    const updateLast = (updater) => {
-      setConversation((prev) => {
-        const next = [...prev];
-        const last = next[next.length - 1];
-        if (last && last.role === "assistant") {
-          next[next.length - 1] = updater(last);
-        }
-        return next;
-      });
-    };
-
     try {
-      if (mode === "agent") {
-        await runAgentMode(q, controller.signal, updateLast);
+      const resp = await startRun({
+        question: q,
+        sessionId: routeSessionId || null,
+        mode,
+        chatIds: selectedChats.length > 0 ? selectedChats : null,
+      });
+      setActiveRunId(resp.run_id);
+      // 若是新建 session，URL 跳到 /qa/:id
+      if (!routeSessionId) {
+        navigate(`/qa/${resp.session_id}`, { replace: true });
       } else {
-        await runRagMode(q, controller.signal, updateLast);
+        // 同 session：补充本轮 user turn 立刻显示（后端正在写入）
+        setPersistedTurns((prev) => [
+          ...prev,
+          {
+            id: -Date.now(), // 临时 id
+            seq: prev.length,
+            role: "user",
+            content: q,
+            created_at: new Date().toISOString(),
+          },
+        ]);
       }
-      getQAHistory().then(setHistory).catch(() => {});
     } catch (err) {
-      if (err.name === "AbortError") {
-        updateLast((m) => ({
-          ...m,
-          content: m.content + "\n\n_(已中止)_",
-          streaming: false,
-          currentStage: null,
-        }));
-      } else {
-        updateLast((m) => ({
-          ...m,
-          content: `抱歉，处理问题时出现错误：${err.message}`,
-          streaming: false,
-          currentStage: null,
-        }));
-      }
-    } finally {
-      setLoading(false);
-      abortRef.current = null;
+      console.error("启动 run 失败", err);
+      alert(`启动失败: ${err.response?.data?.detail || err.message}`);
     }
   };
 
-  // -------- RAG 模式 --------
-  const runRagMode = async (q, signal, updateLast) => {
-    await askQuestionStream(q, {
-      chatIds: selectedChats.length > 0 ? selectedChats : null,
-      signal,
-      onEvent: (ev) => {
-        if (ev.type === "status") {
-          updateLast((m) => ({
-            ...m,
-            currentStage: ev.stage,
-            events: [...m.events, { kind: "status", stage: ev.stage, message: ev.message }],
-          }));
-        } else if (ev.type === "search_result") {
-          updateLast((m) => ({
-            ...m,
-            events: [...m.events, {
-              kind: "search_result",
-              searchKind: ev.kind,
-              count: ev.count,
-              preview: ev.preview,
-            }],
-          }));
-        } else if (ev.type === "rerank") {
-          updateLast((m) => ({
-            ...m,
-            events: [...m.events, {
-              kind: "rerank", before: ev.before, after: ev.after, top_scores: ev.top_scores,
-            }],
-          }));
-        } else if (ev.type === "context") {
-          updateLast((m) => ({
-            ...m,
-            events: [...m.events, { kind: "context", count: ev.count, preview: ev.preview }],
-          }));
-        } else if (ev.type === "token") {
-          updateLast((m) => ({ ...m, content: m.content + ev.text }));
-        } else if (ev.type === "done") {
-          updateLast((m) => ({
-            ...m,
-            content: ev.answer || m.content,
-            sources: ev.sources || [],
-            confidence: ev.confidence,
-            streaming: false,
-            currentStage: null,
-          }));
-        } else if (ev.type === "error") {
-          updateLast((m) => ({
-            ...m,
-            content: m.content + `\n\n❌ 错误: ${ev.error}`,
-            streaming: false,
-            currentStage: null,
-          }));
-        }
-      },
-    });
-  };
-
-  // -------- Agent 模式 --------
-  const runAgentMode = async (q, signal, updateLast) => {
-    // conversation 此时还是旧状态（setConversation 是异步的），直接取全部 user/assistant
-    const historyMsgs = conversation
-      .filter((m) => (m.role === "user" || m.role === "assistant") && m.content)
-      .map((m) => ({ role: m.role, content: m.content }));
-
-    await askAgentStream(q, {
-      chatIds: selectedChats.length > 0 ? selectedChats : null,
-      history: historyMsgs.length > 0 ? historyMsgs : null,
-      signal,
-      onEvent: (ev) => {
-        if (ev.type === "status") {
-          // 顶部状态栏，不需要存
-        } else if (ev.type === "step_start") {
-          updateLast((m) => ({
-            ...m,
-            agentSteps: [
-              ...m.agentSteps,
-              { step: ev.step, thinking: "", reasoning: "", toolCalls: [], done: false },
-            ],
-          }));
-        } else if (ev.type === "thinking_delta") {
-          updateLast((m) => {
-            const steps = [...m.agentSteps];
-            const idx = steps.findIndex((s) => s.step === ev.step);
-            if (idx !== -1) {
-              steps[idx] = { ...steps[idx], thinking: (steps[idx].thinking || "") + ev.text };
-            }
-            return { ...m, agentSteps: steps };
-          });
-        } else if (ev.type === "reasoning_delta") {
-          // Kimi 思考链
-          updateLast((m) => {
-            const steps = [...m.agentSteps];
-            const idx = steps.findIndex((s) => s.step === ev.step);
-            if (idx !== -1) {
-              steps[idx] = { ...steps[idx], reasoning: (steps[idx].reasoning || "") + ev.text };
-            }
-            return { ...m, agentSteps: steps };
-          });
-        } else if (ev.type === "tool_call") {
-          updateLast((m) => {
-            const steps = [...m.agentSteps];
-            const idx = steps.findIndex((s) => s.step === ev.step);
-            if (idx !== -1) {
-              steps[idx] = {
-                ...steps[idx],
-                toolCalls: [
-                  ...steps[idx].toolCalls,
-                  {
-                    id: ev.id,
-                    name: ev.name,
-                    args: ev.args,
-                    resultReady: false,
-                    error: false,
-                  },
-                ],
-              };
-            }
-            return { ...m, agentSteps: steps };
-          });
-        } else if (ev.type === "tool_result") {
-          updateLast((m) => {
-            const steps = [...m.agentSteps];
-            const idx = steps.findIndex((s) => s.step === ev.step);
-            if (idx !== -1) {
-              const calls = steps[idx].toolCalls.map((c) =>
-                c.id === ev.id
-                  ? {
-                      ...c,
-                      resultReady: true,
-                      error: !!ev.error,
-                      durationMs: ev.duration_ms,
-                      preview: ev.output_preview,
-                    }
-                  : c
-              );
-              steps[idx] = { ...steps[idx], toolCalls: calls };
-            }
-            return { ...m, agentSteps: steps };
-          });
-        } else if (ev.type === "step_done") {
-          updateLast((m) => {
-            const steps = [...m.agentSteps];
-            const idx = steps.findIndex((s) => s.step === ev.step);
-            if (idx !== -1) {
-              steps[idx] = {
-                ...steps[idx],
-                done: true,
-                // 没调用工具的 step = 最终答案 step：内容会在主气泡显示，这里标记隐藏
-                isFinalStep: !ev.had_tool_calls,
-              };
-            }
-            return { ...m, agentSteps: steps };
-          });
-        } else if (ev.type === "final_answer") {
-          updateLast((m) => ({
-            ...m,
-            content: ev.answer || m.content,
-            sources: ev.sources || [],
-            streaming: false,
-          }));
-        } else if (ev.type === "error") {
-          updateLast((m) => ({
-            ...m,
-            content: m.content + `\n\n❌ 错误: ${ev.error}`,
-            streaming: false,
-          }));
-        }
-      },
-    });
-  };
-
-  const handleStop = () => {
-    abortRef.current?.abort();
+  const handleStop = async () => {
+    if (activeRunId) await abortRun(activeRunId);
   };
 
   const handleKeyDown = (e) => {
@@ -575,37 +530,68 @@ export default function QA() {
     }
   };
 
+  // 计算实际显示的 conversation：
+  // 1. 持久化 turns 为基础（含已落库的 user/assistant）
+  // 2. 如果有 activeRun 且当前 session 未有对应的最新 assistant turn，则把 activeRun 作为"流式 assistant"附加
+  const isLive = activeRun && (activeRun.status === "running" || activeRun.status === "pending");
+  const renderItems = useMemo(() => {
+    const items = persistedTurns.map((t) => ({
+      kind: "turn",
+      turn: t,
+    }));
+    if (isLive && activeRun) {
+      // 检查最后一条 turn 是不是已经覆盖了这次 run 的内容
+      // 我们的策略：activeRun 期间，user turn 已 push 到 persistedTurns（startRun 时手动加的）
+      // assistant turn 还没落库，渲染流式 activeRun 作为"临时 assistant"
+      items.push({ kind: "live", run: activeRun });
+    }
+    return items;
+  }, [persistedTurns, isLive, activeRun]);
+
+  const isEmpty = renderItems.length === 0;
+
+  // 模型/usage 显示来源：当前 run > sticky（最后一次）
+  const displayUsage = activeRun?.usage || stickyUsage;
+
   return (
-    <div className="flex h-[calc(100vh-3rem)] gap-4">
+    <div className="flex h-full">
+      {/* 会话侧栏 */}
+      <SessionSidebar refreshKey={persistedTurns.length} />
+
       {/* 主聊天区 */}
-      <div className="flex-1 flex flex-col">
-        <div className="flex items-center justify-between mb-4">
-          <h1 className="text-2xl font-bold">智能问答</h1>
+      <div className="flex-1 flex flex-col h-full overflow-hidden">
+        {/* 顶部条 */}
+        <div className="flex items-center justify-between p-3 border-b border-border shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <h1 className="text-base font-semibold truncate">
+              {sessionMeta?.title || "智能问答"}
+            </h1>
+            {sessionLoading && <Loader2 size={14} className="animate-spin text-muted-foreground" />}
+          </div>
           <div className="flex gap-2 items-center">
-            {/* 模式切换 */}
-            <div className="inline-flex border border-border rounded-md overflow-hidden text-sm" title="问答模式">
+            <div className="inline-flex border border-border rounded-md overflow-hidden text-sm">
               <button
                 onClick={() => setMode("agent")}
-                disabled={loading}
-                className={`flex items-center gap-1 px-2.5 py-1.5 ${
+                disabled={isLive}
+                className={`flex items-center gap-1 px-2.5 py-1 ${
                   mode === "agent"
                     ? "bg-primary text-primary-foreground"
                     : "text-muted-foreground hover:bg-accent"
                 } disabled:opacity-50`}
-                title="Agent 模式：LLM 自主调用工具多轮推理"
+                title="Agent 模式"
               >
                 <Sparkles size={14} />
                 Agent
               </button>
               <button
                 onClick={() => setMode("rag")}
-                disabled={loading}
-                className={`flex items-center gap-1 px-2.5 py-1.5 border-l border-border ${
+                disabled={isLive}
+                className={`flex items-center gap-1 px-2.5 py-1 border-l border-border ${
                   mode === "rag"
                     ? "bg-primary text-primary-foreground"
                     : "text-muted-foreground hover:bg-accent"
                 } disabled:opacity-50`}
-                title="RAG 模式：固定流程的语义检索 + 一次回答"
+                title="RAG 模式"
               >
                 <Database size={14} />
                 RAG
@@ -613,51 +599,27 @@ export default function QA() {
             </div>
             <button
               onClick={() => setShowFilters(!showFilters)}
-              className={`inline-flex items-center gap-1 px-3 py-1.5 rounded-md text-sm border ${
-                showFilters
-                  ? "border-primary text-primary"
-                  : "border-border text-muted-foreground"
+              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-sm border ${
+                showFilters ? "border-primary text-primary" : "border-border text-muted-foreground"
               }`}
             >
               <Filter size={14} />
               筛选
-            </button>
-            <button
-              onClick={() => setShowHistory(!showHistory)}
-              className={`inline-flex items-center gap-1 px-3 py-1.5 rounded-md text-sm border ${
-                showHistory
-                  ? "border-primary text-primary"
-                  : "border-border text-muted-foreground"
-              }`}
-            >
-              <History size={14} />
-              历史
             </button>
           </div>
         </div>
 
         {/* 筛选器 */}
         {showFilters && (
-          <div className="bg-card border border-border rounded-lg p-3 mb-3">
+          <div className="bg-card border-b border-border p-3 shrink-0">
             <p className="text-xs text-muted-foreground mb-2">选择群聊范围</p>
             <div className="flex flex-wrap gap-2">
               {chats.map((c) => (
-                <label
-                  key={c.chat_id}
-                  className="inline-flex items-center gap-1.5 text-sm"
-                >
+                <label key={c.chat_id} className="inline-flex items-center gap-1.5 text-sm">
                   <input
                     type="checkbox"
                     checked={selectedChats.includes(c.chat_id)}
-                    onChange={(e) => {
-                      if (e.target.checked) {
-                        setSelectedChats((p) => [...p, c.chat_id]);
-                      } else {
-                        setSelectedChats((p) =>
-                          p.filter((id) => id !== c.chat_id)
-                        );
-                      }
-                    }}
+                    onChange={(e) => handleToggleChat(c.chat_id, e.target.checked)}
                     className="rounded"
                   />
                   {c.chat_name}
@@ -667,149 +629,212 @@ export default function QA() {
           </div>
         )}
 
-        {/* 对话区域 */}
-        <div className="flex-1 overflow-auto border border-border rounded-lg p-4 mb-3 bg-card/50">
-          {conversation.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-full text-muted-foreground gap-3">
-              <p className="text-lg">开始提问吧</p>
-              <p className="text-sm">
-                你可以问任何关于群聊记录的问题，例如：
-              </p>
-              <div className="flex flex-wrap gap-2 justify-center max-w-lg">
-                {[
-                  "群里讨论过哪些技术方案？",
-                  "有人分享过有用的链接吗？",
-                  "关于XX项目有什么讨论？",
-                ].map((q) => (
-                  <button
-                    key={q}
-                    onClick={() => setQuestion(q)}
-                    className="text-sm border border-border rounded-full px-3 py-1 hover:bg-accent transition-colors"
-                  >
-                    {q}
-                  </button>
-                ))}
-              </div>
-            </div>
+        {/* 对话区 */}
+        <div className="flex-1 overflow-auto p-4 bg-card/30">
+          {isEmpty && !sessionLoading ? (
+            <EmptyState onPickQuestion={(q) => setQuestion(q)} />
           ) : (
-            <div className="space-y-4">
-              {conversation.map((msg, i) => (
-                <div key={i}>
-                  {/* RAG 检索事件时间线（RAG 模式） */}
-                  {msg.role === "assistant" && msg.mode !== "agent" && msg.events && msg.events.length > 0 && (
-                    <RAGTimeline events={msg.events} streaming={msg.streaming} currentStage={msg.currentStage} />
-                  )}
-                  {/* Agent 步骤时间线（Agent 模式） */}
-                  {msg.role === "assistant" && msg.mode === "agent" && msg.agentSteps && msg.agentSteps.length > 0 && (
-                    <AgentTimeline steps={msg.agentSteps} streaming={msg.streaming} />
-                  )}
-                  <div
-                    className={`flex ${
-                      msg.role === "user" ? "justify-end" : "justify-start"
-                    }`}
-                  >
-                    <div
-                      className={`max-w-[80%] rounded-lg px-4 py-3 ${
-                        msg.role === "user"
-                          ? "bg-primary text-primary-foreground"
-                          : "bg-card border border-border"
-                      }`}
-                    >
-                      {msg.role === "assistant" ? (
-                        <div className="prose prose-sm max-w-none">
-                          {msg.content ? (
-                            <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
-                          ) : (
-                            msg.streaming && (
-                              <p className="text-sm text-muted-foreground italic">
-                                {msg.currentStage === "generating"
-                                  ? "正在生成..."
-                                  : "准备中..."}
-                              </p>
-                            )
-                          )}
-                          {msg.streaming && msg.content && (
-                            <span className="inline-block w-2 h-4 bg-primary/60 animate-pulse ml-0.5 align-middle" />
-                          )}
-                        </div>
-                      ) : (
-                        <p className="text-sm">{msg.content}</p>
-                      )}
-                    </div>
-                  </div>
-                  {/* 来源引用 */}
-                  {msg.sources && msg.sources.length > 0 && (
-                    <div className="mt-2 ml-2 space-y-2">
-                      <p className="text-xs text-muted-foreground">
-                        📎 来源引用 ({msg.sources.length})
-                      </p>
-                      {msg.sources.map((src, j) => (
-                        <SourceCard key={j} source={src} />
-                      ))}
-                    </div>
-                  )}
-                </div>
+            <div className="space-y-4 max-w-4xl mx-auto">
+              {renderItems.map((it, idx) => (
+                it.kind === "turn"
+                  ? <PersistedTurn key={`t-${it.turn.id}`} turn={it.turn} />
+                  : <LiveAssistant key={`live-${it.run.run_id}`} run={it.run} />
               ))}
               <div ref={bottomRef} />
             </div>
           )}
         </div>
 
-        {/* 输入框 */}
-        <div className="flex gap-2">
-          <textarea
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="输入你的问题..."
-            rows={1}
-            className="flex-1 border border-border rounded-lg px-4 py-2.5 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-ring"
-          />
-          {loading ? (
-            <button
-              onClick={handleStop}
-              className="bg-red-500 text-white p-2.5 rounded-lg hover:bg-red-600 transition-colors"
-              title="中止"
-            >
-              <Square size={18} fill="currentColor" />
-            </button>
-          ) : (
-            <button
-              onClick={handleAsk}
-              disabled={!question.trim()}
-              className="bg-primary text-primary-foreground p-2.5 rounded-lg hover:opacity-90 disabled:opacity-50"
-            >
-              <Send size={18} />
-            </button>
+        {/* 输入区 */}
+        <div className="p-3 border-t border-border shrink-0 bg-background">
+          <div className="max-w-4xl mx-auto">
+            <div className="flex items-center justify-between mb-2 gap-2">
+              <ContextBadge
+                usage={displayUsage}
+                defaultMax={qaSettings.contextWindow}
+                defaultModel={qaSettings.model}
+              />
+              {isLive && activeRun && (
+                <span className="text-xs text-muted-foreground inline-flex items-center gap-1">
+                  <Loader2 size={11} className="animate-spin" />
+                  正在生成... ({activeRun.status})
+                </span>
+              )}
+              {activeRun?.status === "lost" && (
+                <span className="text-xs text-amber-600 inline-flex items-center gap-1">
+                  <AlertCircle size={11} />
+                  会话已过期，请刷新查看最终结果
+                </span>
+              )}
+            </div>
+            <div className="flex gap-2">
+              <textarea
+                value={question}
+                onChange={(e) => setQuestion(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder={isLive ? "正在生成中，请等待或点击停止..." : "输入你的问题..."}
+                rows={1}
+                disabled={isLive}
+                className="flex-1 border border-border rounded-lg px-3 py-2 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-ring disabled:opacity-60"
+              />
+              {isLive ? (
+                <button
+                  onClick={handleStop}
+                  className="bg-red-500 text-white p-2 rounded-lg hover:bg-red-600 transition-colors"
+                  title="停止"
+                >
+                  <Square size={18} fill="currentColor" />
+                </button>
+              ) : (
+                <button
+                  onClick={handleAsk}
+                  disabled={!question.trim()}
+                  className="bg-primary text-primary-foreground p-2 rounded-lg hover:opacity-90 disabled:opacity-50"
+                >
+                  <Send size={18} />
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- 子组件：空状态 ----------
+
+function EmptyState({ onPickQuestion }) {
+  return (
+    <div className="flex flex-col items-center justify-center h-full text-muted-foreground gap-3 py-20">
+      <Sparkles size={28} className="text-primary/60" />
+      <p className="text-lg">开始提问吧</p>
+      <p className="text-sm">你可以问任何关于群聊记录的问题，例如：</p>
+      <div className="flex flex-wrap gap-2 justify-center max-w-lg">
+        {[
+          "群里讨论过哪些技术方案？",
+          "有人分享过有用的链接吗？",
+          "关于XX项目有什么讨论？",
+        ].map((q) => (
+          <button
+            key={q}
+            onClick={() => onPickQuestion(q)}
+            className="text-sm border border-border rounded-full px-3 py-1 hover:bg-accent transition-colors"
+          >
+            {q}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------- 子组件：持久化 turn ----------
+
+function PersistedTurn({ turn }) {
+  if (turn.role === "user") {
+    return (
+      <div className="flex justify-end">
+        <div className="max-w-[80%] rounded-lg px-4 py-3 bg-primary text-primary-foreground">
+          <p className="text-sm whitespace-pre-wrap">{turn.content}</p>
+        </div>
+      </div>
+    );
+  }
+
+  // assistant turn：trajectory 还原 + content + sources
+  const traj = turn.trajectory || {};
+  const steps = normalizeAgentSteps(traj.steps);
+  const ragEvents = normalizeRagEvents(traj.rag_events);
+
+  const isAborted = turn.meta?.aborted;
+  const isFailed = turn.meta?.failed;
+
+  return (
+    <div>
+      {ragEvents.length > 0 && (
+        <RAGTimeline events={ragEvents} streaming={false} currentStage={null} />
+      )}
+      {steps.length > 0 && <AgentTimeline steps={steps} streaming={false} />}
+
+      <div className="flex justify-start">
+        <div className="max-w-[80%] rounded-lg px-4 py-3 bg-card border border-border">
+          {(isAborted || isFailed) && (
+            <div className="text-xs text-amber-600 mb-2 inline-flex items-center gap-1">
+              <XCircle size={11} />
+              {isAborted ? "用户中止" : `失败: ${turn.meta?.error || "未知错误"}`}
+            </div>
           )}
+          <div className="prose prose-sm max-w-none">
+            {turn.content ? (
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{turn.content}</ReactMarkdown>
+            ) : (
+              <p className="text-sm text-muted-foreground italic">（无内容）</p>
+            )}
+          </div>
         </div>
       </div>
 
-      {/* 历史侧边栏 */}
-      {showHistory && (
-        <aside className="w-72 border border-border rounded-lg bg-card p-3 overflow-auto">
-          <h3 className="text-sm font-semibold mb-3">历史问答</h3>
-          {history.length === 0 ? (
-            <p className="text-xs text-muted-foreground">暂无历史记录</p>
-          ) : (
-            <div className="space-y-2">
-              {history.map((h) => (
-                <button
-                  key={h.id}
-                  onClick={() => setQuestion(h.question)}
-                  className="w-full text-left border border-border rounded-md p-2 hover:bg-accent/50 transition-colors"
-                >
-                  <p className="text-sm font-medium line-clamp-2">
-                    {h.question}
-                  </p>
-                  <p className="text-xs text-muted-foreground mt-1">
-                    {new Date(h.created_at).toLocaleString("zh-CN")}
-                  </p>
-                </button>
-              ))}
+      {turn.sources && turn.sources.length > 0 && (
+        <div className="mt-2 ml-2 space-y-2">
+          <p className="text-xs text-muted-foreground">📎 来源引用 ({turn.sources.length})</p>
+          {turn.sources.map((src, j) => (
+            <SourceCard key={j} source={src} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- 子组件：流式 assistant（来自 activeRun） ----------
+
+function LiveAssistant({ run }) {
+  const steps = normalizeAgentSteps(run.agentSteps);
+  const ragEvents = run.ragEvents || [];
+  const streaming = run.status === "running" || run.status === "pending";
+
+  return (
+    <div>
+      {run.mode === "rag" && ragEvents.length > 0 && (
+        <RAGTimeline events={ragEvents} streaming={streaming} currentStage={run.currentStage} />
+      )}
+      {run.mode === "agent" && steps.length > 0 && (
+        <AgentTimeline steps={steps} streaming={streaming} />
+      )}
+
+      <div className="flex justify-start">
+        <div className="max-w-[80%] rounded-lg px-4 py-3 bg-card border border-border">
+          {run.error && (
+            <div className="text-xs text-red-600 mb-2 inline-flex items-center gap-1">
+              <XCircle size={11} />
+              {run.error}
             </div>
           )}
-        </aside>
+          <div className="prose prose-sm max-w-none">
+            {run.answer ? (
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{run.answer}</ReactMarkdown>
+            ) : streaming ? (
+              <p className="text-sm text-muted-foreground italic">
+                {run.currentStage === "generating" ? "正在生成..." : "准备中..."}
+              </p>
+            ) : (
+              <p className="text-sm text-muted-foreground italic">（无内容）</p>
+            )}
+            {streaming && run.answer && (
+              <span className="inline-block w-2 h-4 bg-primary/60 animate-pulse ml-0.5 align-middle" />
+            )}
+          </div>
+        </div>
+      </div>
+
+      {run.sources && run.sources.length > 0 && (
+        <div className="mt-2 ml-2 space-y-2">
+          <p className="text-xs text-muted-foreground">📎 来源引用 ({run.sources.length})</p>
+          {run.sources.map((src, j) => (
+            <SourceCard key={j} source={src} />
+          ))}
+        </div>
       )}
     </div>
   );

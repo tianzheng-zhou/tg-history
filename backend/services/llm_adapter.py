@@ -68,6 +68,63 @@ def get_client_for_model(model: str) -> AsyncOpenAI:
     return _get_client()
 
 
+# ---------- 模型上下文窗口 ----------
+#
+# 数据来源：阿里云百炼 / Moonshot 官方模型列表（2026-04 时点）
+# https://help.aliyun.com/zh/model-studio/models
+# https://platform.moonshot.cn/docs/intro
+#
+# 注：百炼对很多模型实际给出"上下文长度 = 输入 + 输出"，输入上限通常略小于
+# 上下文长度（如 qwen3.6-plus 1,000,000 上下文，最大输入 ~983K）。这里取
+# 上下文长度作为"window"，因为我们只用 prompt_tokens 算占比。
+
+MODEL_CONTEXT_WINDOW: dict[str, int] = {
+    # ----- DashScope / Qwen 旗舰 -----
+    # qwen3.6-plus: 上下文 1M（思考/非思考），输入 2 元/百万 token（≤256K）
+    "qwen3.6-plus": 1_000_000,
+    # qwen3.5-plus: 上下文 1M
+    "qwen3.5-plus": 1_000_000,
+    # qwen-plus: Qwen3 系列，上下文 ~1M（995,904 / 997,952，简化按 1M 显示）
+    "qwen-plus": 1_000_000,
+    # qwen3-max / qwen-max: 上下文 262,144（256K）
+    "qwen3-max": 262_144,
+    "qwen-max": 262_144,
+    # ----- DashScope / Qwen Flash -----
+    # qwen3.5-flash: 上下文 1M
+    "qwen3.5-flash": 1_000_000,
+    # qwen-flash: 上下文 ~1M（995,904 / 997,952）
+    "qwen-flash": 1_000_000,
+    # qwen-turbo: 旧名，已被 qwen-flash 替代，但仍可调用
+    "qwen-turbo": 1_000_000,
+    # ----- DashScope / Qwen Omni -----
+    "qwen3.5-omni-plus": 262_144,
+    "qwen3.5-omni-flash": 262_144,
+    "qwen3-omni-flash": 65_536,
+    # ----- Moonshot / Kimi -----
+    # Kimi K2/K2.5/K2.6: 256K = 262,144 上下文
+    "kimi-k2.6": 262_144,
+    "kimi-k2.5": 262_144,
+    "kimi-k2-0905-preview": 262_144,
+}
+DEFAULT_CONTEXT_WINDOW = 131_072  # 未知模型回落到 128K（保守）
+
+
+def get_context_window(model: str) -> int:
+    """获取模型的最大上下文窗口（tokens）。未知模型回落到默认 128K。
+
+    匹配策略：
+    1. 精确匹配
+    2. prefix 匹配（处理 qwen3.6-plus-2026-04-02 这种带快照日期的）
+    """
+    if model in MODEL_CONTEXT_WINDOW:
+        return MODEL_CONTEXT_WINDOW[model]
+    # 按 key 长度倒序，优先匹配更长的 prefix（避免 qwen-plus 误匹配 qwen-plus-...）
+    for key in sorted(MODEL_CONTEXT_WINDOW.keys(), key=len, reverse=True):
+        if model.startswith(key):
+            return MODEL_CONTEXT_WINDOW[key]
+    return DEFAULT_CONTEXT_WINDOW
+
+
 def _kimi_chat_kwargs(model: str, temperature: float, enable_thinking: bool | None) -> dict:
     """构建 Kimi 模型的特殊参数"""
     kwargs: dict = {}

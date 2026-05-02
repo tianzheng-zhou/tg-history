@@ -1,16 +1,33 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.models.database import init_db
-from backend.routers import import_router, qa_router, settings_router, summary_router
+from backend.routers import (
+    import_router,
+    qa_router,
+    session_router,
+    settings_router,
+    summary_router,
+)
+from backend.services.run_registry import periodic_cleanup
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    yield
+    # 后台定时清理过期 run（完成 5 分钟后自动从 registry 中移除）
+    cleanup_task = asyncio.create_task(periodic_cleanup(interval_seconds=60))
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except Exception:
+            pass
 
 
 app = FastAPI(
@@ -31,6 +48,7 @@ app.add_middleware(
 app.include_router(import_router.router)
 app.include_router(summary_router.router)
 app.include_router(qa_router.router)
+app.include_router(session_router.router)
 app.include_router(settings_router.router)
 
 

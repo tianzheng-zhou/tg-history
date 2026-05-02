@@ -1,4 +1,4 @@
-import { NavLink, Outlet } from "react-router-dom";
+import { NavLink, Outlet, useLocation } from "react-router-dom";
 import {
   LayoutDashboard,
   Upload,
@@ -7,6 +7,7 @@ import {
   MessageCircleQuestion,
   Settings,
 } from "lucide-react";
+import RunningRunsBadge from "./RunningRunsBadge";
 
 const navItems = [
   { to: "/", icon: LayoutDashboard, label: "仪表盘" },
@@ -18,6 +19,10 @@ const navItems = [
 ];
 
 export default function Layout() {
+  const location = useLocation();
+  // QA 页面（/qa 或 /qa/:id）使用全宽布局，让侧栏靠边贴
+  const isFullWidth = location.pathname.startsWith("/qa");
+
   return (
     <div className="flex h-screen bg-background">
       {/* Sidebar */}
@@ -50,9 +55,19 @@ export default function Layout() {
       </aside>
 
       {/* Main */}
-      <main className="flex-1 overflow-auto">
-        <div className="max-w-6xl mx-auto p-6">
-          <Outlet />
+      <main className="flex-1 flex flex-col overflow-hidden">
+        {/* Header */}
+        <header className="h-10 border-b border-border bg-card/40 flex items-center justify-end px-4 gap-2 shrink-0">
+          <RunningRunsBadge />
+        </header>
+        <div className={`flex-1 overflow-auto ${isFullWidth ? "" : ""}`}>
+          {isFullWidth ? (
+            <Outlet />
+          ) : (
+            <div className="max-w-6xl mx-auto p-6">
+              <Outlet />
+            </div>
+          )}
         </div>
       </main>
     </div>
