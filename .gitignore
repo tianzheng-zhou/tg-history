@@ -5,8 +5,11 @@ dist/
 build/
 .env
 *.db
+*.db-shm
+*.db-wal
 data/chroma_db/
 data/app.db
+venv/
 node_modules/
 frontend/dist/
 .vite/
