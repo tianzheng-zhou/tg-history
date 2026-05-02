@@ -83,8 +83,7 @@ async def _stream_sub_llm(
     )
 
     if is_kimi:
-        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-        kwargs["temperature"] = 1.0
+        kwargs.update(llm_adapter.kimi_chat_kwargs(model, True))
     else:
         kwargs["parallel_tool_calls"] = True
         kwargs["temperature"] = 0.3
@@ -266,8 +265,7 @@ async def run_sub_agent(
             stream=False,
         )
         if llm_adapter.is_kimi_model(model):
-            force_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-            force_kwargs["temperature"] = 0.6
+            force_kwargs.update(llm_adapter.kimi_chat_kwargs(model, False))
         else:
             force_kwargs["temperature"] = 0.3
         async with sem:

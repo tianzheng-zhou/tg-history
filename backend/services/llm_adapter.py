@@ -5,7 +5,8 @@ from openai import AsyncOpenAI
 
 from backend.config import settings
 
-# 分 Provider 并发控制（月之暗面并发限制 = 3）
+# 分 Provider 并发控制
+# DashScope RPM 30,000（含百炼直供 kimi/），官方 Moonshot 并发限制 = 3
 _DASHSCOPE_CHAT_SEM = asyncio.Semaphore(10)
 _MOONSHOT_CHAT_SEM = asyncio.Semaphore(3)
 _EMBED_SEM = asyncio.Semaphore(20)
@@ -55,23 +56,32 @@ def _get_moonshot_client() -> AsyncOpenAI:
 
 # ---------- Provider 路由 ----------
 
-KIMI_MODELS = {"kimi-k2.6", "kimi-k2.5", "kimi-k2-0905-preview"}
+KIMI_MODELS = {"kimi-k2.6", "kimi-k2.5", "kimi-k2-0905-preview",
+               "kimi/kimi-k2.6", "kimi/kimi-k2.5"}
 
 
 def is_kimi_model(model: str) -> bool:
-    return model.startswith("kimi-")
+    """判断是否为 Kimi 系列模型（含官方 Moonshot 和百炼直供）"""
+    return model.startswith("kimi-") or model.startswith("kimi/")
+
+
+def _is_dashscope_kimi(model: str) -> bool:
+    """判断是否为百炼直供 Kimi（kimi/ 前缀，走 DashScope client）"""
+    return model.startswith("kimi/")
 
 
 def get_client_for_model(model: str) -> AsyncOpenAI:
     """根据模型名称返回对应 provider 的 client"""
-    if is_kimi_model(model):
-        return _get_moonshot_client()
-    return _get_client()
+    if is_kimi_model(model) and not _is_dashscope_kimi(model):
+        return _get_moonshot_client()  # 官方 Moonshot API
+    return _get_client()  # DashScope（含 kimi/ 百炼直供）
 
 
 def get_chat_semaphore(model: str) -> asyncio.Semaphore:
     """获取模型对应 provider 的 chat 并发 semaphore"""
-    return _MOONSHOT_CHAT_SEM if is_kimi_model(model) else _DASHSCOPE_CHAT_SEM
+    if is_kimi_model(model) and not _is_dashscope_kimi(model):
+        return _MOONSHOT_CHAT_SEM  # 官方 Moonshot 并发 = 3
+    return _DASHSCOPE_CHAT_SEM  # DashScope（含 kimi/ 百炼直供）RPM 30,000
 
 
 # ---------- 模型上下文窗口 ----------
@@ -106,11 +116,14 @@ MODEL_CONTEXT_WINDOW: dict[str, int] = {
     "qwen3.5-omni-plus": 262_144,
     "qwen3.5-omni-flash": 262_144,
     "qwen3-omni-flash": 65_536,
-    # ----- Moonshot / Kimi -----
+    # ----- Moonshot / Kimi（官方 + 百炼直供）-----
     # Kimi K2/K2.5/K2.6: 256K = 262,144 上下文
     "kimi-k2.6": 262_144,
     "kimi-k2.5": 262_144,
     "kimi-k2-0905-preview": 262_144,
+    # 百炼直供（kimi/ 前缀）
+    "kimi/kimi-k2.6": 262_144,
+    "kimi/kimi-k2.5": 262_144,
 }
 DEFAULT_CONTEXT_WINDOW = 131_072  # 未知模型回落到 128K（保守）
 
@@ -131,16 +144,26 @@ def get_context_window(model: str) -> int:
     return DEFAULT_CONTEXT_WINDOW
 
 
-def _kimi_chat_kwargs(model: str, temperature: float, enable_thinking: bool | None) -> dict:
-    """构建 Kimi 模型的特殊参数"""
+def kimi_chat_kwargs(model: str, enable_thinking: bool | None) -> dict:
+    """构建 Kimi 模型的特殊参数（同时支持官方 Moonshot 和百炼直供）
+
+    - 官方 Moonshot: thinking: {type: "enabled"/"disabled"}
+    - 百炼直供 kimi/: enable_thinking: true/false
+    - 温度固定：思考=1.0，非思考=0.6
+    """
     kwargs: dict = {}
-    # Kimi K2.6/K2.5 温度只能是 1.0（思考）或 0.6（非思考），不能自定义
+    dashscope = _is_dashscope_kimi(model)
     if enable_thinking is False:
-        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        if dashscope:
+            kwargs["extra_body"] = {"enable_thinking": False}
+        else:
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         kwargs["temperature"] = 0.6
     else:
-        # 默认开启思考
-        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+        if dashscope:
+            kwargs["extra_body"] = {"enable_thinking": True}
+        else:
+            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
         kwargs["temperature"] = 1.0
     return kwargs
 
@@ -164,7 +187,7 @@ async def chat(
         max_tokens=max_tokens,
     )
     if is_kimi_model(model):
-        kwargs.update(_kimi_chat_kwargs(model, temperature, enable_thinking))
+        kwargs.update(kimi_chat_kwargs(model, enable_thinking))
     elif enable_thinking is not None:
         kwargs["extra_body"] = {"enable_thinking": enable_thinking}
     async with get_chat_semaphore(model):
@@ -189,7 +212,7 @@ async def chat_stream(
         stream=True,
     )
     if is_kimi_model(model):
-        kwargs.update(_kimi_chat_kwargs(model, temperature, False))
+        kwargs.update(kimi_chat_kwargs(model, False))
     async with get_chat_semaphore(model):
         stream = await client.chat.completions.create(**kwargs)
         async for chunk in stream:

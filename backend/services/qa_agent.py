@@ -152,8 +152,7 @@ async def _stream_llm_step(
 
     if is_kimi:
         # Kimi: 思考模式 + tool_choice 只能 auto/none
-        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-        kwargs["temperature"] = 1.0
+        kwargs.update(llm_adapter.kimi_chat_kwargs(model, True))
         # Kimi 不支持 parallel_tool_calls 参数
     else:
         kwargs["parallel_tool_calls"] = True
@@ -509,8 +508,7 @@ async def run_agent(
                 stream=True,
             )
             if llm_adapter.is_kimi_model(_model):
-                _force_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-                _force_kwargs["temperature"] = 0.6
+                _force_kwargs.update(llm_adapter.kimi_chat_kwargs(_model, False))
             else:
                 _force_kwargs["temperature"] = 0.3
             _sem = llm_adapter.get_chat_semaphore(_model)
@@ -579,8 +577,7 @@ async def _force_summarize_recovery(messages: list[dict], cited_ids: set[int]) -
             stream=False,
         )
         if llm_adapter.is_kimi_model(model):
-            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-            kwargs["temperature"] = 0.6
+            kwargs.update(llm_adapter.kimi_chat_kwargs(model, False))
         else:
             kwargs["temperature"] = 0.3
         async with sem:

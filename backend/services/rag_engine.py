@@ -326,8 +326,7 @@ async def answer_question_stream(
             stream_options={"include_usage": True},
         )
         if is_kimi:
-            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-            kwargs["temperature"] = 0.6
+            kwargs.update(llm_adapter.kimi_chat_kwargs(model, False))
         else:
             kwargs["temperature"] = 0.3
 
