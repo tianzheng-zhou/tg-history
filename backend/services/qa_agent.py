@@ -178,12 +178,7 @@ async def _stream_llm_step(
             # 捕获 usage（通常在最后一个 chunk，choices 可能为空）
             usage = getattr(chunk, "usage", None)
             if usage is not None:
-                last_usage = {
-                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-                    "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
-                    "total_tokens": getattr(usage, "total_tokens", 0) or 0,
-                    "model": model,
-                }
+                last_usage = llm_adapter.parse_usage(usage)
 
             choice = chunk.choices[0] if chunk.choices else None
             if not choice:
@@ -236,7 +231,7 @@ async def _stream_llm_step(
     if reasoning_parts:
         yield {"type": "reasoning_content", "text": "".join(reasoning_parts)}
 
-    # yield usage（供上层记录当前上下文占比）
+    # yield usage（供上层记录当前上下文占比 + 累计统计）
     if last_usage is not None:
         max_ctx = llm_adapter.get_context_window(model)
         yield {
@@ -244,6 +239,7 @@ async def _stream_llm_step(
             "prompt_tokens": last_usage["prompt_tokens"],
             "completion_tokens": last_usage["completion_tokens"],
             "total_tokens": last_usage["total_tokens"],
+            "cached_tokens": last_usage["cached_tokens"],
             "max_context": max_ctx,
             "percent": round(last_usage["prompt_tokens"] / max_ctx, 4) if max_ctx else 0.0,
             "model": model,
@@ -284,6 +280,14 @@ async def run_agent(
     cited_message_ids: set[int] = set()
     final_text_parts: list[str] = []
 
+    # 累计 token 用量（含子 Agent）
+    cumulative_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0}
+    sub_agent_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0}
+
+    def _add_usage(target: dict, u: dict):
+        for k in target:
+            target[k] += u.get(k, 0)
+
     for step in range(1, MAX_STEPS + 1):
         yield {"type": "step_start", "step": step}
 
@@ -323,6 +327,8 @@ async def run_agent(
                 elif ev["type"] == "tool_calls":
                     step_tool_calls = ev["calls"]
                 elif ev["type"] == "usage":
+                    # 累加到全局用量
+                    _add_usage(cumulative_usage, ev)
                     # 向上透传 usage（上下文占比显示）
                     yield {**ev, "step": step}
                 elif ev["type"] == "done":
@@ -473,6 +479,12 @@ async def run_agent(
 
             call, result, duration_ms = item
 
+            # 收集子 Agent usage（research 工具返回中包含 usage 字段）
+            sub_usage = result.get("usage") if isinstance(result, dict) else None
+            if sub_usage and isinstance(sub_usage, dict):
+                _add_usage(cumulative_usage, sub_usage)
+                _add_usage(sub_agent_usage, sub_usage)
+
             # 收集消息 ID 用于后续引用
             _collect_ids(result, cited_message_ids)
 
@@ -520,9 +532,13 @@ async def run_agent(
                 _force_kwargs["temperature"] = 0.3
             _sem = llm_adapter.get_chat_semaphore(_model)
             forced_text = ""
+            _force_kwargs["stream_options"] = {"include_usage": True}
             async with _sem:
                 stream = await _client.chat.completions.create(**_force_kwargs)
                 async for chunk in stream:
+                    _fu = getattr(chunk, "usage", None)
+                    if _fu is not None:
+                        _add_usage(cumulative_usage, llm_adapter.parse_usage(_fu))
                     choice = chunk.choices[0] if chunk.choices else None
                     if choice and choice.delta.content:
                         forced_text += choice.delta.content
@@ -534,10 +550,27 @@ async def run_agent(
     # 构造 sources（从引用过的消息中选前 5 条，按话题去重）
     sources = _build_sources(db, cited_message_ids)
 
+    # 计算预估费用
+    model = settings.llm_model_qa
+    estimated_cost = llm_adapter.estimate_cost(
+        model,
+        cumulative_usage["prompt_tokens"],
+        cumulative_usage["completion_tokens"],
+        cumulative_usage["cached_tokens"],
+    )
+
     yield {
         "type": "final_answer",
         "answer": "".join(final_text_parts),
         "sources": sources,
+        "task_usage": {
+            **cumulative_usage,
+            "sub_agent_prompt_tokens": sub_agent_usage["prompt_tokens"],
+            "sub_agent_completion_tokens": sub_agent_usage["completion_tokens"],
+            "sub_agent_cached_tokens": sub_agent_usage["cached_tokens"],
+            "estimated_cost_yuan": estimated_cost,
+            "model": model,
+        },
     }
 
 

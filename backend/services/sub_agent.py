@@ -88,12 +88,19 @@ async def _stream_sub_llm(
         kwargs["parallel_tool_calls"] = True
         kwargs["temperature"] = 0.3
 
+    last_usage = None
+
     async with sem:
         stream = await client.chat.completions.create(**kwargs)
         tool_calls_acc: dict[int, dict] = {}
         reasoning_parts: list[str] = []
 
         async for chunk in stream:
+            # 捕获 usage（通常在最后一个 chunk）
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                last_usage = usage
+
             choice = chunk.choices[0] if chunk.choices else None
             if not choice:
                 continue
@@ -128,6 +135,9 @@ async def _stream_sub_llm(
     if reasoning_parts:
         yield {"type": "reasoning_content", "text": "".join(reasoning_parts)}
 
+    # yield usage 事件
+    yield {"type": "usage", "usage": llm_adapter.parse_usage(last_usage)}
+
     yield {"type": "done"}
 
 
@@ -154,6 +164,11 @@ async def run_sub_agent(
 
     cited_message_ids: set[int] = set()
     total_tool_calls = 0
+    cumulative_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0}
+
+    def _add_usage(u: dict):
+        for k in cumulative_usage:
+            cumulative_usage[k] += u.get(k, 0)
 
     async def _emit(event: dict):
         if event_callback:
@@ -174,6 +189,8 @@ async def run_sub_agent(
                     step_reasoning = ev["text"]
                 elif ev["type"] == "tool_calls":
                     step_tool_calls = ev["calls"]
+                elif ev["type"] == "usage":
+                    _add_usage(ev["usage"])
                 elif ev["type"] == "done":
                     break
         except Exception as e:
@@ -185,12 +202,14 @@ async def run_sub_agent(
                     "message_ids": sorted(cited_message_ids),
                     "steps": step,
                     "tool_calls_count": total_tool_calls,
+                    "usage": cumulative_usage,
                 }
             return {
                 "report": f"子 Agent LLM 调用失败: {e}",
                 "message_ids": [],
                 "steps": step,
                 "tool_calls_count": total_tool_calls,
+                "usage": cumulative_usage,
             }
 
         # 构建 assistant 消息
@@ -216,6 +235,7 @@ async def run_sub_agent(
                 "message_ids": sorted(cited_message_ids),
                 "steps": step,
                 "tool_calls_count": total_tool_calls,
+                "usage": cumulative_usage,
             }
 
         # 执行工具
@@ -271,6 +291,7 @@ async def run_sub_agent(
         async with sem:
             resp = await client.chat.completions.create(**force_kwargs)
         report = resp.choices[0].message.content or ""
+        _add_usage(llm_adapter.parse_usage(getattr(resp, "usage", None)))
     except Exception as e:
         report = f"子 Agent 强制总结失败: {e}"
 
@@ -279,6 +300,7 @@ async def run_sub_agent(
         "message_ids": sorted(cited_message_ids),
         "steps": SUB_MAX_STEPS,
         "tool_calls_count": total_tool_calls,
+        "usage": cumulative_usage,
     }
 
 

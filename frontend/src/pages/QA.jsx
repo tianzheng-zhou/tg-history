@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import Markdown from "@/components/Markdown";
 import {
   Send,
   Loader2,
@@ -26,8 +25,8 @@ import {
   patchSession,
   autotitleSession,
 } from "@/lib/api";
-import SourceCard from "@/components/SourceCard";
 import ContextBadge from "@/components/ContextBadge";
+import TaskUsageBadge from "@/components/TaskUsageBadge";
 import SessionSidebar from "@/components/SessionSidebar";
 import { useRuns, findActiveRunForSession } from "@/lib/runsStore";
 
@@ -190,7 +189,14 @@ function AgentTimeline({ steps, streaming }) {
 }
 
 function AgentStep({ step, streaming }) {
-  const [expanded, setExpanded] = useState(true);
+  // 流式中默认展开，流式结束（或历史 turn）默认折叠
+  const [expanded, setExpanded] = useState(streaming);
+  const prevStreaming = useRef(streaming);
+  useEffect(() => {
+    // streaming: true → false 的瞬间自动折叠（用户后续可手动重新展开）
+    if (prevStreaming.current && !streaming) setExpanded(false);
+    prevStreaming.current = streaming;
+  }, [streaming]);
   const isActive = streaming && !step.done;
   const hasToolCalls = step.tool_calls && step.tool_calls.length > 0;
 
@@ -242,7 +248,7 @@ function AgentStep({ step, streaming }) {
                 <span>thinking</span>
               </div>
               <div className="prose prose-xs max-w-none">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{step.thinking}</ReactMarkdown>
+                <Markdown>{step.thinking}</Markdown>
               </div>
             </div>
           )}
@@ -748,7 +754,7 @@ function PersistedTurn({ turn }) {
     );
   }
 
-  // assistant turn：trajectory 还原 + content + sources
+  // assistant turn：trajectory 还原 + content
   const traj = turn.trajectory || {};
   const steps = normalizeAgentSteps(traj.steps);
   const ragEvents = normalizeRagEvents(traj.rag_events);
@@ -773,7 +779,7 @@ function PersistedTurn({ turn }) {
           )}
           <div className="prose prose-sm max-w-none">
             {turn.content ? (
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{turn.content}</ReactMarkdown>
+              <Markdown>{turn.content}</Markdown>
             ) : (
               <p className="text-sm text-muted-foreground italic">（无内容）</p>
             )}
@@ -781,12 +787,9 @@ function PersistedTurn({ turn }) {
         </div>
       </div>
 
-      {turn.sources && turn.sources.length > 0 && (
-        <div className="mt-2 ml-2 space-y-2">
-          <p className="text-xs text-muted-foreground">📎 来源引用 ({turn.sources.length})</p>
-          {turn.sources.map((src, j) => (
-            <SourceCard key={j} source={src} />
-          ))}
+      {turn.meta?.task_usage && (
+        <div className="mt-2 ml-2">
+          <TaskUsageBadge taskUsage={turn.meta.task_usage} />
         </div>
       )}
     </div>
@@ -819,7 +822,7 @@ function LiveAssistant({ run }) {
           )}
           <div className="prose prose-sm max-w-none">
             {run.answer ? (
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{run.answer}</ReactMarkdown>
+              <Markdown>{run.answer}</Markdown>
             ) : streaming ? (
               <p className="text-sm text-muted-foreground italic">
                 {run.currentStage === "generating" ? "正在生成..." : "准备中..."}
@@ -834,12 +837,9 @@ function LiveAssistant({ run }) {
         </div>
       </div>
 
-      {run.sources && run.sources.length > 0 && (
-        <div className="mt-2 ml-2 space-y-2">
-          <p className="text-xs text-muted-foreground">📎 来源引用 ({run.sources.length})</p>
-          {run.sources.map((src, j) => (
-            <SourceCard key={j} source={src} />
-          ))}
+      {!streaming && run.taskUsage && (
+        <div className="mt-2 ml-2">
+          <TaskUsageBadge taskUsage={run.taskUsage} />
         </div>
       )}
     </div>

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
+import Markdown from "@/components/Markdown";
 import { FileText, Loader2, RefreshCw, Sparkles } from "lucide-react";
 import { getChats, getSummaries, getSummaryProgress, triggerSummarize, triggerSummarizeAll } from "@/lib/api";
 
@@ -287,7 +287,7 @@ export default function Summary() {
           {/* 内容 */}
           {activeSummary ? (
             <div className="bg-card border border-border rounded-lg p-6 prose prose-sm max-w-none">
-              <ReactMarkdown>{activeSummary.content}</ReactMarkdown>
+              <Markdown>{activeSummary.content}</Markdown>
             </div>
           ) : (
             <div className="text-center py-12 text-muted-foreground">

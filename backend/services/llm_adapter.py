@@ -144,6 +144,91 @@ def get_context_window(model: str) -> int:
     return DEFAULT_CONTEXT_WINDOW
 
 
+# ---------- 模型定价（元 / 百万 token） ----------
+#
+# 数据来源：https://help.aliyun.com/zh/model-studio/model-pricing（2026-05 时点）
+# (input, output, cached_input)  —— cached_input 为 0 表示不支持/无折扣
+MODEL_PRICING: dict[str, tuple[float, float, float]] = {
+    # 百炼直供 Kimi（隐式缓存）
+    "kimi/kimi-k2.6": (6.5, 27.0, 6.5 * 0.169),   # 缓存 16.9%
+    "kimi/kimi-k2.5": (4.0, 21.0, 4.0 * 0.175),    # 缓存 17.5%
+    # 阿里云部署 Kimi
+    "kimi-k2.6": (6.5, 27.0, 0),
+    "kimi-k2.5": (4.0, 21.0, 0),
+    # Qwen Plus
+    "qwen3.6-plus": (2.0, 12.0, 0),
+    "qwen3.5-plus": (0.8, 4.8, 0),
+    "qwen-plus": (0.8, 2.0, 0),
+    # Qwen Flash
+    "qwen3.5-flash": (0.0, 0.0, 0),   # 免费
+    "qwen-flash": (0.0, 0.0, 0),
+    # Embedding / Rerank
+    "text-embedding-v4": (0.5, 0, 0),
+    "text-embedding-v3": (0.5, 0, 0),
+    "qwen3-rerank": (0.5, 0, 0),
+    "gte-rerank-v2": (0.8, 0, 0),
+}
+
+
+def _match_pricing(model: str) -> tuple[float, float, float]:
+    """获取模型定价，支持精确匹配和 prefix 匹配。未知模型返回 (0,0,0)。"""
+    if model in MODEL_PRICING:
+        return MODEL_PRICING[model]
+    for key in sorted(MODEL_PRICING.keys(), key=len, reverse=True):
+        if model.startswith(key):
+            return MODEL_PRICING[key]
+    return (0, 0, 0)
+
+
+def parse_usage(usage) -> dict:
+    """从 OpenAI usage 对象提取 token 计数（含 cached_tokens）。
+
+    兼容 DashScope 的 prompt_tokens_details.cached_tokens。
+    usage 可以是对象（有属性）或 dict。
+    """
+    if usage is None:
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0}
+
+    def _get(obj, key, default=0):
+        if isinstance(obj, dict):
+            return obj.get(key, default) or default
+        return getattr(obj, key, default) or default
+
+    prompt = _get(usage, "prompt_tokens")
+    completion = _get(usage, "completion_tokens")
+    total = _get(usage, "total_tokens")
+
+    # cached_tokens 藏在 prompt_tokens_details 里
+    cached = 0
+    details = _get(usage, "prompt_tokens_details", None)
+    if details is not None:
+        cached = _get(details, "cached_tokens")
+
+    return {
+        "prompt_tokens": int(prompt),
+        "completion_tokens": int(completion),
+        "total_tokens": int(total),
+        "cached_tokens": int(cached),
+    }
+
+
+def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int,
+                  cached_tokens: int = 0) -> float:
+    """根据模型定价估算费用（元）。
+
+    cached_tokens 是 prompt_tokens 中命中缓存的部分，
+    按缓存价计费，剩余按正常输入价。
+    """
+    input_price, output_price, cache_price = _match_pricing(model)
+    per_m = 1_000_000
+
+    uncached_input = max(prompt_tokens - cached_tokens, 0)
+    cost = (uncached_input / per_m) * input_price
+    cost += (cached_tokens / per_m) * cache_price
+    cost += (completion_tokens / per_m) * output_price
+    return round(cost, 6)
+
+
 def kimi_chat_kwargs(model: str, enable_thinking: bool | None) -> dict:
     """构建 Kimi 模型的特殊参数（同时支持官方 Moonshot 和百炼直供）
 

@@ -46,6 +46,7 @@ class Run:
     final_answer: str = ""
     final_sources: list = field(default_factory=list)
     final_usage: dict | None = None
+    final_task_usage: dict | None = None
     error: str | None = None
 
 
@@ -332,6 +333,8 @@ async def _run_worker(run: Run) -> None:
                 if t == "final_answer":
                     run.final_answer = ev.get("answer", "") or ""
                     run.final_sources = ev.get("sources", []) or []
+                    if ev.get("task_usage"):
+                        run.final_task_usage = ev["task_usage"]
                 elif t == "usage":
                     run.final_usage = {
                         k: v for k, v in ev.items()
@@ -358,6 +361,8 @@ async def _run_worker(run: Run) -> None:
         meta: dict = {"run_id": run.id}
         if run.final_usage:
             meta["usage"] = run.final_usage
+        if run.final_task_usage:
+            meta["task_usage"] = run.final_task_usage
         if run.status == "aborted":
             meta["aborted"] = True
         elif run.status == "failed":

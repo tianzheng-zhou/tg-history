@@ -47,6 +47,7 @@ function emptyRun(meta) {
     answer: "",
     sources: [],
     usage: null,
+    taskUsage: null,
     error: null,
     maxSeq: -1,
   };
@@ -163,6 +164,7 @@ function applyEvent(run, ev) {
   if (t === "final_answer") {
     out.answer = ev.answer || out.answer;
     out.sources = ev.sources || [];
+    out.taskUsage = ev.task_usage || null;
     return out;
   }
 
