@@ -48,18 +48,19 @@ async def add_documents(
     # 并发计算所有 batch 的 embedding（受 _EMBED_SEM 限流）
     embed_tasks = [_embed_batch(s) for s in starts]
 
+    def _upsert_sync(b_ids, b_emb, b_texts, b_meta):
+        collection.upsert(
+            ids=b_ids, embeddings=b_emb, documents=b_texts, metadatas=b_meta,
+        )
+
     # 按完成顺序写入 chroma，及时更新进度
     for coro in asyncio.as_completed(embed_tasks):
         start, embeddings = await coro
         batch_ids = ids[start : start + batch_size]
         batch_texts = texts[start : start + batch_size]
         batch_meta = metadatas[start : start + batch_size] if metadatas else None
-        collection.upsert(
-            ids=batch_ids,
-            embeddings=embeddings,
-            documents=batch_texts,
-            metadatas=batch_meta,
-        )
+        # chromadb upsert 是同步阻塞 IO（写入磁盘），派到 thread 不阻塞 main loop
+        await asyncio.to_thread(_upsert_sync, batch_ids, embeddings, batch_texts, batch_meta)
         if progress is not None:
             progress["index_done"] = progress.get("index_done", 0) + len(batch_ids)
 
@@ -133,20 +134,34 @@ def _chunk_lines(lines: list[str], msg_ids: list[int]) -> list[tuple[str, list[i
 def _collect_topic_chunks(
     db_session, chat_id: str, topics: list,
 ) -> tuple[list[str], list[str], list[dict]]:
-    """从给定 topic 列表生成 (ids, texts, metadatas)。供全量/增量复用。"""
+    """从给定 topic 列表生成 (ids, texts, metadatas)。供全量/增量复用。
+
+    优化：一次 query 拉所有 messages，按 topic_id 分组，避免 N+1 查询
+    （之前对几千个 topic 会发几千次 query，对大群聊主循环阻塞数十秒）。
+    """
+    from collections import defaultdict
     from backend.models.database import Message
 
     ids: list[str] = []
     texts: list[str] = []
     metadatas: list[dict] = []
 
+    if not topics:
+        return ids, texts, metadatas
+
+    topic_ids = [t.id for t in topics]
+    all_msgs = (
+        db_session.query(Message)
+        .filter(Message.topic_id.in_(topic_ids))
+        .order_by(Message.date)
+        .all()
+    )
+    msgs_by_topic: dict[int, list] = defaultdict(list)
+    for m in all_msgs:
+        msgs_by_topic[m.topic_id].append(m)
+
     for topic in topics:
-        msgs = (
-            db_session.query(Message)
-            .filter(Message.topic_id == topic.id)
-            .order_by(Message.date)
-            .all()
-        )
+        msgs = msgs_by_topic.get(topic.id, [])
         if not msgs:
             continue
 
@@ -228,6 +243,29 @@ def _delete_chunks_for_topics(chat_id: str, topic_ids: set[int]) -> None:
             raise
 
 
+def _prepare_incremental_index_sync(
+    chat_id: str, changed_topic_ids: set[int],
+) -> tuple[list[str], list[str], list[dict]]:
+    """同步：拉 topics + 切 chunks + 删旧向量。在 thread pool 跑，避免阻塞主 loop。"""
+    from backend.models.database import SessionLocal, Topic
+
+    db = SessionLocal()
+    try:
+        topics = (
+            db.query(Topic)
+            .filter(Topic.chat_id == chat_id, Topic.id.in_(changed_topic_ids))
+            .all()
+        )
+        ids, texts, metadatas = _collect_topic_chunks(db, chat_id, topics)
+    finally:
+        db.close()
+
+    # 先删旧的（按 topic_id 精确删除，未变 topic 的向量保持不动）
+    _delete_chunks_for_topics(chat_id, changed_topic_ids)
+
+    return ids, texts, metadatas
+
+
 async def build_index_for_chat_incremental(
     db_session,
     chat_id: str,
@@ -239,6 +277,8 @@ async def build_index_for_chat_incremental(
     - changed_topic_ids 为空：什么都不做（旧向量保留），返回 0
     - 否则先按 topic_id 删除 ChromaDB 里这些 topic 的旧 chunks，再重新写入
     - 返回本次写入的 chunk 数量
+
+    db_session 参数兼容签名，**实际不使用**（同步段在独立 thread session 里跑）。
     """
     if not changed_topic_ids:
         if progress is not None:
@@ -246,22 +286,14 @@ async def build_index_for_chat_incremental(
             progress["index_done"] = 0
         return 0
 
-    from backend.models.database import Topic
-
-    topics = (
-        db_session.query(Topic)
-        .filter(Topic.chat_id == chat_id, Topic.id.in_(changed_topic_ids))
-        .all()
+    # 准备阶段（同步 db query + chromadb delete）派到 thread
+    ids, texts, metadatas = await asyncio.to_thread(
+        _prepare_incremental_index_sync, chat_id, changed_topic_ids
     )
-
-    ids, texts, metadatas = _collect_topic_chunks(db_session, chat_id, topics)
 
     if progress is not None:
         progress["index_total"] = len(ids)
         progress["index_done"] = 0
-
-    # 先删旧的（按 topic_id 精确删除，未变 topic 的向量保持不动）
-    _delete_chunks_for_topics(chat_id, changed_topic_ids)
 
     if ids:
         await add_documents(ids, texts, metadatas, progress=progress)
@@ -269,30 +301,47 @@ async def build_index_for_chat_incremental(
     return len(ids)
 
 
-async def build_index_for_chat(db_session, chat_id: str, progress: dict | None = None):
-    """为指定群聊构建向量索引（大话题自动切分）。
+def _prepare_full_rebuild_sync(
+    chat_id: str,
+) -> tuple[list[str], list[str], list[dict]]:
+    """同步：拉所有 topics + 切 chunks + 清空 chat 旧向量。在 thread pool 跑。"""
+    import logging
+    from backend.models.database import SessionLocal, Topic
 
-    全量重建：先清空该 chat 的所有旧 chunks，再重新写入。
-    """
-    from backend.models.database import Topic
+    db = SessionLocal()
+    try:
+        topics = db.query(Topic).filter(Topic.chat_id == chat_id).all()
+        ids, texts, metadatas = _collect_topic_chunks(db, chat_id, topics)
+    finally:
+        db.close()
 
-    topics = db_session.query(Topic).filter(Topic.chat_id == chat_id).all()
-    ids, texts, metadatas = _collect_topic_chunks(db_session, chat_id, topics)
-
-    if progress is not None:
-        progress["index_total"] = len(ids)
-        progress["index_done"] = 0
-
-    # 全量重建：先清空该 chat 的所有旧 chunks，避免遗留已删 topic 的向量
+    # 全量重建：先清空该 chat 的所有旧 chunks
     try:
         collection = get_or_create_collection()
         collection.delete(where={"chat_id": chat_id})
     except Exception as e:
-        import logging
         logging.getLogger(__name__).warning(
             "全量重建前清空 chat=%s 旧 chunks 失败（继续 upsert，可能有残留）: %s",
             chat_id, e,
         )
+
+    return ids, texts, metadatas
+
+
+async def build_index_for_chat(db_session, chat_id: str, progress: dict | None = None):
+    """为指定群聊构建向量索引（大话题自动切分）。
+
+    全量重建：先清空该 chat 的所有旧 chunks，再重新写入。
+
+    db_session 参数兼容签名，**实际不使用**（同步段在独立 thread session 里跑）。
+    """
+    ids, texts, metadatas = await asyncio.to_thread(
+        _prepare_full_rebuild_sync, chat_id
+    )
+
+    if progress is not None:
+        progress["index_total"] = len(ids)
+        progress["index_done"] = 0
 
     if ids:
         await add_documents(ids, texts, metadatas, progress=progress)
