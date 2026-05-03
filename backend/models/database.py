@@ -151,6 +151,27 @@ class ImportedFile(Base):
     imported_at = Column(DateTime, default=datetime.now)
 
 
+class TelegramAccount(Base):
+    """Telegram 直连同步账号：仅 1 行（singleton），存 api_id/hash 和登录态。
+
+    api_hash 与 .session 文件等价于免密码登录凭证 —— 不要导出到 git，
+    不要外传。本表与 data/telegram.session 文件配套使用。
+    """
+
+    __tablename__ = "telegram_account"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    api_id = Column(Integer, nullable=False)
+    api_hash = Column(String, nullable=False)
+    phone = Column(String, nullable=False)                    # E.164 格式，含 + 和国家码
+    tg_user_id = Column(Integer)                              # 登录后填入
+    username = Column(String)                                 # 登录后填入（可能为空）
+    first_name = Column(String)
+    last_name = Column(String)
+    created_at = Column(DateTime, default=datetime.now)
+    last_login_at = Column(DateTime)
+
+
 # ---------- Engine / Session ----------
 
 def _ensure_data_dir():

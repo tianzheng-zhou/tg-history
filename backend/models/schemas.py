@@ -259,3 +259,67 @@ class ScanResult(BaseModel):
     imported: int                            # 本次成功处理的文件数
     failed: int                              # 解析/导入失败的文件数
     files: list[ScanFileResult] = []
+
+
+# ---------- Telegram 直连同步 ----------
+
+class TelegramAccountInfo(BaseModel):
+    """登录态信息（供前端判断 UI 状态）"""
+    configured: bool = False                  # 是否已保存 api_id/hash/phone
+    authorized: bool = False                  # 是否已完成验证码登录（session 有效）
+    phone: str | None = None
+    tg_user_id: int | None = None
+    username: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
+    last_login_at: datetime | None = None
+    needs_password: bool = False              # 上次 sign_in 抛了 SessionPasswordNeededError
+    proxy: dict | None = None                 # 当前代理状态：{enabled, source, scheme, host, port}
+
+
+class TelegramConfigureRequest(BaseModel):
+    api_id: int
+    api_hash: str
+    phone: str                                # E.164 格式，含 + 号，如 +8613800138000
+
+
+class TelegramSendCodeResponse(BaseModel):
+    sent: bool
+    phone_code_hash: str | None = None        # 仅作为前端透传字段，verify 时由后端从内存取
+
+
+class TelegramVerifyRequest(BaseModel):
+    code: str
+    password: str | None = None               # 2FA 云密码（账号开启了二次验证才需要）
+
+
+class TelegramDialogInfo(BaseModel):
+    chat_id: str
+    name: str
+    type: str                                 # private / group / supergroup / channel / unknown
+    username: str | None = None
+    unread_count: int = 0
+    last_message_id: int | None = None
+    last_message_date: str | None = None
+    # 本地导入状态（由后端 join Import 表后填充）
+    imported: bool = False
+    imported_message_count: int = 0
+    local_max_message_id: int = 0             # 本地已存的最大原始 message id（增量基准）
+
+
+class TelegramSyncRequest(BaseModel):
+    chat_ids: list[str]
+
+
+class TelegramSyncProgress(BaseModel):
+    running: bool = False
+    aborting: bool = False
+    total: int = 0                            # 待同步 chat 数
+    completed: int = 0                        # 已完成 chat 数
+    current_chat_id: str | None = None
+    current_chat_name: str | None = None
+    current_fetched: int = 0                  # 当前 chat 已拉取条数
+    current_imported: int = 0                 # 当前 chat 累计入库条数
+    results: list[dict] = []                  # 每个 chat 完成后追加 {chat_id, chat_name, status, message_count, error?}
+    started_at: datetime | None = None
+    finished_at: datetime | None = None

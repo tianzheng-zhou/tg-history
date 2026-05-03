@@ -66,12 +66,27 @@ def _stable_id_offset(chat_id: str) -> int:
     return (int.from_bytes(digest[:8], "big") % (10**9)) * 1000000
 
 
-def _import_single_chat(parsed: dict, db: Session) -> ImportResult:
-    """导入单个群聊数据到数据库（同步，不含向量索引）"""
-    chat_id = parsed["chat_id"]
-    chat_name = parsed["chat_name"]
-    messages = parsed["messages"]
+def import_messages_for_chat(
+    db: Session,
+    *,
+    chat_id: str,
+    chat_name: str,
+    messages: list[dict],
+    date_range: str,
+) -> ImportResult:
+    """把一批已解析的消息写入数据库 + FTS（同步，不含向量索引）。
 
+    messages 中每个元素须符合 parser.parse_message 的输出格式：
+        id (int, 原始 chat 内 id), chat_id, date, sender, sender_id,
+        text, text_plain, reply_to_id, forwarded_from, media_type, entities
+
+    去重逻辑：
+    - 用 chat_id 稳定哈希偏移把每条消息映射到全局唯一 id；
+    - 对该 chat 已存在的 message id 取交集，跳过重复；
+    - 同步 FTS5 索引；如果有新消息且已存在导入记录，标记摘要 stale + index_built=False。
+
+    返回 ImportResult，message_count 表示**本次新增**条数（增量）。
+    """
     # 检查是否已导入（支持增量）
     existing = db.query(Import).filter(Import.chat_id == chat_id).first()
     existing_ids = set()
@@ -126,13 +141,13 @@ def _import_single_chat(parsed: dict, db: Session) -> ImportResult:
     total_count = db.query(Message).filter(Message.chat_id == chat_id).count()
     if existing:
         existing.message_count = total_count
-        existing.date_range = parsed["date_range"]
+        existing.date_range = date_range
     else:
         db.add(Import(
             chat_name=chat_name,
             chat_id=chat_id,
             message_count=total_count,
-            date_range=parsed["date_range"],
+            date_range=date_range,
         ))
 
     # 增量导入时，标记该群聊的旧摘要为过期 + 索引已过期
@@ -149,6 +164,17 @@ def _import_single_chat(parsed: dict, db: Session) -> ImportResult:
         chat_id=chat_id,
         chat_name=chat_name,
         message_count=new_count,
+        date_range=date_range,
+    )
+
+
+def _import_single_chat(parsed: dict, db: Session) -> ImportResult:
+    """从 parser.parse_export_file 返回的单个 chat dict 写入数据库（兼容老调用）。"""
+    return import_messages_for_chat(
+        db,
+        chat_id=parsed["chat_id"],
+        chat_name=parsed["chat_name"],
+        messages=parsed["messages"],
         date_range=parsed["date_range"],
     )
 

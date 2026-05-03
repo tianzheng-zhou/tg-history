@@ -11,6 +11,7 @@ import {
   Folder,
   RefreshCw,
   Trash2,
+  Send,
 } from "lucide-react";
 import {
   importChat,
@@ -22,8 +23,10 @@ import {
   deleteFolder,
   scanFolder,
 } from "@/lib/api";
+import TelegramSync from "@/components/TelegramSync";
 
 export default function Import() {
+  const [activeTab, setActiveTab] = useState("upload"); // "upload" | "folder" | "telegram"
   const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
@@ -190,78 +193,115 @@ export default function Import() {
     }
   };
 
+  const TABS = [
+    { key: "upload", label: "文件上传", icon: Upload },
+    { key: "folder", label: "扫描目录", icon: FolderSearch },
+    { key: "telegram", label: "Telegram 直连", icon: Send },
+  ];
+
   return (
     <div>
-      <h1 className="text-2xl font-bold mb-6">数据导入</h1>
+      <h1 className="text-2xl font-bold mb-4">数据导入</h1>
 
-      {/* 拖拽上传区域 */}
-      <div
-        onDrop={handleDrop}
-        onDragOver={(e) => e.preventDefault()}
-        className="border-2 border-dashed border-border rounded-lg p-12 text-center hover:border-primary/50 transition-colors cursor-pointer"
-        onClick={() => document.getElementById("file-input").click()}
-      >
-        <input
-          id="file-input"
-          type="file"
-          accept=".json"
-          className="hidden"
-          onChange={handleFileSelect}
-        />
-        <Upload size={40} className="mx-auto mb-4 text-muted-foreground" />
-        <p className="text-lg font-medium mb-1">
-          拖拽或点击上传 Telegram 导出的 JSON 文件
-        </p>
-        <p className="text-sm text-muted-foreground">
-          支持 Telegram Desktop 导出的 result.json 格式
-        </p>
+      {/* Tabs */}
+      <div className="flex items-center gap-1 border-b border-border mb-6">
+        {TABS.map((t) => {
+          const Icon = t.icon;
+          const active = activeTab === t.key;
+          return (
+            <button
+              key={t.key}
+              onClick={() => setActiveTab(t.key)}
+              className={`inline-flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px ${
+                active
+                  ? "border-primary text-primary"
+                  : "border-transparent text-muted-foreground hover:text-foreground hover:border-border"
+              }`}
+            >
+              <Icon size={14} />
+              {t.label}
+            </button>
+          );
+        })}
       </div>
 
-      {/* 已选文件 */}
-      {file && (
-        <div className="mt-4 flex items-center justify-between bg-card border border-border rounded-lg p-4">
-          <div className="flex items-center gap-3">
-            <FileJson size={20} className="text-primary" />
-            <div>
-              <p className="text-sm font-medium">{file.name}</p>
-              <p className="text-xs text-muted-foreground">
-                {(file.size / 1024 / 1024).toFixed(2)} MB
-              </p>
-            </div>
-          </div>
-          <button
-            onClick={handleImport}
-            disabled={loading}
-            className="bg-primary text-primary-foreground px-4 py-2 rounded-md text-sm hover:opacity-90 transition-opacity disabled:opacity-50"
+      {/* Tab: 文件上传 */}
+      {activeTab === "upload" && (
+        <>
+          <div
+            onDrop={handleDrop}
+            onDragOver={(e) => e.preventDefault()}
+            className="border-2 border-dashed border-border rounded-lg p-12 text-center hover:border-primary/50 transition-colors cursor-pointer"
+            onClick={() => document.getElementById("file-input").click()}
           >
-            {loading ? "导入中..." : "开始导入"}
-          </button>
-        </div>
-      )}
-
-      {/* 导入结果 */}
-      {result && result.length > 0 && (
-        <div className="mt-4 bg-green-50 border border-green-200 rounded-lg p-4 flex items-start gap-3">
-          <CheckCircle2 size={20} className="text-green-600 mt-0.5" />
-          <div>
-            <p className="font-medium text-green-800">
-              导入成功! 共 {result.length} 个群聊
+            <input
+              id="file-input"
+              type="file"
+              accept=".json"
+              className="hidden"
+              onChange={handleFileSelect}
+            />
+            <Upload size={40} className="mx-auto mb-4 text-muted-foreground" />
+            <p className="text-lg font-medium mb-1">
+              拖拽或点击上传 Telegram 导出的 JSON 文件
             </p>
-            {result.map((r, i) => (
-              <p key={i} className="text-sm text-green-700 mt-1">
-                {r.chat_name} · 新增 {r.message_count} 条消息 · {r.date_range}
-              </p>
-            ))}
+            <p className="text-sm text-muted-foreground">
+              支持 Telegram Desktop 导出的 result.json 格式
+            </p>
           </div>
-        </div>
+
+          {file && (
+            <div className="mt-4 flex items-center justify-between bg-card border border-border rounded-lg p-4">
+              <div className="flex items-center gap-3">
+                <FileJson size={20} className="text-primary" />
+                <div>
+                  <p className="text-sm font-medium">{file.name}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {(file.size / 1024 / 1024).toFixed(2)} MB
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={handleImport}
+                disabled={loading}
+                className="bg-primary text-primary-foreground px-4 py-2 rounded-md text-sm hover:opacity-90 transition-opacity disabled:opacity-50"
+              >
+                {loading ? "导入中..." : "开始导入"}
+              </button>
+            </div>
+          )}
+
+          {result && result.length > 0 && (
+            <div className="mt-4 bg-green-50 border border-green-200 rounded-lg p-4 flex items-start gap-3">
+              <CheckCircle2 size={20} className="text-green-600 mt-0.5" />
+              <div>
+                <p className="font-medium text-green-800">
+                  导入成功! 共 {result.length} 个群聊
+                </p>
+                {result.map((r, i) => (
+                  <p key={i} className="text-sm text-green-700 mt-1">
+                    {r.chat_name} · 新增 {r.message_count} 条消息 · {r.date_range}
+                  </p>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {error && (
+            <div className="mt-4 bg-red-50 border border-red-200 rounded-lg p-4 flex items-start gap-3">
+              <AlertCircle size={20} className="text-red-600 mt-0.5" />
+              <div>
+                <p className="font-medium text-red-800">导入失败</p>
+                <p className="text-sm text-red-700 mt-1">{error}</p>
+              </div>
+            </div>
+          )}
+        </>
       )}
 
-      {/* 自动扫描目录 */}
-      <div className="mt-8">
-        <div className="flex items-center gap-2 mb-3">
-          <FolderSearch size={18} className="text-primary" />
-          <h2 className="text-lg font-semibold">自动扫描目录</h2>
-        </div>
+      {/* Tab: 扫描目录 */}
+      {activeTab === "folder" && (
+      <div>
         <p className="text-xs text-muted-foreground mb-3">
           绑定一个本地目录（服务端可访问的绝对路径），点击"立即扫描"会递归查找其中所有 <code className="px-1 py-0.5 bg-secondary rounded">result.json</code> 并自动导入。已扫描过且未修改的文件会被跳过。
         </p>
@@ -482,6 +522,12 @@ export default function Import() {
           </div>
         )}
       </div>
+      )}
+
+      {/* Tab: Telegram 直连 */}
+      {activeTab === "telegram" && (
+        <TelegramSync onImported={() => { loadImports(); startPolling(); }} />
+      )}
 
       {/* 索引构建进度 */}
       {indexProgress && (indexProgress.running || indexProgress.completed > 0) && (
@@ -519,17 +565,6 @@ export default function Import() {
               ))}
             </div>
           )}
-        </div>
-      )}
-
-      {/* 错误提示 */}
-      {error && (
-        <div className="mt-4 bg-red-50 border border-red-200 rounded-lg p-4 flex items-start gap-3">
-          <AlertCircle size={20} className="text-red-600 mt-0.5" />
-          <div>
-            <p className="font-medium text-red-800">导入失败</p>
-            <p className="text-sm text-red-700 mt-1">{error}</p>
-          </div>
         </div>
       )}
 

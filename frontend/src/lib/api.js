@@ -273,4 +273,55 @@ export async function updateSettings(settings) {
   return data;
 }
 
+// ---------- Telegram 直连同步 ----------
+
+export async function getTelegramAccount() {
+  const { data } = await api.get("/telegram/account");
+  return data;
+}
+
+export async function configureTelegramAccount({ apiId, apiHash, phone }) {
+  const { data } = await api.post("/telegram/account", {
+    api_id: Number(apiId),
+    api_hash: apiHash,
+    phone,
+  });
+  return data;
+}
+
+export async function deleteTelegramAccount() {
+  const { data } = await api.delete("/telegram/account");
+  return data;
+}
+
+export async function telegramSendCode() {
+  const { data } = await api.post("/telegram/login/send-code");
+  return data;
+}
+
+export async function telegramVerifyCode(code, password = null) {
+  const { data } = await api.post("/telegram/login/verify", { code, password });
+  return data;
+}
+
+export async function listTelegramDialogs() {
+  const { data } = await api.get("/telegram/dialogs", { timeout: 0 });
+  return data;
+}
+
+export async function startTelegramSync(chatIds) {
+  const { data } = await api.post("/telegram/sync", { chat_ids: chatIds });
+  return data;
+}
+
+export async function getTelegramSyncProgress() {
+  const { data } = await api.get("/telegram/sync/progress");
+  return data;
+}
+
+export async function abortTelegramSync() {
+  const { data } = await api.post("/telegram/sync/abort");
+  return data;
+}
+
 export default api;

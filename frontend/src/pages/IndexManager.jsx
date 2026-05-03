@@ -1,64 +1,31 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect } from "react";
 import {
   Database,
   RefreshCw,
   CheckCircle2,
   AlertTriangle,
   Loader2,
-  Clock,
   Zap,
 } from "lucide-react";
-import { getChats, getIndexProgress, rebuildIndex, rebuildAllIndex } from "@/lib/api";
+import { rebuildIndex, rebuildAllIndex } from "@/lib/api";
+import { useIndexStore } from "@/lib/indexStore";
 
 export default function IndexManager() {
-  const [chats, setChats] = useState([]);
-  const [progress, setProgress] = useState(null);
-  const [rebuilding, setRebuilding] = useState(false);
-  const pollRef = useRef(null);
+  // 全局 store：chats + progress + 开始构建的操作切走再切回不丢
+  const {
+    chats,
+    progress,
+    rebuilding,
+    refreshChats,
+    refreshProgress,
+    startPolling,
+  } = useIndexStore();
 
-  const loadChats = useCallback(() => {
-    getChats().then(setChats).catch(() => {});
-  }, []);
-
-  const stopPolling = useCallback(() => {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
-  }, []);
-
-  const startPolling = useCallback(() => {
-    stopPolling();
-    setRebuilding(true);
-    pollRef.current = setInterval(async () => {
-      try {
-        const prog = await getIndexProgress();
-        setProgress(prog);
-        if (!prog.running) {
-          stopPolling();
-          setRebuilding(false);
-          loadChats();
-        }
-      } catch {
-        stopPolling();
-        setRebuilding(false);
-      }
-    }, 1500);
-  }, [stopPolling, loadChats]);
-
+  // 组件 mount 时 soft-refresh：确保显示最新状态（store 已有旧值，用户看到旧值后即刻被新值覆盖，没空窗）
   useEffect(() => {
-    loadChats();
-    getIndexProgress()
-      .then((prog) => {
-        setProgress(prog);
-        if (prog.running) {
-          setRebuilding(true);
-          startPolling();
-        }
-      })
-      .catch(() => {});
-    return stopPolling;
-  }, [loadChats, startPolling, stopPolling]);
+    refreshChats();
+    refreshProgress();
+  }, [refreshChats, refreshProgress]);
 
   const handleRebuild = async (chatId, force = false) => {
     if (force && !window.confirm("强制全量重建会清空所有旧话题重新划分（token 开销较大），确定继续？")) return;

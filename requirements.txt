@@ -13,3 +13,5 @@ langchain-text-splitters==0.3.8
 python-dotenv==1.1.0
 aiofiles==24.1.0
 sse-starlette==2.2.1
+telethon==1.40.0
+python-socks[asyncio]==2.8.1

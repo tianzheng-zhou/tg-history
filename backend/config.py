@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     # 数据目录
     data_dir: str = "./data"
 
+    # Telegram 直连同步代理
+    # 国内访问 Telegram 服务器（149.154.0.0/16 等）需要代理
+    # 格式：socks5://127.0.0.1:7891 或 http://127.0.0.1:7890
+    # 留空时回退读取 HTTPS_PROXY / ALL_PROXY 环境变量；都没有则直连
+    telegram_proxy: str = ""
+
     @property
     def db_path(self) -> Path:
         return Path(self.data_dir) / "app.db"

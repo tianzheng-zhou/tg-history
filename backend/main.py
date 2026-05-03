@@ -11,6 +11,7 @@ from backend.routers import (
     session_router,
     settings_router,
     summary_router,
+    telegram_router,
 )
 from backend.services.main_loop import set_main_loop
 from backend.services.run_registry import periodic_cleanup
@@ -54,6 +55,7 @@ app.include_router(summary_router.router)
 app.include_router(qa_router.router)
 app.include_router(session_router.router)
 app.include_router(settings_router.router)
+app.include_router(telegram_router.router)
 
 
 @app.get("/api/health")

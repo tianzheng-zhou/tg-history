@@ -8,6 +8,7 @@
 
 - **文件上传**：上传 Telegram Desktop 导出的 `result.json`，支持单群聊和全量导出格式
 - **目录绑定**：绑定本地文件夹，手动触发扫描递归发现 `result.json` 文件
+- **Telegram 直连同步**：通过 MTProto API 直接登录账号，列出全部对话并增量拉取，免去手动导出（推荐）
 - **增量导入**：相同群聊重复导入时自动去重，只插入新消息
 - **全文检索索引**：导入时同步构建 SQLite FTS5（trigram tokenizer）全文索引，对中文/CJK 友好
 - **消息去重修复**：内置 `/api/admin/dedupe-messages` 管理接口，修复历史 hash 不稳定 bug 造成的重复消息
@@ -267,16 +268,36 @@ tg-history/
 | `GET/PUT` | `/api/settings` | 配置查看/更新 |
 | `POST` | `/api/folders` | 绑定监控目录 |
 | `POST` | `/api/folders/{id}/scan` | 扫描目录导入 |
+| `GET/POST/DELETE` | `/api/telegram/account` | Telegram 账号配置 / 退出登录 |
+| `POST` | `/api/telegram/login/send-code` | 发送 Telegram 登录验证码 |
+| `POST` | `/api/telegram/login/verify` | 校验验证码 + 完成登录 |
+| `GET` | `/api/telegram/dialogs` | 列出账号下所有对话 |
+| `POST` | `/api/telegram/sync` | 启动后台增量同步 |
+| `GET` | `/api/telegram/sync/progress` | 同步进度 |
+| `POST` | `/api/telegram/sync/abort` | 中止同步 |
 
 ## 数据导出
 
-### Telegram Desktop 导出步骤
+### 方式 1：Telegram 直连同步（推荐）
+
+1. 访问 [https://my.telegram.org/apps](https://my.telegram.org/apps) 申请 `api_id` 和 `api_hash`：
+   - 用 Telegram 账号登录
+   - 填写 App title（含空格，如 `My Chat History`）+ Short name（纯字母数字）+ Platform 选 **Desktop**
+   - 提交后保存 `api_id`（数字）和 `api_hash`（32 位 hex）
+2. 在 Web UI「数据导入」页 → **Telegram 直连** Tab
+3. 填入 `api_id` / `api_hash` / 手机号（E.164 格式，如 `+8613800138000`）→ 点击「发送验证码」
+4. 在 Telegram 客户端收到验证码后填入 → 登录（账号开启 2FA 时还需输入云密码）
+5. 列出全部对话 → 勾选要同步的群聊/频道 → 点击「开始同步」，后台增量拉取消息
+
+> ⚠️ **安全提示**：`api_hash` 与 `data/telegram.session` 文件等同免密码登录凭证，**不要提交到 git**（已加入 `.gitignore`），不要分享给他人。
+
+### 方式 2：Telegram Desktop 手动导出
 
 1. 打开 Telegram Desktop
 2. 进入目标群聊 → 右上角菜单 → **Export chat history**
 3. 格式选择 **Machine-readable JSON**
 4. 选择需要的时间范围和内容类型
-5. 导出完成后得到 `result.json` 文件
+5. 导出完成后得到 `result.json` 文件，上传到 Web UI 或放入「绑定目录」
 
 ## License
 

@@ -9,6 +9,8 @@ build/
 *.db-wal
 data/chroma_db/
 data/app.db
+data/*.session
+data/*.session-journal
 venv/
 node_modules/
 frontend/dist/
