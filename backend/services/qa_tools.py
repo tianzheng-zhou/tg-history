@@ -15,8 +15,14 @@ from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from backend.models.database import Import, Message, Topic
-from backend.services import llm_adapter
+from backend.services import artifact_service, llm_adapter
 from backend.services.embedding import search_similar
+from backend.services.artifact_service import (
+    ArtifactError,
+    ArtifactKeyConflict,
+    ArtifactNotFound,
+    StrReplaceError,
+)
 
 
 def _msg_to_dict(m: Message, preview_len: int = 400) -> dict:
@@ -287,6 +293,171 @@ async def tool_search_by_date(
     }
 
 
+# ---------------------- Artifact tool handlers ----------------------
+
+# 这三个工具与检索类工具不同：它们需要 session_id 上下文，必须由 dispatch_tool
+# 通过 context 参数注入，因此 handler 签名带 session_id 而非纯 args。
+# 返回结果含 `_artifact_event` 私有字段（下划线开头），qa_agent 会把它转成 SSE
+# 事件给前端，自身不喂回 LLM 的工具消息。
+
+def _artifact_op_event(kind: str, art, ver) -> dict:
+    """构造 artifact_event 的 payload（kind = created / updated / rewritten）。"""
+    return {
+        "kind": kind,
+        "artifact_key": art.artifact_key,
+        "title": art.title,
+        "version": ver.version,
+        "current_version": art.current_version,
+        "content_type": art.content_type or "text/markdown",
+        "session_id": art.session_id,
+        "op_meta": artifact_service._parse_op_meta(ver.op_meta),
+    }
+
+
+async def tool_create_artifact(
+    db: Session,
+    *,
+    session_id: str,
+    artifact_key: str,
+    title: str,
+    content: str,
+) -> dict:
+    """创建一篇 markdown artifact（session 内可有多篇，artifact_key 必须唯一）。"""
+    if not session_id:
+        return {"error": "create_artifact 需要在会话上下文中调用"}
+
+    def _do():
+        return artifact_service.create_artifact(
+            db,
+            session_id=session_id,
+            artifact_key=artifact_key,
+            title=title,
+            content=content,
+        )
+
+    try:
+        art, ver = await asyncio.to_thread(_do)
+    except ArtifactKeyConflict as e:
+        return {
+            "error": str(e),
+            "code": "key_conflict",
+            "suggestion": "换一个 artifact_key（同 session 内不可重复），"
+                          "或者用 update_artifact / rewrite_artifact 修改已存在的同名 artifact。",
+        }
+    except ArtifactError as e:
+        return {"error": str(e), "code": "invalid"}
+
+    return {
+        "ok": True,
+        "artifact_key": art.artifact_key,
+        "title": art.title,
+        "version": ver.version,
+        "content_length": len(content),
+        "_artifact_event": _artifact_op_event("created", art, ver),
+    }
+
+
+async def tool_update_artifact(
+    db: Session,
+    *,
+    session_id: str,
+    artifact_key: str,
+    old_str: str,
+    new_str: str,
+) -> dict:
+    """str_replace 风格增量编辑：old_str 必须在当前正文中恰好出现一次。"""
+    if not session_id:
+        return {"error": "update_artifact 需要在会话上下文中调用"}
+
+    def _do():
+        return artifact_service.update_artifact(
+            db,
+            session_id=session_id,
+            artifact_key=artifact_key,
+            old_str=old_str,
+            new_str=new_str,
+        )
+
+    try:
+        art, ver = await asyncio.to_thread(_do)
+    except ArtifactNotFound as e:
+        return {
+            "error": str(e),
+            "code": "not_found",
+            "suggestion": "请先 create_artifact 建立这篇文档，或者用 list 工具检查 key 拼写。",
+        }
+    except StrReplaceError as e:
+        out = {
+            "error": str(e),
+            "code": "no_unique_match",
+            "match_count": e.match_count,
+            "old_str_preview": e.old_str_preview,
+            "suggestion": (
+                "old_str 在文档中匹配 0 次：检查拼写、缩进、换行；可以用 fetch 查看当前正文后再试。"
+                if e.match_count == 0 else
+                f"old_str 在文档中出现了 {e.match_count} 次（必须恰好 1 次）：扩大 old_str 范围"
+                "（多带几行上下文）让它唯一，或改用 rewrite_artifact 整体重写。"
+            ),
+        }
+        if e.nearby_snippets:
+            out["nearby_snippets"] = e.nearby_snippets
+        return out
+    except ArtifactError as e:
+        return {"error": str(e), "code": "invalid"}
+
+    return {
+        "ok": True,
+        "artifact_key": art.artifact_key,
+        "title": art.title,
+        "version": ver.version,
+        "current_version": art.current_version,
+        "_artifact_event": _artifact_op_event("updated", art, ver),
+    }
+
+
+async def tool_rewrite_artifact(
+    db: Session,
+    *,
+    session_id: str,
+    artifact_key: str,
+    content: str,
+    title: str | None = None,
+) -> dict:
+    """整体重写 artifact（生成新版本）。可选 title 同步改标题。"""
+    if not session_id:
+        return {"error": "rewrite_artifact 需要在会话上下文中调用"}
+
+    def _do():
+        return artifact_service.rewrite_artifact(
+            db,
+            session_id=session_id,
+            artifact_key=artifact_key,
+            content=content,
+            title=title,
+        )
+
+    try:
+        art, ver = await asyncio.to_thread(_do)
+    except ArtifactNotFound as e:
+        return {
+            "error": str(e),
+            "code": "not_found",
+            "suggestion": "请先 create_artifact 建立这篇文档。",
+        }
+    except ArtifactError as e:
+        return {"error": str(e), "code": "invalid"}
+
+    return {
+        "ok": True,
+        "artifact_key": art.artifact_key,
+        "title": art.title,
+        "version": ver.version,
+        "current_version": art.current_version,
+        "content_length": len(content),
+        "_artifact_event": _artifact_op_event("rewritten", art, ver),
+    }
+
+
 # ---------------------- Tool schemas（OpenAI function calling） ----------------------
 
 TOOL_SCHEMAS = [
@@ -447,6 +618,100 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    # ---------- Artifact 工具（产出可迭代的侧边文档）----------
+    {
+        "type": "function",
+        "function": {
+            "name": "create_artifact",
+            "description": (
+                "创建一篇 markdown artifact（侧边活文档）。\n"
+                "**何时使用**：用户请求需要产出 30 行以上结构化长文（梳理 / 汇总 / 列表 / 报告）时主动建。\n"
+                "短回答、单条事实、解释类回答**不要**用 artifact。\n"
+                "**多篇规则**：一个 session 内可有多篇 artifact——不同独立主题应分开建。\n"
+                "**artifact_key**：英文小写 slug（字母/数字/下划线/短横线，1~64 字符），同 session 内 unique。\n"
+                "建好之后在最终答复里**简短**点出『已生成 artifact 《标题》』即可，不必复述全文。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "artifact_key": {
+                        "type": "string",
+                        "description": "英文小写 slug，如 'tech-summary' / 'gpu-pricing' / 'decisions-2025q4'。"
+                                       "session 内不可重复",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "中英文标题，例如 '技术讨论汇总'",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "完整的 markdown 正文",
+                    },
+                },
+                "required": ["artifact_key", "title", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_artifact",
+            "description": (
+                "对已有 artifact 做**小改动**：用 str_replace 精准替换一段文本。\n"
+                "**关键约束**：old_str 必须在当前正文中**恰好出现一次**，否则失败并告诉你命中数。\n"
+                "适合：插入新章节（old_str 取上一节末尾几行作为锚点）、改正某条信息、修订标题。\n"
+                "如要大幅重构，使用 rewrite_artifact。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "artifact_key": {
+                        "type": "string",
+                        "description": "之前 create_artifact 用过的 key",
+                    },
+                    "old_str": {
+                        "type": "string",
+                        "description": "在当前正文中要被替换的文本。必须**恰好命中一次**——"
+                                       "若不唯一，请扩大 old_str 包含上下文使其唯一",
+                    },
+                    "new_str": {
+                        "type": "string",
+                        "description": "用来替换 old_str 的新文本（可以为空字符串实现纯删除）",
+                    },
+                },
+                "required": ["artifact_key", "old_str", "new_str"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rewrite_artifact",
+            "description": (
+                "整体重写 artifact 正文，生成新版本。\n"
+                "**何时用**：要换章节结构 / 大段重构 / update_artifact 多次失败。\n"
+                "代价是 token 消耗大；优先考虑 update_artifact。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "artifact_key": {
+                        "type": "string",
+                        "description": "之前 create_artifact 用过的 key",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "新的完整 markdown 正文（替换全部旧内容）",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "可选：同时改标题。不传则保留原标题",
+                    },
+                },
+                "required": ["artifact_key", "content"],
+            },
+        },
+    },
 ]
 
 
@@ -463,9 +728,27 @@ TOOL_HANDLERS = {
     # research 工具在 dispatch_tool 中特殊处理（调用 sub_agent）
 }
 
+# Artifact handlers 需要从 context 注入 session_id；与普通检索类 handler 分开映射
+# 避免误用（普通工具不接 session_id 参数）。
+ARTIFACT_TOOL_HANDLERS = {
+    "create_artifact": tool_create_artifact,
+    "update_artifact": tool_update_artifact,
+    "rewrite_artifact": tool_rewrite_artifact,
+}
 
-async def dispatch_tool(db: Session, name: str, args: dict, event_callback=None) -> dict:
-    """根据名字 dispatch 到对应 handler，统一错误处理"""
+
+async def dispatch_tool(
+    db: Session,
+    name: str,
+    args: dict,
+    event_callback=None,
+    context: dict | None = None,
+) -> dict:
+    """根据名字 dispatch 到对应 handler，统一错误处理。
+
+    Args:
+        context: 调用方上下文，目前只用 ``session_id``（artifact 类工具必需）。
+    """
     # research 工具特殊处理：调用子 Agent
     if name == "research":
         from backend.services.sub_agent import run_sub_agent
@@ -480,6 +763,24 @@ async def dispatch_tool(db: Session, name: str, args: dict, event_callback=None)
             import traceback
             traceback.print_exc()
             return {"error": f"子 Agent 执行失败: {e}"}
+
+    # Artifact 工具：需要 session_id 上下文
+    artifact_handler = ARTIFACT_TOOL_HANDLERS.get(name)
+    if artifact_handler is not None:
+        session_id = (context or {}).get("session_id")
+        if not session_id:
+            return {
+                "error": "Artifact 工具必须在会话上下文中调用（缺失 session_id）",
+                "code": "no_session",
+            }
+        try:
+            return await artifact_handler(db, session_id=session_id, **args)
+        except TypeError as e:
+            return {"error": f"参数错误: {e}", "code": "bad_args"}
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return {"error": f"Artifact 工具执行失败: {e}"}
 
     handler = TOOL_HANDLERS.get(name)
     if not handler:

@@ -327,6 +327,7 @@ async def _run_worker(run: Run) -> None:
                 question=run.question,
                 chat_ids=run.chat_ids,
                 history=history if history else None,
+                session_id=run.session_id,
             ):
                 _emit(run, ev)
                 t = ev.get("type")

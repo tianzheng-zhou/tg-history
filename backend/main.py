@@ -6,11 +6,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.models.database import init_db
 from backend.routers import (
+    artifact_router,
+    articles_router,
     import_router,
     qa_router,
     session_router,
     settings_router,
-    summary_router,
     telegram_router,
 )
 from backend.services.main_loop import set_main_loop
@@ -20,7 +21,7 @@ from backend.services.run_registry import periodic_cleanup
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    # 注册主事件循环，供 import / summary 后台 worker 使用
+    # 注册主事件循环，供 import / index 后台 worker 使用
     # （避免 worker 另起 loop 触碰 llm_adapter 的模块级 Semaphore / httpx 连接池）
     set_main_loop(asyncio.get_running_loop())
     # 后台定时清理过期 run（完成 5 分钟后自动从 registry 中移除）
@@ -37,7 +38,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Telegram 群聊智能分析系统",
-    description="导入 Telegram 群聊数据，AI 摘要 + RAG 问答",
+    description="导入 Telegram 群聊数据，Agent + RAG 智能问答 + Artifact 协同文档",
     version="0.1.0",
     lifespan=lifespan,
 )
@@ -51,9 +52,11 @@ app.add_middleware(
 )
 
 app.include_router(import_router.router)
-app.include_router(summary_router.router)
 app.include_router(qa_router.router)
 app.include_router(session_router.router)
+app.include_router(artifact_router.router)
+app.include_router(articles_router.router)
+app.include_router(articles_router.publish_router)
 app.include_router(settings_router.router)
 app.include_router(telegram_router.router)
 

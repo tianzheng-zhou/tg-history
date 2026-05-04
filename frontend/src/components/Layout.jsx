@@ -3,8 +3,8 @@ import {
   LayoutDashboard,
   Upload,
   Database,
-  FileText,
   MessageCircleQuestion,
+  FileText,
   Settings,
 } from "lucide-react";
 import RunningRunsBadge from "./RunningRunsBadge";
@@ -13,15 +13,17 @@ const navItems = [
   { to: "/", icon: LayoutDashboard, label: "仪表盘" },
   { to: "/import", icon: Upload, label: "数据导入" },
   { to: "/index", icon: Database, label: "索引管理" },
-  { to: "/summary", icon: FileText, label: "摘要报告" },
   { to: "/qa", icon: MessageCircleQuestion, label: "智能问答" },
+  { to: "/articles", icon: FileText, label: "文章库" },
   { to: "/settings", icon: Settings, label: "设置" },
 ];
 
 export default function Layout() {
   const location = useLocation();
-  // QA 页面（/qa 或 /qa/:id）使用全宽布局，让侧栏靠边贴
-  const isFullWidth = location.pathname.startsWith("/qa");
+  // QA 与文章库使用全宽布局（两栏 / 滑出面板都受益于更宽视野）
+  const isFullWidth =
+    location.pathname.startsWith("/qa") ||
+    location.pathname.startsWith("/articles");
 
   return (
     <div className="flex h-screen bg-background">

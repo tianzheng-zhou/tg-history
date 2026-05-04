@@ -93,28 +93,6 @@ export async function getMessages(params) {
   return data;
 }
 
-// ---------- Summary ----------
-
-export async function triggerSummarize(chatId, force = false) {
-  const { data } = await api.post("/summarize", { chat_id: chatId, force });
-  return data;
-}
-
-export async function triggerSummarizeAll(force = false) {
-  const { data } = await api.post(`/summarize-all?force=${force}`);
-  return data;
-}
-
-export async function getSummaries(chatId) {
-  const { data } = await api.get(`/summaries/${chatId}`);
-  return data;
-}
-
-export async function getSummaryProgress() {
-  const { data } = await api.get("/summary-progress");
-  return data;
-}
-
 // ---------- QA: 启动 Run ----------
 
 /**
@@ -275,6 +253,98 @@ export async function autotitleSession(sessionId) {
 
 export function exportSessionUrl(sessionId, format = "md") {
   return `/api/sessions/${encodeURIComponent(sessionId)}/export?format=${format}`;
+}
+
+// ---------- Artifacts ----------
+
+export async function listArtifacts(sessionId) {
+  const { data } = await api.get(
+    `/sessions/${encodeURIComponent(sessionId)}/artifacts`
+  );
+  return data;
+}
+
+export async function getArtifact(sessionId, artifactKey, version = null) {
+  const params = version != null ? { version } : {};
+  const { data } = await api.get(
+    `/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactKey)}`,
+    { params }
+  );
+  return data;
+}
+
+export async function listArtifactVersions(sessionId, artifactKey) {
+  const { data } = await api.get(
+    `/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactKey)}/versions`
+  );
+  return data;
+}
+
+export async function deleteArtifact(sessionId, artifactKey) {
+  const { data } = await api.delete(
+    `/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactKey)}`
+  );
+  return data;
+}
+
+export function exportArtifactUrl(sessionId, artifactKey, version = null) {
+  const base = `/api/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactKey)}/export`;
+  return version != null ? `${base}?version=${version}` : base;
+}
+
+// ---------- Articles (Published Library) ----------
+
+/** 跨 session 草稿总览：所有 artifact + publication_count。 */
+export async function listDrafts() {
+  const { data } = await api.get("/articles/drafts");
+  return data;
+}
+
+/** 跨 session 已发布文章列表（按生成时间倒序）。 */
+export async function listArticles() {
+  const { data } = await api.get("/articles");
+  return data;
+}
+
+/** 取一篇已发布文章的完整内容。 */
+export async function getArticle(articleId) {
+  const { data } = await api.get(`/articles/${encodeURIComponent(articleId)}`);
+  return data;
+}
+
+/** 从文章库撤回一篇文章（不影响源 artifact）。 */
+export async function deleteArticle(articleId) {
+  const { data } = await api.delete(
+    `/articles/${encodeURIComponent(articleId)}`
+  );
+  return data;
+}
+
+/** 导出单篇文章为 .md 下载链接。 */
+export function exportArticleUrl(articleId) {
+  return `/api/articles/${encodeURIComponent(articleId)}/export`;
+}
+
+/** 查询 artifact 已发布过哪些文章（PublishDialog 决定追加/覆盖时用）。 */
+export async function getArtifactPublications(sessionId, artifactKey) {
+  const { data } = await api.get(
+    `/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactKey)}/publications`
+  );
+  return data;
+}
+
+/**
+ * 发布 artifact 到文章库。
+ * @param {object} opts
+ * @param {"append"|"overwrite"} opts.mode 默认 append
+ * @param {string|null} opts.targetArticleId overwrite 时必填
+ */
+export async function publishArtifact(sessionId, artifactKey, { mode = "append", targetArticleId = null } = {}) {
+  const { data } = await api.post(
+    `/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactKey)}/publish`,
+    { mode, target_article_id: targetArticleId }
+  );
+  return data;
 }
 
 // ---------- Settings ----------

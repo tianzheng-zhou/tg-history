@@ -1,4 +1,5 @@
 from datetime import datetime
+from enum import Enum
 
 from pydantic import BaseModel
 
@@ -55,22 +56,6 @@ class MessageQuery(BaseModel):
     date_to: str | None = None
     page: int = 1
     page_size: int = 50
-
-
-# ---------- Summary ----------
-
-class SummarizeRequest(BaseModel):
-    chat_id: str
-    force: bool = False  # 强制重新生成
-
-
-class SummaryItem(BaseModel):
-    id: int
-    chat_id: str
-    category: str
-    content: str
-    generated_at: datetime
-    stale: bool = False
 
 
 # ---------- QA ----------
@@ -135,6 +120,7 @@ class SessionSummary(BaseModel):
     pinned: bool = False
     archived: bool = False
     turn_count: int = 0
+    artifact_count: int = 0  # 该 session 下 artifact 数量（侧栏徽章用）
     last_preview: str | None = None
     created_at: datetime
     updated_at: datetime
@@ -160,6 +146,95 @@ class TurnItem(BaseModel):
 class SessionDetailResponse(BaseModel):
     session: SessionSummary
     turns: list[TurnItem]
+    artifacts: list["ArtifactSummary"] = []
+
+
+# ---------- Artifact ----------
+
+class ArtifactSummary(BaseModel):
+    """Artifact 元信息（不含正文）—— 用于列表 / session detail。"""
+    id: int
+    session_id: str
+    artifact_key: str
+    title: str
+    content_type: str = "text/markdown"
+    current_version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class ArtifactDetail(ArtifactSummary):
+    """Artifact 正文（默认返回最新版；?version=N 可取历史版本）。"""
+    content: str
+    version: int  # 当前响应展示的版本号（可能 != current_version 当查询历史版本时）
+
+
+class ArtifactVersionItem(BaseModel):
+    """Artifact 历史版本元信息（不含正文）。"""
+    version: int
+    op: str  # "create" | "update" | "rewrite"
+    op_meta: dict | None = None
+    turn_id: int | None = None
+    created_at: datetime
+
+
+# 解析 SessionDetailResponse.artifacts 的前向引用（ArtifactSummary 定义在它之后）
+SessionDetailResponse.model_rebuild()
+
+
+# ---------- Published Articles ----------
+
+class PublishMode(str, Enum):
+    APPEND = "append"
+    OVERWRITE = "overwrite"
+
+
+class PublishRequest(BaseModel):
+    """POST /api/sessions/{sid}/artifacts/{key}/publish 请求体。"""
+    mode: PublishMode = PublishMode.APPEND
+    target_article_id: str | None = None  # 仅 overwrite 时必填
+
+
+class DraftItem(BaseModel):
+    """草稿视图 = 跨 session 所有 artifact + publication_count 统计。"""
+    id: int
+    session_id: str
+    session_title: str
+    artifact_key: str
+    title: str
+    current_version: int
+    content_type: str = "text/markdown"
+    content_length: int
+    content_preview: str                      # 前 200 字，列表卡片显示
+    publication_count: int = 0                # 已发布几次（>0 时显示角标）
+    created_at: datetime
+    updated_at: datetime
+
+
+class ArticleItem(BaseModel):
+    """已发布文章元信息（不含正文）—— 用于列表。"""
+    id: str
+    title: str
+    content_type: str = "text/markdown"
+    # 源追溯
+    source_artifact_id: int | None = None
+    source_session_id: str | None = None
+    source_session_title: str                 # 冗余，源 session 被删后仍能显示
+    source_artifact_key: str
+    source_version_number: int
+    source_exists: bool                       # 服务层计算：源 artifact 是否仍存在
+    # 内容预览
+    content_preview: str                      # 前 200 字
+    content_length: int
+    # 时间
+    content_created_at: datetime              # ← UI 主展示字段（"生成于..."）
+    published_at: datetime                    # 内部追溯（tooltip）
+    updated_at: datetime                      # 仅覆盖模式变
+
+
+class ArticleDetail(ArticleItem):
+    """已发布文章完整正文。"""
+    content: str
 
 
 # ---------- Runs ----------
@@ -196,7 +271,6 @@ class SettingsUpdate(BaseModel):
     dashscope_api_key: str | None = None
     moonshot_api_key: str | None = None
     llm_model_map: str | None = None
-    llm_model_reduce: str | None = None
     llm_model_qa: str | None = None
     embedding_model: str | None = None
     rerank_model: str | None = None
@@ -204,7 +278,6 @@ class SettingsUpdate(BaseModel):
 
 class SettingsResponse(BaseModel):
     llm_model_map: str
-    llm_model_reduce: str
     llm_model_qa: str
     qa_context_window: int = 131072  # 当前 QA 模型的最大上下文窗口
     embedding_model: str

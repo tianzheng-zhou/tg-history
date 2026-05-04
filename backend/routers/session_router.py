@@ -18,14 +18,20 @@ from backend.models.schemas import (
     SessionUpdateRequest,
     TurnItem,
 )
-from backend.services import llm_adapter, session_service
+from backend.services import artifact_service, llm_adapter, session_service
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
 
-def _to_summary(s) -> SessionSummary:
-    d = session_service.session_to_dict(s)
+def _to_summary(s, artifact_count: int = 0) -> SessionSummary:
+    d = session_service.session_to_dict(s, artifact_count=artifact_count)
     return SessionSummary(**d)
+
+
+def _to_summary_with_count(db: Session, s) -> SessionSummary:
+    """便捷封装：单 session 时直接计数。批量场景应该用 count_artifacts_bulk 避免 N+1。"""
+    cnt = session_service.count_artifacts(db, s.id)
+    return _to_summary(s, artifact_count=cnt)
 
 
 def _to_turn(t) -> TurnItem:
@@ -56,8 +62,9 @@ def list_sessions(
     items, total = session_service.list_sessions(
         db, archived=archived, pinned=pinned, q=q, limit=limit, offset=offset
     )
+    counts = session_service.count_artifacts_bulk(db, [s.id for s in items])
     return SessionListResponse(
-        sessions=[_to_summary(s) for s in items],
+        sessions=[_to_summary(s, artifact_count=counts.get(s.id, 0)) for s in items],
         total=total,
     )
 
@@ -68,9 +75,12 @@ def get_session(session_id: str, db: Session = Depends(get_db)):
     if not s:
         raise HTTPException(404, "会话不存在")
     turns = session_service.get_turns(db, session_id)
+    artifacts = artifact_service.list_artifacts(db, session_id)
+    art_dicts = [artifact_service.artifact_to_summary_dict(a) for a in artifacts]
     return SessionDetailResponse(
-        session=_to_summary(s),
+        session=_to_summary(s, artifact_count=len(artifacts)),
         turns=[_to_turn(t) for t in turns],
+        artifacts=art_dicts,
     )
 
 
@@ -96,7 +106,7 @@ def update_session(
     )
     if not s:
         raise HTTPException(404, "会话不存在")
-    return _to_summary(s)
+    return _to_summary_with_count(db, s)
 
 
 @router.delete("/{session_id}")
@@ -115,7 +125,7 @@ async def autotitle_session(session_id: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "会话不存在")
     turns = session_service.get_turns(db, session_id)
     if len(turns) < 2:
-        return _to_summary(s)
+        return _to_summary_with_count(db, s)
 
     first_q = turns[0].content or ""
     first_a = turns[1].content or ""
@@ -137,7 +147,7 @@ async def autotitle_session(session_id: str, db: Session = Depends(get_db)):
             s = session_service.update_session(db, session_id, title=title, bump_updated=False)
     except Exception:
         pass
-    return _to_summary(s)
+    return _to_summary_with_count(db, s)
 
 
 @router.get("/{session_id}/export")

@@ -14,6 +14,7 @@ import {
   MoreVertical,
   Download,
   FileJson,
+  FileText,
   Loader2,
   MessageSquare,
 } from "lucide-react";
@@ -284,6 +285,12 @@ function SessionItem({ session, isActive, isRunning, onClick, onPin, onArchive, 
           {session.last_preview && !editing && (
             <div className="text-[11px] text-muted-foreground truncate mt-0.5">
               {session.last_preview}
+            </div>
+          )}
+          {session.artifact_count > 0 && !editing && (
+            <div className="inline-flex items-center gap-0.5 mt-0.5 text-[10px] text-primary/80">
+              <FileText size={9} />
+              <span>{session.artifact_count}</span>
             </div>
           )}
         </div>

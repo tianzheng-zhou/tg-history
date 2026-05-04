@@ -15,7 +15,6 @@ from backend.models.database import (
     Import,
     Message,
     SessionLocal,
-    SummaryReport,
     Topic,
     WatchedFolder,
     get_db,
@@ -190,12 +189,8 @@ def import_messages_for_chat(
             date_range=date_range,
         ))
 
-    # 增量导入时，标记该群聊的旧摘要为过期 + 索引已过期
+    # 增量导入时，标记索引已过期
     if new_count > 0 and existing:
-        db.query(SummaryReport).filter(
-            SummaryReport.chat_id == chat_id,
-            SummaryReport.stale == False,
-        ).update({"stale": True})
         existing.index_built = False
 
     db.commit()
@@ -1093,10 +1088,6 @@ def dedupe_messages(dry_run: bool = False, db: Session = Depends(get_db)):
         db.query(Topic).filter(Topic.chat_id.in_(affected_chat_ids)).delete(
             synchronize_session=False
         )
-        db.query(SummaryReport).filter(
-            SummaryReport.chat_id.in_(affected_chat_ids),
-            SummaryReport.stale == False,
-        ).update({"stale": True}, synchronize_session=False)
 
     db.commit()
 

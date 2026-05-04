@@ -7,10 +7,12 @@ from sqlalchemy import (
     Column,
     DateTime,
     Float,
+    ForeignKey,
     Index,
     Integer,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     event,
     text,
@@ -42,7 +44,7 @@ class Message(Base):
     embedding_id = Column(String)
 
     __table_args__ = (
-        # 热查询：按 chat 过滤 + 按时间排序（summarizer/qa_tools/_sync_runner 均涉及）
+        # 热查询：按 chat 过滤 + 按时间排序（qa_tools / _sync_runner 均涉及）
         Index("ix_messages_chat_date", "chat_id", "date"),
         # 话题内按时间拉取（embedding._collect_topic_chunks 、qa_tools.tool_fetch_topic_context）
         Index("ix_messages_topic_date", "topic_id", "date"),
@@ -86,18 +88,6 @@ class Import(Base):
     index_built = Column(Boolean, default=False)  # 向量索引是否已构建
 
 
-class SummaryReport(Base):
-    __tablename__ = "summary_reports"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    chat_id = Column(String, index=True, nullable=False)
-    category = Column(String, index=True)  # tech / business / resource / decision / opinion
-    content = Column(Text)
-    generated_at = Column(DateTime, default=datetime.utcnow)
-    chunk_summaries = Column(Text)  # JSON: Map 阶段各段摘要
-    stale = Column(Boolean, default=False)  # 新数据导入后标记过期
-
-
 class ChatSession(Base):
     """智能问答的会话（多轮对话容器）"""
 
@@ -130,6 +120,114 @@ class ChatTurn(Base):
     mode = Column(String)  # "agent" | "rag" 本轮实际模式
     meta = Column(Text)  # JSON：usage/confidence/aborted/run_id/...
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Artifact(Base):
+    """Agent 在会话中产出的"活文档"。session 内可有多篇，按 artifact_key 区分。
+
+    替代旧的一次性 SummaryReport：Agent 通过 create_artifact / update_artifact /
+    rewrite_artifact 工具持续迭代，每次更新生成新 ArtifactVersion。
+    """
+
+    __tablename__ = "artifacts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(
+        String,
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    # Agent 自定义 slug（如 "tech-summary"），session 内 unique
+    artifact_key = Column(String, nullable=False)
+    title = Column(String, nullable=False)
+    content_type = Column(String, default="text/markdown")
+    current_version = Column(Integer, default=1)  # 当前最新版本号（=ArtifactVersion.version 最大值）
+    # 预留字段：未来升级到 chat-scoped 知识库时使用，现阶段始终 None
+    chat_id = Column(String, nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "artifact_key", name="uq_artifact_session_key"),
+    )
+
+
+class ArtifactVersion(Base):
+    """Artifact 的某一次版本快照。每次 create / update / rewrite 都新增一行。
+
+    保留全量内容（而非 diff），方便 UI 任意切换版本浏览。
+    """
+
+    __tablename__ = "artifact_versions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    artifact_id = Column(
+        Integer,
+        ForeignKey("artifacts.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    version = Column(Integer, nullable=False)  # 1, 2, 3, ...
+    content = Column(Text, nullable=False)
+    op = Column(String, nullable=False)  # "create" | "update" | "rewrite"
+    # JSON：update 时 {"old_str_preview": "...", "new_str_preview": "..."}；
+    # create 时 None；rewrite 时 {"prev_length": N, "new_length": M}
+    op_meta = Column(Text)
+    # 哪次 assistant turn 产出（trace 用），turn 被删时置 NULL
+    turn_id = Column(
+        Integer,
+        ForeignKey("chat_turns.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("artifact_id", "version", name="uq_artifact_version"),
+    )
+
+
+class PublishedArticle(Base):
+    """已发布到"文章库"的冻结快照。
+
+    由用户在 UI 上手动 publish artifact 时创建；内容取自 artifacts.content 当前快照，
+    但**脱钩保存** —— 即使源 artifact / session 被删，文章仍保留。
+    """
+
+    __tablename__ = "published_articles"
+
+    id = Column(String, primary_key=True)  # UUID hex
+
+    # 源追溯（ON DELETE SET NULL —— 源被删后保留文章）
+    source_artifact_id = Column(
+        Integer,
+        ForeignKey("artifacts.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    source_session_id = Column(
+        String,
+        ForeignKey("chat_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # 冗余备份字段：防 session / artifact 被删后丢失归属显示
+    source_session_title = Column(String, nullable=False)
+    source_artifact_key = Column(String, nullable=False)
+    source_version_number = Column(Integer, nullable=False)
+
+    # 内容快照
+    title = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+    content_type = Column(String, default="text/markdown")
+
+    # 时间
+    # ↓ 用户关心的"生成时间" = 源 ArtifactVersion.created_at，UI 主展示字段
+    content_created_at = Column(DateTime, nullable=False, index=True)
+    # 发布动作的时间（首次 publish 时 & overwrite 不改），仅用于内部追溯
+    published_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    # 覆盖模式下会变，用来做"最近改动"排序辅助
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
 class WatchedFolder(Base):
@@ -231,8 +329,10 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 def init_db():
     """创建所有表 + FTS5 虚拟表（trigram tokenizer，对中文友好）"""
     # 丢弃旧 QAHistory 表（已被 chat_sessions + chat_turns 替代）
+    # 丢弃旧 SummaryReport 表（已被 Artifact 机制替代）
     with engine.connect() as conn:
         conn.execute(text("DROP TABLE IF EXISTS qa_history"))
+        conn.execute(text("DROP TABLE IF EXISTS summary_reports"))
         conn.commit()
 
     Base.metadata.create_all(bind=engine)

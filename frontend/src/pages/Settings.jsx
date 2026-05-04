@@ -23,7 +23,6 @@ export default function Settings() {
     dashscope_api_key: "",
     moonshot_api_key: "",
     llm_model_map: "qwen3.5-plus",
-    llm_model_reduce: "qwen3.6-plus",
     llm_model_qa: "qwen3.6-plus",
     embedding_model: "text-embedding-v4",
     rerank_model: "qwen3-rerank",
@@ -38,7 +37,6 @@ export default function Settings() {
       setForm((prev) => ({
         ...prev,
         llm_model_map: data.llm_model_map,
-        llm_model_reduce: data.llm_model_reduce,
         llm_model_qa: data.llm_model_qa,
         embedding_model: data.embedding_model,
         rerank_model: data.rerank_model,
@@ -116,10 +114,10 @@ export default function Settings() {
         {/* LLM 模型 */}
         <section className="bg-card border border-border rounded-lg p-4">
           <h2 className="text-sm font-semibold mb-3">LLM 模型</h2>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <label className="block text-sm text-muted-foreground mb-1">
-                Map 摘要模型
+                话题切分模型
               </label>
               <select
                 value={form.llm_model_map}
@@ -133,24 +131,8 @@ export default function Settings() {
                 ))}
               </select>
               <p className="text-xs text-muted-foreground mt-1">
-                大量调用，建议选便宜的
+                话题切分大量调用，建议选便宜的
               </p>
-            </div>
-            <div>
-              <label className="block text-sm text-muted-foreground mb-1">
-                Reduce 汇总模型
-              </label>
-              <select
-                value={form.llm_model_reduce}
-                onChange={(e) => update("llm_model_reduce", e.target.value)}
-                className="w-full border border-border rounded-md px-3 py-2 text-sm"
-              >
-                {MODEL_OPTIONS.llm.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))}
-              </select>
             </div>
             <div>
               <label className="block text-sm text-muted-foreground mb-1">

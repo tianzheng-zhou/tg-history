@@ -50,6 +50,11 @@ function emptyRun(meta) {
     taskUsage: null,
     error: null,
     maxSeq: -1,
+    // Agent 在本 run 中产出的 artifact 事件（create/update/rewrite）。
+    // 前端用它判断"本 run 是否触动了 artifact"，从而触发 ArtifactPanel 自动打开 + 刷新。
+    artifactEvents: [],
+    lastArtifactKey: null,  // 最近一次操作的 artifact_key，便于 panel 自动跳到该 tab
+    artifactEventCounter: 0,  // 单调递增计数：UI 监听这个数值变化而非数组引用
   };
 }
 
@@ -165,6 +170,27 @@ function applyEvent(run, ev) {
     out.answer = ev.answer || out.answer;
     out.sources = ev.sources || [];
     out.taskUsage = ev.task_usage || null;
+    return out;
+  }
+
+  // ---- Artifact 工具事件（create / update / rewrite）----
+  if (t === "artifact_event") {
+    out.artifactEvents = [
+      ...out.artifactEvents,
+      {
+        kind: ev.kind, // "created" | "updated" | "rewritten"
+        artifact_key: ev.artifact_key,
+        title: ev.title,
+        version: ev.version,
+        current_version: ev.current_version,
+        content_type: ev.content_type,
+        op_meta: ev.op_meta || null,
+        step: ev.step,
+        tool_call_id: ev.tool_call_id,
+      },
+    ];
+    out.lastArtifactKey = ev.artifact_key;
+    out.artifactEventCounter = (out.artifactEventCounter || 0) + 1;
     return out;
   }
 

@@ -12,12 +12,11 @@ class Settings(BaseSettings):
     moonshot_base_url: str = "https://api.moonshot.cn/v1"
 
     # LLM 模型
-    # 注意：map 模型在话题切分/Map 摘要里被高频调用，是 token 消耗大头。
+    # 注意：map 模型在话题切分里被高频调用，是 token 消耗大头。
     # qwen3.5-flash 比 qwen3.5-plus 输入便宜 4x、输出便宜 2.4x，限流也更宽松。
     # 当前所有调用 llm_model_map 的位置都已经传 enable_thinking=False，避免 flash
     # 默认开思考模式吃额外的思考链 token。
     llm_model_map: str = "qwen3.5-flash"
-    llm_model_reduce: str = "qwen3.6-plus"
     llm_model_qa: str = "qwen3.6-plus"
 
     # Embedding / Rerank

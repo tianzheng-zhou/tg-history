@@ -89,7 +89,7 @@ def _trim_messages_to_budget(messages: list[dict], model: str) -> tuple[list[dic
     return result, True
 
 
-SYSTEM_PROMPT = """你是一个 Telegram 聊天记录分析的智能助手。你同时拥有直接检索工具和子 Agent 委派能力。
+SYSTEM_PROMPT = """你是一个 Telegram 聊天记录分析的智能助手。你同时拥有直接检索工具、子 Agent 委派能力，以及 Artifact 协同文档工具。
 
 ## 工具选择策略
 
@@ -112,6 +112,24 @@ SYSTEM_PROMPT = """你是一个 Telegram 聊天记录分析的智能助手。你
 任务拆分原则：
 - **对比/列举型**：2-3 个 research，按维度分
 - **复杂调研型**：3-5 个 research，按子主题分
+
+## Artifact：产出可迭代的侧边文档
+
+当用户的请求需要产出**结构化长文档**（梳理 / 汇总 / 列表 / 报告 / 知识库），且预期内容超过 ~30 行 markdown 时，
+**主动用 artifact 工具**产出可侧边浏览的活文档；用户会在右侧面板看到，并能复制 / 导出。
+
+工具：
+- **create_artifact**(artifact_key, title, content) — 新建一篇
+- **update_artifact**(artifact_key, old_str, new_str) — 小改动专用，old_str 必须在当前正文恰好出现一次
+- **rewrite_artifact**(artifact_key, content[, title]) — 整体重写
+
+使用规则：
+1. **何时建**：长篇结构化交付（梳理 / 汇总 / 列表 / 行动项）。**不要**给单条事实、短解释建 artifact
+2. **多篇**：一个 session 可以有多篇 artifact——主题独立时分开建（如 `tech-summary` + `links-roundup`）
+3. **artifact_key**：英文小写 slug，如 `tech-summary` / `gpu-pricing` / `decisions-2025q4`，session 内 unique
+4. **优先 update**：小改动用 update_artifact 省 token；只在大幅重构时用 rewrite_artifact
+5. **str_replace 规则**：old_str 必须在正文中**恰好出现一次**——不唯一时扩大 old_str 范围（多带几行上下文）
+6. **简短复述**：建好 artifact 后，最终答复中只需短短一句"已生成 artifact 《标题》"指向侧边面板，不要重复完整内容
 
 ## 通用规则
 - 如果不确定数据范围，可先用 **list_chats** 了解可用群聊
@@ -253,8 +271,14 @@ async def run_agent(
     question: str,
     chat_ids: list[str] | None = None,
     history: list[dict] | None = None,
+    session_id: str | None = None,
 ) -> AsyncIterator[dict]:
-    """Agent 主循环，yield 事件给上层"""
+    """Agent 主循环，yield 事件给上层。
+
+    Args:
+        session_id: 当前对话 session 的 ID。Artifact 类工具需要它作为上下文；
+            缺失时这些工具会返回 ``no_session`` 错误（不会让整个 agent 崩）。
+    """
     # 构造 user 消息；如果指定了 chat_ids，注入上下文
     user_content = question
     if chat_ids:
@@ -425,12 +449,19 @@ async def run_agent(
         async def _sub_event_cb(ev: dict):
             sub_events.append(ev)
 
+        # Artifact 工具与 sub_agent 都通过 dispatch_tool 入口；
+        # session_id 给 artifact handlers 用，event_callback 给 sub_agent 用。
+        tool_context = {"session_id": session_id}
+
         # 并发执行所有 research 调用（semaphore 自动限流），其他工具顺序执行
         async def _exec_one(call: dict, args: dict) -> tuple[dict, dict, int]:
             """执行单个工具，返回 (call, result, duration_ms)"""
             t0 = time.time()
             cb = _sub_event_cb if call["name"] == "research" else None
-            result = await dispatch_tool(db, call["name"], args, event_callback=cb)
+            result = await dispatch_tool(
+                db, call["name"], args,
+                event_callback=cb, context=tool_context,
+            )
             duration_ms = int((time.time() - t0) * 1000)
             return call, result, duration_ms
 
@@ -488,6 +519,12 @@ async def run_agent(
             # 收集消息 ID 用于后续引用
             _collect_ids(result, cited_message_ids)
 
+            # 提取 artifact_event（artifact 类工具会在 result 里塞 _artifact_event）；
+            # 用 pop 把它从 result 中剥掉，避免回灌到 LLM 上下文里浪费 token。
+            artifact_ev_payload: dict | None = None
+            if isinstance(result, dict) and "_artifact_event" in result:
+                artifact_ev_payload = result.pop("_artifact_event")
+
             # 截断过长输出
             result_str = _truncate_tool_output(result)
 
@@ -500,6 +537,15 @@ async def run_agent(
                 "duration_ms": duration_ms,
                 "error": "error" in result,
             }
+
+            # 紧随 tool_result 之后发射 artifact_event（前端用于刷新侧边面板）
+            if artifact_ev_payload is not None:
+                yield {
+                    "type": "artifact_event",
+                    "step": step,
+                    "tool_call_id": call["id"],
+                    **artifact_ev_payload,
+                }
 
             messages.append({
                 "role": "tool",
@@ -670,6 +716,18 @@ def _make_preview(result: dict) -> dict:
                        f"{result.get('tool_calls_count', '?')} 次工具调用, "
                        f"{len(result.get('message_ids', []))} 条引用)",
             "report_preview": report_text[:300],
+        }
+
+    # Artifact 工具返回（create / update / rewrite）
+    if "artifact_key" in result:
+        ak = result["artifact_key"]
+        ver = result.get("version")
+        title = result.get("title", "")
+        return {
+            "summary": f"📄 《{title}》 v{ver}（{ak}）",
+            "artifact_key": ak,
+            "version": ver,
+            "title": title,
         }
 
     # 根据不同工具返回，生成简洁摘要

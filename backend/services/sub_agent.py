@@ -23,8 +23,11 @@ from backend.services.qa_tools import TOOL_SCHEMAS, dispatch_tool
 SUB_MAX_STEPS = 15  # 子 Agent 最大步数
 MAX_TOOL_OUTPUT_CHARS = 50000  # 单次工具输出截断
 
-# 子 Agent 可用的工具：排除 research（防递归）
-SUB_TOOL_SCHEMAS = [t for t in TOOL_SCHEMAS if t["function"]["name"] != "research"]
+# 子 Agent 可用的工具：
+# - 排除 research（防递归）
+# - 排除 artifact 工具（它们是 Orchestrator 的最终交付职责，且需 session 上下文）
+_SUB_EXCLUDED_TOOLS = {"research", "create_artifact", "update_artifact", "rewrite_artifact"}
+SUB_TOOL_SCHEMAS = [t for t in TOOL_SCHEMAS if t["function"]["name"] not in _SUB_EXCLUDED_TOOLS]
 
 SUB_SYSTEM_PROMPT = """你是一个 Telegram 聊天记录检索子助手，负责完成一个具体的搜索任务。
 

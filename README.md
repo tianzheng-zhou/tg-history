@@ -1,6 +1,6 @@
 # Telegram 群聊智能分析系统
 
-导入 Telegram 群聊导出数据（JSON），自动构建话题索引，通过 AI 生成结构化摘要报告，并支持 Agent / RAG 两种模式的智能问答。
+导入 Telegram 群聊导出数据（JSON），自动构建话题索引，支持 Agent / RAG 两种模式的智能问答，并通过 Artifact 机制让 Agent 产出可迭代的结构化文档。
 
 ## 功能概览
 
@@ -29,15 +29,6 @@
 - **增量索引**：仅对变更的话题重新 embed，未变话题的向量保持不动
 - **全量重建**：支持强制清空重建（`force=true`）
 - **多群聊并行**：最多 16 个群聊同时构建索引，实时上报进度（话题构建 → 向量写入）
-
-### AI 摘要
-
-- **Map-Reduce 架构**：
-  - **Map 阶段**：按话题分组（小话题合并至约 200 条/组），并发调用 LLM 提取五大分类信息
-  - **Reduce 阶段**：合并所有 Map 摘要，生成去重、按时间排序的结构化报告
-- **五大分类**：技术信息 / 商业信息 / 资源与链接 / 关键决策与待办 / 重要观点与讨论
-- **过期标记**：新数据导入后自动将旧摘要标记为 `stale`，提示用户重新生成
-- **批量生成**：`/api/summarize-all` 一键为所有已索引群聊生成摘要
 
 ### 智能问答
 
@@ -70,6 +61,14 @@
 - **上下文窗口监控**：实时显示 prompt token 用量占模型最大上下文的百分比
 - **来源引用**：答案自动附带来源消息（发言人 + 日期 + 预览），按话题去重
 
+### Artifact 协同文档
+
+- **Agent 主动创建**：Agent 在回答中遇到需要交付结构化长文档时（如 “梳理 XX 讨论”、“汇总资源链接”），主动调 `create_artifact` 工具产出 markdown 文档
+- **增量编辑**：`update_artifact` 用 `old_str` / `new_str` 精确替换做小改动；`rewrite_artifact` 整体重写做大重构
+- **会话内多篇**：一个 Q&A 会话可拥有多篇 artifact，按独立主题分开（如 `tech-summary` / `links-roundup` / `decisions`）
+- **版本历史**：每次更新生成新版本，UI 支持版本下拉切换、对比
+- **只读展示**：用户侧边面板查看、复制、导出 `.md`；修改通过让 Agent 迭代完成
+
 ### 会话管理
 
 - **会话列表**：支持搜索、置顶、归档、分页
@@ -100,22 +99,22 @@
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                        React 前端                            │
-│  Dashboard │ Import │ Index │ Summary │ QA │ Settings        │
+│  Dashboard │ Import │ Index │ QA │ Settings                  │
 └────────────────────────────┬─────────────────────────────────┘
                              │ HTTP / SSE
 ┌────────────────────────────┴─────────────────────────────────┐
 │                     FastAPI 后端                              │
-│  ┌──────────┐  ┌───────────┐  ┌─────────┐  ┌──────────────┐ │
-│  │  Import   │  │  Summary  │  │   QA    │  │  Session     │ │
-│  │  Router   │  │  Router   │  │  Router │  │  Router      │ │
+│  ┌──────────┐  ┌──────────┐  ┌─────────┐  ┌──────────────┐ │
+│  │  Import   │  │   QA     │  │ Artifact│  │  Session     │ │
+│  │  Router   │  │  Router  │  │  Router │  │  Router      │ │
 │  └─────┬─────┘  └─────┬─────┘  └────┬────┘  └──────┬───────┘ │
 │        │              │             │               │         │
-│  ┌─────┴─────┐  ┌─────┴─────┐  ┌───┴───────────────┴──────┐ │
-│  │  Parser   │  │Summarizer │  │ QA Agent │ RAG Engine     │ │
-│  │  Topic    │  │Map-Reduce │  │ Tool Calling │ Rerank     │ │
-│  │  Builder  │  │           │  │ Run Registry              │ │
-│  └─────┬─────┘  └─────┬─────┘  └───┬──────────────────────┘ │
-│        │              │             │                         │
+│  ┌─────┴─────┐  ┌─────┴─────────────┐   ┌─┴─────────┴──────┐ │
+│  │  Parser   │  │  QA Agent │ RAG    │   │ Artifact Service   │ │
+│  │  Topic    │  │  Tool Calling │Rerank │   │ (create / update /  │ │
+│  │  Builder  │  │  Run Registry     │   │  rewrite / version)│ │
+│  └─────┬─────┘  └─────┬─────────────┘   └───────────────────┘ │
+│        │              │                                   │
 │  ┌─────┴──────────────┴─────────────┴──────────────────────┐ │
 │  │                   LLM Adapter                            │ │
 │  │  DashScope Client  │  Moonshot Client  │  Semaphore      │ │
@@ -170,8 +169,7 @@ npm run dev
 2. 在**「设置」**页检查 API Key 是否配置正确
 3. 在**「数据导入」**页上传 Telegram 导出的 `result.json`，或绑定本地目录批量扫描
 4. 等待后台自动完成话题构建和向量索引（进度可在「索引管理」页查看）
-5. 在**「摘要报告」**页生成并查看 AI 分类摘要
-6. 在**「智能问答」**页对聊天记录进行提问
+5. 在**「智能问答」**页对聊天记录进行提问，Agent 在复杂梳理类问题时会主动产出 Artifact 侧边文档
 
 ## 环境变量
 
@@ -181,14 +179,13 @@ npm run dev
 | `DASHSCOPE_BASE_URL` | DashScope 兼容端点 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 | `MOONSHOT_API_KEY` | Moonshot/Kimi API Key（可选） | — |
 | `MOONSHOT_BASE_URL` | Moonshot 兼容端点 | `https://api.moonshot.cn/v1` |
-| `LLM_MODEL_MAP` | Map 阶段 / 话题切分模型 | `qwen3.5-flash` |
-| `LLM_MODEL_REDUCE` | Reduce 阶段模型 | `qwen3.6-plus` |
+| `LLM_MODEL_MAP` | 话题切分模型（高频调用） | `qwen3.5-flash` |
 | `LLM_MODEL_QA` | 问答模型 | `kimi-k2.6` |
 | `EMBEDDING_MODEL` | 文本向量化模型 | `text-embedding-v4` |
 | `RERANK_MODEL` | 重排序模型 | `qwen3-rerank` |
 | `DATA_DIR` | 数据存储目录（SQLite + ChromaDB） | `./data` |
 
-> **成本提示**：`LLM_MODEL_MAP` 是 token 消耗大头（话题切分 + Map 摘要高频调用），默认使用 `qwen3.5-flash` 以降低成本。
+> **成本提示**：`LLM_MODEL_MAP` 是 token 消耗大头（话题切分高频调用），默认使用 `qwen3.5-flash` 以降低成本。
 
 ## 项目结构
 
@@ -199,12 +196,10 @@ tg-history/
 │   │   ├── database.py          # SQLAlchemy 模型 + FTS5 初始化
 │   │   └── schemas.py           # Pydantic 请求/响应模型
 │   ├── prompts/
-│   │   ├── map_summary.txt      # Map 阶段 prompt
-│   │   ├── reduce_summary.txt   # Reduce 阶段 prompt
 │   │   └── qa_answer.txt        # RAG 问答 prompt
 │   ├── routers/
 │   │   ├── import_router.py     # 数据导入 + 目录绑定 + 索引管理
-│   │   ├── summary_router.py    # 摘要生成 + 查询
+│   │   ├── artifact_router.py   # Artifact CRUD + 版本查询 + 导出
 │   │   ├── qa_router.py         # 问答启动 + SSE 订阅 + Run 管理
 │   │   ├── session_router.py    # 会话 CRUD + 自动标题 + 导出
 │   │   └── settings_router.py   # 配置查看 + 热更新
@@ -212,9 +207,9 @@ tg-history/
 │   │   ├── parser.py            # Telegram JSON 解析
 │   │   ├── topic_builder.py     # 话题构建（回复链 + LLM 语义切分）
 │   │   ├── embedding.py         # ChromaDB 向量索引
-│   │   ├── summarizer.py        # Map-Reduce 摘要引擎
+│   │   ├── artifact_service.py  # Artifact CRUD + str_replace + version
 │   │   ├── qa_agent.py          # Agent 主循环（LLM + Tool Calling）
-│   │   ├── qa_tools.py          # Agent 工具集（7 种）
+│   │   ├── qa_tools.py          # Agent 工具集（检索 + artifact 操作）
 │   │   ├── rag_engine.py        # RAG 检索 + Rerank + 生成
 │   │   ├── llm_adapter.py       # 多 Provider LLM 客户端 + 并发控制
 │   │   ├── run_registry.py      # Run 注册表 + 后台 worker
@@ -229,8 +224,7 @@ tg-history/
 │   │   │   ├── Dashboard.jsx    # 仪表盘（群聊统计概览）
 │   │   │   ├── Import.jsx       # 数据导入 + 目录管理
 │   │   │   ├── IndexManager.jsx # 索引构建管理
-│   │   │   ├── Summary.jsx      # 摘要报告查看
-│   │   │   ├── QA.jsx           # 智能问答（Agent/RAG）
+│   │   │   ├── QA.jsx           # 智能问答（Agent/RAG + Artifact 面板）
 │   │   │   └── Settings.jsx     # 系统设置
 │   │   ├── components/          # 通用组件（Layout, ChatBubble, SourceCard...）
 │   │   └── lib/
@@ -257,14 +251,12 @@ tg-history/
 | `POST` | `/api/rebuild-index/{chat_id}` | 重建单群聊索引 |
 | `POST` | `/api/rebuild-index-all` | 批量重建索引 |
 | `GET` | `/api/index-progress` | 索引构建进度查询 |
-| `POST` | `/api/summarize` | 触发单群聊摘要生成 |
-| `POST` | `/api/summarize-all` | 批量生成摘要 |
-| `GET` | `/api/summaries/{chat_id}` | 获取摘要报告 |
 | `POST` | `/api/ask/agent` | 启动 Agent 问答 Run |
 | `POST` | `/api/ask/stream` | 启动 RAG 问答 Run |
 | `GET` | `/api/runs/{run_id}/events` | SSE 订阅 Run 事件流 |
 | `POST` | `/api/runs/{run_id}/abort` | 中止 Run |
 | `GET/POST/PATCH/DELETE` | `/api/sessions/*` | 会话 CRUD |
+| `GET/DELETE` | `/api/sessions/{id}/artifacts/*` | Artifact 列表 / 详情 / 版本 / 导出 / 删除 |
 | `GET/PUT` | `/api/settings` | 配置查看/更新 |
 | `POST` | `/api/folders` | 绑定监控目录 |
 | `POST` | `/api/folders/{id}/scan` | 扫描目录导入 |

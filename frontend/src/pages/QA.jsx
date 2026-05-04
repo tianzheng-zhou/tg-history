@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import Markdown from "@/components/Markdown";
 import {
   Send,
@@ -8,6 +8,8 @@ import {
   Search,
   Database,
   FileSearch,
+  FileText,
+  Bookmark,
   Brain,
   CheckCircle2,
   AlertCircle,
@@ -28,6 +30,8 @@ import {
 import ContextBadge from "@/components/ContextBadge";
 import TaskUsageBadge from "@/components/TaskUsageBadge";
 import SessionSidebar from "@/components/SessionSidebar";
+import ArtifactPanel from "@/components/ArtifactPanel";
+import PublishDialog from "@/components/PublishDialog";
 import { useRuns, findActiveRunForSession } from "@/lib/runsStore";
 
 // ---------- 阶段图标（RAG 模式时间线） ----------
@@ -366,6 +370,9 @@ function normalizeRagEvents(rag_events) {
 export default function QA() {
   const navigate = useNavigate();
   const { sessionId: routeSessionId } = useParams();
+  const [searchParams] = useSearchParams();
+  // 深链：/qa/:sid?artifact=<key> → 自动打开 artifact 面板并切到该 key
+  const deepLinkArtifactKey = searchParams.get("artifact");
 
   const { runs, startRun, abortRun, dropRun } = useRuns();
 
@@ -387,6 +394,12 @@ export default function QA() {
   // 当前 QA 模型 + 其上下文窗口（来自后端 /api/settings，给 ContextBadge 占位用）
   const [qaSettings, setQaSettings] = useState({ model: null, contextWindow: null });
 
+  // Artifact 面板：本 session 的 artifact 数量 + 面板可见性
+  const [sessionArtifactCount, setSessionArtifactCount] = useState(0);
+  const [artifactPanelOpen, setArtifactPanelOpen] = useState(false);
+  // Publish 弹窗：从 ArtifactPanel 工具栏「发布」按钮触发
+  const [publishDialog, setPublishDialog] = useState(null); // { sessionId, artifactKey, title }
+
   const bottomRef = useRef(null);
 
   // 加载群聊列表（用于 filter）+ 当前 QA 模型设置
@@ -407,6 +420,8 @@ export default function QA() {
       setSessionMeta(null);
       setActiveRunId(null);
       setStickyUsage(null);
+      setSessionArtifactCount(0);
+      setArtifactPanelOpen(false);
       return;
     }
     let cancelled = false;
@@ -425,6 +440,9 @@ export default function QA() {
         const lastAssistant = [...(data.turns || [])].reverse()
           .find((t) => t.role === "assistant" && t.meta?.usage);
         if (lastAssistant?.meta?.usage) setStickyUsage(lastAssistant.meta.usage);
+        // 同步 artifact 计数（已存在的 artifacts 数量），但不强行打开面板
+        const artCount = (data.artifacts || []).length;
+        setSessionArtifactCount(artCount);
       })
       .catch((err) => {
         console.error("加载 session 失败", err);
@@ -456,6 +474,34 @@ export default function QA() {
     if (activeRun?.usage) setStickyUsage(activeRun.usage);
   }, [activeRun?.usage]);
 
+  // 当前 run 第一次推送 artifact_event 时自动打开侧边面板
+  const prevArtifactCounter = useRef(0);
+  useEffect(() => {
+    const cur = activeRun?.artifactEventCounter || 0;
+    if (cur > prevArtifactCounter.current && !artifactPanelOpen) {
+      setArtifactPanelOpen(true);
+    }
+    prevArtifactCounter.current = cur;
+  }, [activeRun?.artifactEventCounter, artifactPanelOpen]);
+
+  // 深链：?artifact=<key> 且 session 有 artifact 时，自动打开面板（一次性）
+  const deepLinkConsumedRef = useRef(false);
+  useEffect(() => {
+    if (
+      deepLinkArtifactKey &&
+      !deepLinkConsumedRef.current &&
+      routeSessionId &&
+      sessionArtifactCount > 0
+    ) {
+      setArtifactPanelOpen(true);
+      deepLinkConsumedRef.current = true;
+    }
+  }, [deepLinkArtifactKey, routeSessionId, sessionArtifactCount]);
+  // 路由 session 变了 → 重置 consumed flag，让新 session 的 deep link 也能生效
+  useEffect(() => {
+    deepLinkConsumedRef.current = false;
+  }, [routeSessionId]);
+
   // run 终止后自动刷新 session 数据（持久化的 assistant turn 已落库）
   const wasStreaming = useRef(false);
   useEffect(() => {
@@ -467,6 +513,7 @@ export default function QA() {
       getSession(routeSessionId).then((data) => {
         setSessionMeta(data.session);
         setPersistedTurns(data.turns || []);
+        setSessionArtifactCount((data.artifacts || []).length);
         // 首轮答完 → 异步生成 title
         if ((data.turns || []).length === 2 && (data.session.title === "新对话" || data.session.title?.endsWith("…"))) {
           autotitleSession(routeSessionId).then((updated) => {
@@ -610,6 +657,30 @@ export default function QA() {
               </button>
             </div>
             <button
+              onClick={() => setArtifactPanelOpen((v) => !v)}
+              disabled={!routeSessionId || sessionArtifactCount === 0}
+              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-sm border ${
+                artifactPanelOpen
+                  ? "border-primary text-primary bg-primary/5"
+                  : "border-border text-muted-foreground"
+              } disabled:opacity-40 disabled:cursor-not-allowed`}
+              title={
+                sessionArtifactCount === 0
+                  ? "本会话还没有 artifact"
+                  : artifactPanelOpen
+                    ? "隐藏 artifact 面板"
+                    : "显示 artifact 面板"
+              }
+            >
+              <FileText size={14} />
+              Artifacts
+              {sessionArtifactCount > 0 && (
+                <span className="bg-primary/15 text-primary px-1 rounded text-[10px] font-mono">
+                  {sessionArtifactCount}
+                </span>
+              )}
+            </button>
+            <button
               onClick={() => setShowFilters(!showFilters)}
               className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-sm border ${
                 showFilters ? "border-primary text-primary" : "border-border text-muted-foreground"
@@ -710,6 +781,48 @@ export default function QA() {
           </div>
         </div>
       </div>
+
+      {/* Artifact 侧边面板 */}
+      <ArtifactPanel
+        sessionId={routeSessionId || null}
+        isOpen={artifactPanelOpen}
+        onClose={() => setArtifactPanelOpen(false)}
+        lastArtifactKey={activeRun?.lastArtifactKey || null}
+        artifactEventCounter={activeRun?.artifactEventCounter || 0}
+        onArtifactsChange={setSessionArtifactCount}
+        preferredKey={deepLinkArtifactKey || null}
+        renderActiveExtraToolbar={({ sessionId, artifactKey }) => (
+          <button
+            onClick={() =>
+              setPublishDialog({
+                sessionId,
+                artifactKey,
+                title: null, // ArtifactView 内部已展示标题；弹窗里也会再 fetch publications
+              })
+            }
+            className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded bg-primary/10 text-primary hover:bg-primary/20"
+            title="发布到文章库（生成一份冻结快照）"
+          >
+            <Bookmark size={12} />
+            发布
+          </button>
+        )}
+      />
+
+      {/* Publish 弹窗 */}
+      {publishDialog && (
+        <PublishDialog
+          isOpen
+          sessionId={publishDialog.sessionId}
+          artifactKey={publishDialog.artifactKey}
+          artifactTitle={publishDialog.title}
+          onClose={() => setPublishDialog(null)}
+          onPublished={() => {
+            // 简单提示：发布后想让用户看到文章库，提供一个跳转选项
+            // 这里直接关闭弹窗即可，PublishDialog 已经处理了关闭逻辑
+          }}
+        />
+      )}
     </div>
   );
 }

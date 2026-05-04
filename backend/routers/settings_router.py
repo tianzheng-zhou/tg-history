@@ -12,7 +12,6 @@ router = APIRouter(prefix="/api", tags=["settings"])
 def _build_response() -> SettingsResponse:
     return SettingsResponse(
         llm_model_map=settings.llm_model_map,
-        llm_model_reduce=settings.llm_model_reduce,
         llm_model_qa=settings.llm_model_qa,
         qa_context_window=llm_adapter.get_context_window(settings.llm_model_qa),
         embedding_model=settings.embedding_model,
@@ -40,8 +39,6 @@ def update_settings(req: SettingsUpdate):
         llm_adapter._moonshot_client = None
     if req.llm_model_map is not None:
         settings.llm_model_map = req.llm_model_map
-    if req.llm_model_reduce is not None:
-        settings.llm_model_reduce = req.llm_model_reduce
     if req.llm_model_qa is not None:
         settings.llm_model_qa = req.llm_model_qa
     if req.embedding_model is not None:
@@ -64,7 +61,6 @@ def _persist_env():
         "MOONSHOT_API_KEY": settings.moonshot_api_key,
         "MOONSHOT_BASE_URL": settings.moonshot_base_url,
         "LLM_MODEL_MAP": settings.llm_model_map,
-        "LLM_MODEL_REDUCE": settings.llm_model_reduce,
         "LLM_MODEL_QA": settings.llm_model_qa,
         "EMBEDDING_MODEL": settings.embedding_model,
         "RERANK_MODEL": settings.rerank_model,

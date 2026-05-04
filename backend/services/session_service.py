@@ -14,7 +14,7 @@ from typing import Any
 from sqlalchemy import and_, desc, func, or_
 from sqlalchemy.orm import Session
 
-from backend.models.database import ChatSession, ChatTurn
+from backend.models.database import Artifact, ArtifactVersion, ChatSession, ChatTurn
 
 
 # ---------- utilities ----------
@@ -50,7 +50,7 @@ def _derive_preview(text: str | None, max_len: int = 80) -> str:
     return s[:max_len] + "…"
 
 
-def session_to_dict(s: ChatSession) -> dict:
+def session_to_dict(s: ChatSession, artifact_count: int = 0) -> dict:
     return {
         "id": s.id,
         "title": s.title or "新对话",
@@ -59,10 +59,34 @@ def session_to_dict(s: ChatSession) -> dict:
         "pinned": bool(s.pinned),
         "archived": bool(s.archived),
         "turn_count": s.turn_count or 0,
+        "artifact_count": artifact_count,
         "last_preview": s.last_preview,
         "created_at": s.created_at or datetime.utcnow(),
         "updated_at": s.updated_at or datetime.utcnow(),
     }
+
+
+def count_artifacts(db: Session, session_id: str) -> int:
+    """统计某 session 下的 artifact 数量（不含版本数）。"""
+    return (
+        db.query(func.count(Artifact.id))
+        .filter(Artifact.session_id == session_id)
+        .scalar()
+        or 0
+    )
+
+
+def count_artifacts_bulk(db: Session, session_ids: list[str]) -> dict[str, int]:
+    """批量统计多个 session 的 artifact 数量。返回 {session_id: count}，未出现的视为 0。"""
+    if not session_ids:
+        return {}
+    rows = (
+        db.query(Artifact.session_id, func.count(Artifact.id))
+        .filter(Artifact.session_id.in_(session_ids))
+        .group_by(Artifact.session_id)
+        .all()
+    )
+    return {sid: cnt for sid, cnt in rows}
 
 
 def turn_to_dict(t: ChatTurn) -> dict:
@@ -189,6 +213,15 @@ def delete_session(db: Session, session_id: str) -> bool:
     s = get_session(db, session_id)
     if not s:
         return False
+    # 级联删除 artifacts + 版本（FK CASCADE 也会兜底，但 ORM 层显式删更稳）
+    artifact_ids = [
+        aid for (aid,) in db.query(Artifact.id).filter(Artifact.session_id == session_id).all()
+    ]
+    if artifact_ids:
+        db.query(ArtifactVersion).filter(
+            ArtifactVersion.artifact_id.in_(artifact_ids)
+        ).delete(synchronize_session=False)
+        db.query(Artifact).filter(Artifact.id.in_(artifact_ids)).delete(synchronize_session=False)
     # 级联删除 turns
     db.query(ChatTurn).filter(ChatTurn.session_id == session_id).delete()
     db.delete(s)
