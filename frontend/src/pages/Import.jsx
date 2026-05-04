@@ -17,6 +17,7 @@ import {
   importChat,
   getChats,
   getIndexProgress,
+  getImportProgress,
   validateFolder,
   listFolders,
   addFolder,
@@ -29,11 +30,12 @@ export default function Import() {
   const [activeTab, setActiveTab] = useState("upload"); // "upload" | "folder" | "telegram"
   const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [recentImports, setRecentImports] = useState([]);
   const [indexProgress, setIndexProgress] = useState(null);
+  const [importProgress, setImportProgress] = useState(null);
   const pollRef = useRef(null);
+  const importPollRef = useRef(null);
 
   // 绑定目录相关
   const [folders, setFolders] = useState([]);
@@ -44,7 +46,6 @@ export default function Import() {
   const [adding, setAdding] = useState(false);
   const [folderError, setFolderError] = useState(null);
   const [scanningId, setScanningId] = useState(null);
-  const [scanResult, setScanResult] = useState(null);
 
   const loadImports = useCallback(() => {
     getChats().then(setRecentImports).catch(() => {});
@@ -54,17 +55,16 @@ export default function Import() {
     listFolders().then(setFolders).catch(() => {});
   }, []);
 
-  useState(() => {
+  useEffect(() => {
     loadImports();
     loadFolders();
-  });
+  }, [loadImports, loadFolders]);
 
   const handleDrop = useCallback((e) => {
     e.preventDefault();
     const f = e.dataTransfer?.files?.[0];
     if (f && f.name.endsWith(".json")) {
       setFile(f);
-      setResult(null);
       setError(null);
     }
   }, []);
@@ -73,7 +73,6 @@ export default function Import() {
     const f = e.target.files?.[0];
     if (f) {
       setFile(f);
-      setResult(null);
       setError(null);
     }
   };
@@ -96,28 +95,73 @@ export default function Import() {
     }, 1500);
   }, [loadImports]);
 
+  // 文件 / 目录扫描的导入进度轮询：与索引构建独立。
+  // import 流程：parsing → importing → done | error，
+  // 完成后再触发 startPolling() 跟进向量索引阶段。
+  const startImportPolling = useCallback(() => {
+    if (importPollRef.current) clearInterval(importPollRef.current);
+    importPollRef.current = setInterval(async () => {
+      try {
+        const prog = await getImportProgress();
+        setImportProgress(prog);
+        if (!prog.running) {
+          clearInterval(importPollRef.current);
+          importPollRef.current = null;
+          loadImports();
+          loadFolders();
+          // 导入完成后，索引构建一般会被 _enqueue_index 触发 → 顺便启动索引轮询
+          getIndexProgress().then((ip) => {
+            if (ip.running) {
+              setIndexProgress(ip);
+              startPolling();
+            }
+          }).catch(() => {});
+        }
+      } catch {
+        clearInterval(importPollRef.current);
+        importPollRef.current = null;
+      }
+    }, 800);
+  }, [loadImports, loadFolders, startPolling]);
+
   useEffect(() => {
-    // 页面加载时检查是否有正在进行的索引构建
+    // 页面加载时同时检查导入任务和索引构建是否在跑
+    getImportProgress().then((prog) => {
+      if (prog.running) {
+        setImportProgress(prog);
+        startImportPolling();
+      } else if (prog.stage && (prog.stage === "done" || prog.stage === "error")) {
+        // 上一次任务已结束，展示一次结果
+        setImportProgress(prog);
+      }
+    }).catch(() => {});
     getIndexProgress().then((prog) => {
       if (prog.running || prog.completed > 0) {
         setIndexProgress(prog);
         if (prog.running) startPolling();
       }
     }).catch(() => {});
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
-  }, [startPolling]);
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+      if (importPollRef.current) clearInterval(importPollRef.current);
+    };
+  }, [startPolling, startImportPolling]);
 
   const handleImport = async () => {
     if (!file) return;
     setLoading(true);
     setError(null);
-    setResult(null);
+    setImportProgress(null);
     try {
-      const data = await importChat(file);
-      setResult(data);
+      // 后端立即返回 task_id，真正进度通过轮询拿；不再阻塞等几十分钟
+      await importChat(file);
       setFile(null);
-      loadImports();
-      startPolling();
+      // 立刻拉一次并启动轮询，避免空白 1 秒
+      try {
+        const prog = await getImportProgress();
+        setImportProgress(prog);
+      } catch {}
+      startImportPolling();
     } catch (err) {
       setError(err.response?.data?.detail || "导入失败，请检查文件格式");
     } finally {
@@ -173,19 +217,16 @@ export default function Import() {
 
   const handleScanFolder = async (folderId) => {
     setScanningId(folderId);
-    setScanResult(null);
     setFolderError(null);
+    setImportProgress(null);
     try {
-      const data = await scanFolder(folderId);
-      setScanResult(data);
-      loadFolders();
-      loadImports();
-      // 扫描后若有新增 chat 触发了索引构建，启动轮询
-      const prog = await getIndexProgress();
-      if (prog.running) {
-        setIndexProgress(prog);
-        startPolling();
-      }
+      // scanFolder 后端改成异步任务，立即返回 task_id；进度通过轮询拿
+      await scanFolder(folderId);
+      try {
+        const prog = await getImportProgress();
+        setImportProgress(prog);
+      } catch {}
+      startImportPolling();
     } catch (err) {
       setFolderError(err.response?.data?.detail || "扫描失败");
     } finally {
@@ -268,22 +309,6 @@ export default function Import() {
               >
                 {loading ? "导入中..." : "开始导入"}
               </button>
-            </div>
-          )}
-
-          {result && result.length > 0 && (
-            <div className="mt-4 bg-green-50 border border-green-200 rounded-lg p-4 flex items-start gap-3">
-              <CheckCircle2 size={20} className="text-green-600 mt-0.5" />
-              <div>
-                <p className="font-medium text-green-800">
-                  导入成功! 共 {result.length} 个群聊
-                </p>
-                {result.map((r, i) => (
-                  <p key={i} className="text-sm text-green-700 mt-1">
-                    {r.chat_name} · 新增 {r.message_count} 条消息 · {r.date_range}
-                  </p>
-                ))}
-              </div>
             </div>
           )}
 
@@ -475,58 +500,114 @@ export default function Import() {
           </div>
         )}
 
-        {/* 扫描结果 */}
-        {scanResult && (
-          <div className="mt-3 bg-green-50 border border-green-200 rounded-lg p-4">
-            <div className="flex items-center gap-2 mb-2">
-              <CheckCircle2 size={18} className="text-green-600" />
-              <p className="font-medium text-green-800 text-sm">
-                扫描完成：共 {scanResult.total} · 新导入{" "}
-                <span className="font-semibold">{scanResult.imported}</span> ·
-                跳过 {scanResult.skipped}
-                {scanResult.failed > 0 && (
-                  <span className="text-red-600"> · 失败 {scanResult.failed}</span>
-                )}
-              </p>
-            </div>
-            {scanResult.files?.length > 0 && (
-              <div className="max-h-48 overflow-y-auto space-y-0.5 text-xs">
-                {scanResult.files.map((fr, i) => (
-                  <div
-                    key={i}
-                    className={
-                      fr.status === "ok" ? "text-green-700" : "text-red-600"
-                    }
-                  >
-                    {fr.status === "ok" ? "✓" : "✗"}{" "}
-                    <span className="font-mono">{fr.path}</span>
-                    {fr.status === "ok" && fr.chats?.length > 0 && (
-                      <span className="text-muted-foreground">
-                        {" "}
-                        ·{" "}
-                        {fr.chats
-                          .map(
-                            (c) =>
-                              `${c.chat_name}(+${c.message_count})`
-                          )
-                          .join("、")}
-                      </span>
-                    )}
-                    {fr.status === "error" && fr.error && (
-                      <span> · {fr.error}</span>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
       </div>
       )}
 
       {/* Tab: Telegram 直连 */}
       {activeTab === "telegram" && (
         <TelegramSync onImported={() => { loadImports(); startPolling(); }} />
+      )}
+
+      {/* 导入进度（文件上传 / 目录扫描共用） */}
+      {importProgress && importProgress.stage && (
+        <div
+          className={`mt-4 border rounded-lg p-4 ${
+            importProgress.stage === "error"
+              ? "bg-red-50 border-red-200"
+              : importProgress.stage === "done"
+              ? "bg-green-50 border-green-200"
+              : "bg-blue-50 border-blue-200"
+          }`}
+        >
+          <div className="flex items-center gap-2 mb-2">
+            {importProgress.running ? (
+              <Loader2 size={18} className="text-blue-600 animate-spin" />
+            ) : importProgress.stage === "error" ? (
+              <AlertCircle size={18} className="text-red-600" />
+            ) : (
+              <CheckCircle2 size={18} className="text-green-600" />
+            )}
+            <span
+              className={`font-medium ${
+                importProgress.stage === "error"
+                  ? "text-red-800"
+                  : importProgress.stage === "done"
+                  ? "text-green-800"
+                  : "text-blue-800"
+              }`}
+            >
+              {importProgress.running
+                ? importProgress.stage === "parsing"
+                  ? "正在解析 JSON 文件..."
+                  : `正在导入 ${
+                      importProgress.current_chat_name || ""
+                    } (${importProgress.chats_done}/${
+                      importProgress.chats_total || "?"
+                    })`
+                : importProgress.stage === "error"
+                ? `导入失败：${importProgress.error || "未知错误"}`
+                : `导入完成 · 共 ${importProgress.chats_done} 个群聊`}
+            </span>
+          </div>
+
+          {/* 当前 chat 内部进度（消息条数） */}
+          {importProgress.running &&
+            importProgress.stage === "importing" &&
+            importProgress.current_chat_total > 0 && (
+              <>
+                <div className="w-full bg-blue-100 rounded-full h-2 mb-1">
+                  <div
+                    className="bg-blue-500 h-2 rounded-full transition-all duration-300"
+                    style={{
+                      width: `${
+                        (importProgress.current_chat_done /
+                          importProgress.current_chat_total) *
+                        100
+                      }%`,
+                    }}
+                  />
+                </div>
+                <p className="text-xs text-blue-700">
+                  {importProgress.current_chat_done.toLocaleString()} /{" "}
+                  {importProgress.current_chat_total.toLocaleString()} 条消息
+                </p>
+              </>
+            )}
+
+          {/* 目录扫描的文件级进度 */}
+          {importProgress.kind === "folder_scan" &&
+            importProgress.files_total > 0 && (
+              <p className="text-xs text-blue-700 mt-1">
+                文件 {importProgress.files_done} / {importProgress.files_total}
+              </p>
+            )}
+
+          {/* 完成后的结果列表 */}
+          {!importProgress.running &&
+            importProgress.results?.length > 0 && (
+              <div className="mt-2 max-h-48 overflow-y-auto space-y-0.5 text-xs">
+                {importProgress.results.map((r, i) => (
+                  <p
+                    key={i}
+                    className={
+                      r.status === "ok" ? "text-green-700" : "text-red-600"
+                    }
+                  >
+                    {r.status === "ok" ? "✓" : "✗"} {r.chat_name}
+                    {r.status === "ok" && (
+                      <span className="text-muted-foreground">
+                        {" "}
+                        · 新增 {r.message_count} 条 · {r.date_range}
+                      </span>
+                    )}
+                    {r.status === "error" && r.error && (
+                      <span> · {r.error}</span>
+                    )}
+                  </p>
+                ))}
+              </div>
+            )}
+        </div>
       )}
 
       {/* 索引构建进度 */}

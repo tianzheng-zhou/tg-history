@@ -47,6 +47,7 @@ from backend.models.schemas import (
 )
 from backend.routers.import_router import (
     _enqueue_index,
+    _load_existing_ids,
     _stable_id_offset,
     import_messages_for_chat,
 )
@@ -266,31 +267,40 @@ async def list_dialogs(db: Session = Depends(get_db)):
         logger.exception("list_dialogs 失败")
         raise HTTPException(500, f"列出对话失败: {e}")
 
-    # join 本地 Import + Messages 表
+    # join 本地 Import + Messages 表（一次性聚合，避免 N+1）
     chat_ids = [d["chat_id"] for d in dialogs]
-    if chat_ids:
+
+    def _aggregate_local_state(cids: list[str]) -> tuple[dict, dict]:
+        """同步聚合：一次查 Import 表 + 一次 GROUP BY 查所有 max(Message.id)。"""
+        if not cids:
+            return {}, {}
         imp_rows = (
             db.query(Import.chat_id, Import.message_count)
-            .filter(Import.chat_id.in_(chat_ids))
+            .filter(Import.chat_id.in_(cids))
             .all()
         )
-        imported_map = {cid: cnt for cid, cnt in imp_rows}
-    else:
-        imported_map = {}
+        imp_map = {cid: cnt for cid, cnt in imp_rows}
+
+        # 一条 GROUP BY 替代 N 次 max(Message.id)，消除 N+1
+        max_rows = (
+            db.query(Message.chat_id, func.max(Message.id))
+            .filter(Message.chat_id.in_(cids))
+            .group_by(Message.chat_id)
+            .all()
+        )
+        max_map = {cid: mid for cid, mid in max_rows if mid is not None}
+        return imp_map, max_map
+
+    # db 查询整体派 thread，避免阻塞主循环（即便对几百个 chat 也只是 ~10ms 但仍 IO）
+    imported_map, max_id_map = await asyncio.to_thread(_aggregate_local_state, chat_ids)
 
     out: list[TelegramDialogInfo] = []
     for d in dialogs:
         cid = d["chat_id"]
         local_max = 0
-        if cid in imported_map:
+        if cid in imported_map and cid in max_id_map:
             offset = _stable_id_offset(cid)
-            row = (
-                db.query(func.max(Message.id))
-                .filter(Message.chat_id == cid)
-                .scalar()
-            )
-            if row:
-                local_max = max(0, row - offset)
+            local_max = max(0, max_id_map[cid] - offset)
 
         out.append(TelegramDialogInfo(
             chat_id=cid,
@@ -318,31 +328,45 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
             if _sync_progress.get("aborting"):
                 break
 
-            # 计算 min_id（增量基准）
-            offset = _stable_id_offset(cid)
-            row = (
-                db.query(func.max(Message.id))
-                .filter(Message.chat_id == cid)
-                .scalar()
+            # 一次性把该 chat 的状态加载齐全，包含：
+            #   - min_id（incremental 拉取下界）
+            #   - Import 行
+            #   - 现有全局 message id 集合（用于本次同步整个生命周期的 dedup）
+            # 后续所有 batch 都共用 existing_ids，避免每个 batch O(N) 扫全表。
+            def _load_chat_state():
+                offset_local = _stable_id_offset(cid)
+                row_local = (
+                    db.query(func.max(Message.id))
+                    .filter(Message.chat_id == cid)
+                    .scalar()
+                )
+                min_id_local = max(0, (row_local or 0) - offset_local) if row_local else 0
+                imp_local = db.query(Import).filter(Import.chat_id == cid).first()
+                existing_local = imp_local.chat_name if imp_local else None
+                # 50w 量级：~30MB / 几秒；但只发生一次
+                ids_local = _load_existing_ids(db, cid) if imp_local else set()
+                return min_id_local, imp_local, existing_local, ids_local
+
+            min_id, imp, existing_name, existing_ids = await asyncio.to_thread(
+                _load_chat_state
             )
-            min_id = max(0, (row or 0) - offset) if row else 0
 
             # 群名优先级：
-            #   1. 现有 Import.chat_name 且看起来不是 chat_id 数字 → 用它（用户/历史可能有正确名字）
-            #   2. 否则通过 Telethon 拿真实群名（list_dialogs 后通常走本地缓存）
+            #   1. 现有 Import.chat_name 且看起来不是 chat_id 数字 → 用它
+            #   2. 否则通过 Telethon 拿真实群名
             #   3. 都拿不到 → 退回 cid
-            imp = db.query(Import).filter(Import.chat_id == cid).first()
-            existing_name = imp.chat_name if imp else None
             if existing_name and existing_name != cid:
                 chat_name = existing_name
             else:
                 chat_name = await tg.get_chat_display_name(api_id, api_hash, cid)
                 if not chat_name:
                     chat_name = cid
-                # 把首次拿到的真实群名回写 DB（修复历史脏数据）
+                # 把首次拿到的真实群名回写 DB（fsync 派 thread）
                 if imp and imp.chat_name != chat_name:
-                    imp.chat_name = chat_name
-                    db.commit()
+                    def _persist_name(name=chat_name, target=imp):
+                        target.chat_name = name
+                        db.commit()
+                    await asyncio.to_thread(_persist_name)
 
             _sync_progress.update({
                 "current_chat_id": cid,
@@ -372,8 +396,10 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
                         if max_dt is None or dt > max_dt:
                             max_dt = dt
 
-                    if len(batch) >= 500:
-                        # 群名兜底：从 dialog 拿不到就用第一条 sender 推断 — 这里直接用 chat_name
+                    if len(batch) >= 2000:
+                        # batch size 500 → 2000：减少 commit 次数 + 减少 progress 更新频率。
+                        # existing_ids 共享：避免每个 batch 重新加载全 chat id 集合。
+                        # skip_total_count=True：避免每 batch 都跑一次 COUNT(*) 全表扫。
                         partial = await asyncio.to_thread(
                             import_messages_for_chat,
                             db,
@@ -381,6 +407,9 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
                             chat_name=chat_name,
                             messages=batch,
                             date_range=tg.date_range_string(min_dt, max_dt),
+                            existing_ids=existing_ids,
+                            update_existing_ids=True,
+                            skip_total_count=True,
                         )
                         total_new += partial.message_count
                         _sync_progress["current_imported"] = total_new
@@ -396,7 +425,8 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
                 logger.exception("同步 %s 失败", cid)
 
             # 无论成功/失败，把 batch 里剩下的消息存入 DB —— 保证「部分成功」不会丢
-            if batch:
+            # 收尾 flush 用 skip_total_count=False，让 Import.message_count 拿到准确值
+            if batch or total_new > 0:
                 try:
                     partial = await asyncio.to_thread(
                         import_messages_for_chat,
@@ -405,6 +435,9 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
                         chat_name=chat_name,
                         messages=batch,
                         date_range=tg.date_range_string(min_dt, max_dt),
+                        existing_ids=existing_ids,
+                        update_existing_ids=True,
+                        skip_total_count=False,  # 收尾纠正 Import.message_count
                     )
                     total_new += partial.message_count
                     _sync_progress["current_imported"] = total_new

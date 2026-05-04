@@ -82,32 +82,46 @@ async def _summary_runner():
                     _summary_progress["stage"] = "map"
 
                 try:
-                    existing = db.query(SummaryReport).filter(SummaryReport.chat_id == chat_id).all()
-                    has_valid = any(not (r.stale or False) for r in existing)
+                    # async 函数主循环里做 sync db.query 会让 /summary-progress 等
+                    # 轮询抖动；派 thread 保证主循环干净
+                    def _load_existing():
+                        rows = db.query(SummaryReport).filter(
+                            SummaryReport.chat_id == chat_id
+                        ).all()
+                        ids = [r.id for r in rows]
+                        has_valid_local = any(not (r.stale or False) for r in rows)
+                        return rows, ids, has_valid_local
+                    existing, old_ids, has_valid = await asyncio.to_thread(_load_existing)
                     if existing and not force and has_valid:
-                        _summary_progress["results"].append({
-                            "chat_name": chat_name, "status": "skipped"
-                        })
+                        with _summary_lock:
+                            _summary_progress["results"].append({
+                                "chat_name": chat_name, "status": "skipped"
+                            })
                         return
 
                     # 先生成新摘要（run_summarize 会 commit 一条新 SummaryReport）
-                    old_ids = [r.id for r in existing]
                     await run_summarize(db, chat_id, progress=detail)
 
                     # 生成成功后才删除旧的，确保失败时旧摘要不丢
                     if old_ids:
-                        db.query(SummaryReport).filter(SummaryReport.id.in_(old_ids)).delete(synchronize_session=False)
-                        db.commit()
+                        def _delete_old():
+                            db.query(SummaryReport).filter(
+                                SummaryReport.id.in_(old_ids)
+                            ).delete(synchronize_session=False)
+                            db.commit()
+                        await asyncio.to_thread(_delete_old)
 
-                    _summary_progress["results"].append({
-                        "chat_name": chat_name, "status": "ok"
-                    })
+                    with _summary_lock:
+                        _summary_progress["results"].append({
+                            "chat_name": chat_name, "status": "ok"
+                        })
                     logger.info(f"摘要生成完成: {chat_name}")
                 except Exception as e:
                     logger.warning(f"摘要生成失败({chat_name}): {e}")
-                    _summary_progress["results"].append({
-                        "chat_name": chat_name, "status": "error", "error": str(e)[:200]
-                    })
+                    with _summary_lock:
+                        _summary_progress["results"].append({
+                            "chat_name": chat_name, "status": "error", "error": str(e)[:200]
+                        })
                     db.rollback()
                 finally:
                     with _summary_lock:
@@ -128,10 +142,11 @@ async def _summary_runner():
     if coros:
         await asyncio.gather(*coros)
 
-    _summary_progress["running"] = False
-    _summary_progress["active_chats"] = []
-    _summary_progress["chat_details"] = {}
-    _summary_progress["stage"] = "done"
+    with _summary_lock:
+        _summary_progress["running"] = False
+        _summary_progress["active_chats"] = []
+        _summary_progress["chat_details"] = {}
+        _summary_progress["stage"] = "done"
 
 
 # ---------- API ----------
@@ -175,9 +190,22 @@ def trigger_summarize_all(force: bool = False, db: Session = Depends(get_db)):
 
 @router.get("/summary-progress")
 def get_summary_progress():
-    """查询摘要生成进度"""
+    """查询摘要生成进度。
+
+    返回前需要 deep-copy 可变字段（results / active_chats / chat_details），
+    否则 worker 在 FastAPI 序列化期间 append / setitem 会触发
+    ``RuntimeError: dictionary changed size during iteration`` 或类似错误。
+    同 /import-progress 与 /index-progress 的处理。
+    """
     with _summary_lock:
-        return {**_summary_progress, "queued": len(_summary_queue)}
+        snap = dict(_summary_progress)
+        snap["active_chats"] = list(_summary_progress["active_chats"])
+        snap["results"] = list(_summary_progress["results"])
+        snap["chat_details"] = {
+            k: dict(v) for k, v in _summary_progress["chat_details"].items()
+        }
+        snap["queued"] = len(_summary_queue)
+        return snap
 
 
 @router.get("/summaries/{chat_id}", response_model=list[SummaryItem])

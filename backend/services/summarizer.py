@@ -121,18 +121,22 @@ async def _reduce_summarize(summaries: list[str]) -> str:
 
 async def run_summarize(db: Session, chat_id: str, progress: dict | None = None) -> dict[str, str]:
     """执行完整的 Map-Reduce 摘要流程，可选 progress dict 实时上报进度"""
-    messages = (
-        db.query(Message)
-        .filter(Message.chat_id == chat_id)
-        .order_by(Message.date)
-        .all()
-    )
 
-    if not messages:
+    # 大群聊几十万条消息，全部拉到内存 + 切 chunk 都是 CPU/IO 同步活，派 thread
+    def _load_and_chunk_sync():
+        messages = (
+            db.query(Message)
+            .filter(Message.chat_id == chat_id)
+            .order_by(Message.date)
+            .all()
+        )
+        if not messages:
+            return []
+        return _chunk_messages(messages)
+
+    chunks = await asyncio.to_thread(_load_and_chunk_sync)
+    if not chunks:
         return {}
-
-    # Map 阶段
-    chunks = _chunk_messages(messages)
     if progress is not None:
         progress["map_total"] = len(chunks)
         progress["map_done"] = 0
@@ -160,18 +164,20 @@ async def run_summarize(db: Session, chat_id: str, progress: dict | None = None)
     now = datetime.utcnow()
     summaries_json = json.dumps(chunk_summaries, ensure_ascii=False)
 
-    # 保存完整报告
-    db.add(SummaryReport(
-        chat_id=chat_id, category="full", content=full_report,
-        generated_at=now, chunk_summaries=summaries_json,
-    ))
-    # 保存各分类（即使内容为"暂无"也写入空标记）
-    for cat_key, cat_content in sections.items():
+    # 保存到 db（commit fsync 是同步 IO，派 thread）
+    def _save_sync():
         db.add(SummaryReport(
-            chat_id=chat_id, category=cat_key, content=cat_content,
-            generated_at=now,
+            chat_id=chat_id, category="full", content=full_report,
+            generated_at=now, chunk_summaries=summaries_json,
         ))
-    db.commit()
+        for cat_key, cat_content in sections.items():
+            db.add(SummaryReport(
+                chat_id=chat_id, category=cat_key, content=cat_content,
+                generated_at=now,
+            ))
+        db.commit()
+
+    await asyncio.to_thread(_save_sync)
 
     return {"full": full_report, **sections}
 

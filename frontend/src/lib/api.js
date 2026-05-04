@@ -7,12 +7,28 @@ const api = axios.create({
 
 // ---------- Import ----------
 
+/**
+ * 上传文件触发后台导入。
+ *
+ * 后端改成异步任务：
+ * - 立即返回 {status: "started", task_id}
+ * - 真正进度由 getImportProgress() 轮询
+ *
+ * 上传本身（multipart 大文件）依然要等服务端把文件写到临时目录才会返回，
+ * 所以保留较大的 timeout（10 分钟）以应对几百 MB 的 export.json。
+ */
 export async function importChat(file) {
   const formData = new FormData();
   formData.append("file", file);
   const { data } = await api.post("/import", formData, {
     headers: { "Content-Type": "multipart/form-data" },
+    timeout: 600000,
   });
+  return data;
+}
+
+export async function getImportProgress() {
+  const { data } = await api.get("/import-progress");
   return data;
 }
 

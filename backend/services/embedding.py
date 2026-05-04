@@ -70,22 +70,30 @@ async def search_similar(
     n_results: int = 10,
     where: dict | None = None,
 ) -> list[dict]:
-    """语义相似度搜索"""
+    """语义相似度搜索。
+
+    chromadb 的 count/query 是同步阻塞调用（HNSW 读 + 距离计算），
+    每次 RAG 检索 / semantic_search 工具 / 子 Agent 都会走这里。
+    必须派到线程池，否则会阻塞主事件循环（百~千 ms 起）。
+    """
     collection = get_or_create_collection()
 
-    if collection.count() == 0:
+    # count 也阻塞主循环，派到 thread；同时一次拿到，避免重复调用
+    total = await asyncio.to_thread(collection.count)
+    if total == 0:
         return []
 
     query_embedding = await llm_adapter.embed([query])
 
     kwargs = {
         "query_embeddings": query_embedding,
-        "n_results": min(n_results, collection.count()),
+        "n_results": min(n_results, total),
     }
     if where:
         kwargs["where"] = where
 
-    results = collection.query(**kwargs)
+    # query 是 chromadb 主热点（HNSW 搜索 + IO），同步派 thread
+    results = await asyncio.to_thread(lambda: collection.query(**kwargs))
 
     output = []
     if results and results["ids"]:

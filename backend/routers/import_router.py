@@ -7,13 +7,12 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from backend.models.database import (
     Import,
-    ImportedFile,
     Message,
     SessionLocal,
     SummaryReport,
@@ -28,13 +27,9 @@ from backend.models.schemas import (
     FolderValidateRequest,
     FolderValidateResponse,
     ImportResult,
-    MessageItem,
-    MessageQuery,
-    ScanFileResult,
-    ScanResult,
     WatchedFolderInfo,
 )
-from backend.services.parser import parse_export_file
+from backend.services.parser import iter_export_chats, parse_export_file
 from backend.services.embedding import (
     build_index_for_chat,
     build_index_for_chat_incremental,
@@ -66,6 +61,18 @@ def _stable_id_offset(chat_id: str) -> int:
     return (int.from_bytes(digest[:8], "big") % (10**9)) * 1000000
 
 
+def _load_existing_ids(db: Session, chat_id: str) -> set[int]:
+    """一次性加载某 chat 现有的 message.id 集合，用于去重。
+
+    在 50w 量级群聊上这一步本身就是 ~30MB 内存 + 几秒 IO，
+    调用方应该 **每个 chat 只调一次**，然后把结果传给后续所有 batch。
+    """
+    return {
+        row[0]
+        for row in db.query(Message.id).filter(Message.chat_id == chat_id).all()
+    }
+
+
 def import_messages_for_chat(
     db: Session,
     *,
@@ -73,36 +80,53 @@ def import_messages_for_chat(
     chat_name: str,
     messages: list[dict],
     date_range: str,
+    existing_ids: set[int] | None = None,
+    update_existing_ids: bool = False,
+    skip_total_count: bool = False,
+    progress_cb=None,
 ) -> ImportResult:
     """把一批已解析的消息写入数据库 + FTS（同步，不含向量索引）。
 
-    messages 中每个元素须符合 parser.parse_message 的输出格式：
-        id (int, 原始 chat 内 id), chat_id, date, sender, sender_id,
-        text, text_plain, reply_to_id, forwarded_from, media_type, entities
+    messages 中每个元素须符合 parser.parse_message 的输出格式。
 
-    去重逻辑：
-    - 用 chat_id 稳定哈希偏移把每条消息映射到全局唯一 id；
-    - 对该 chat 已存在的 message id 取交集，跳过重复；
-    - 同步 FTS5 索引；如果有新消息且已存在导入记录，标记摘要 stale + index_built=False。
+    性能关键参数（用于 50w 量级群聊的多批次增量导入）：
+
+    - ``existing_ids``：调用方传入"该 chat 已存在的全局 message id"集合，
+      避免每个 batch 都重新跑一次全表扫。set 内会被本函数 in-place 加上
+      新插入的 id（仅在 ``update_existing_ids=True`` 时），方便下一个 batch
+      继续 dedup。
+    - ``skip_total_count``：跳过收尾的 ``COUNT(*) FROM messages WHERE chat_id=...``
+      —— 这一句对 50w 表要扫全表 ~1s，不应该每个 batch 都做。
+      调用方应该在所有 batch 写完后再调一次（``skip_total_count=False``）。
+    - ``progress_cb``：可选 callback(processed, total)，用于上报导入进度。
 
     返回 ImportResult，message_count 表示**本次新增**条数（增量）。
     """
     # 检查是否已导入（支持增量）
     existing = db.query(Import).filter(Import.chat_id == chat_id).first()
-    existing_ids = set()
-    if existing:
-        existing_ids = set(
-            row[0]
-            for row in db.query(Message.id).filter(Message.chat_id == chat_id).all()
-        )
+    if existing_ids is None:
+        existing_ids = _load_existing_ids(db, chat_id) if existing else set()
 
     # 为避免跨群聊 message id 冲突，使用 chat_id 稳定哈希偏移
     id_offset = _stable_id_offset(chat_id)
 
     # 批量插入新消息
+    total_msgs = len(messages)
     new_count = 0
-    batch = []
-    for m in messages:
+    batch: list[Message] = []
+    inserted_ids: list[int] = []  # 仅记录这次实际新增的全局 unique_id，用于 FTS 增量插入
+
+    # 在大 batch 内部分块 flush，避免一次性把 50w ORM 对象塞进 SQLAlchemy session
+    FLUSH_EVERY = 2000
+    FTS_CHUNK = 500  # 远低于 SQLite 默认 SQLITE_MAX_VARIABLE_NUMBER
+
+    def _flush_batch_and_fts():
+        if not batch:
+            return
+        db.bulk_save_objects(batch)
+        batch.clear()
+
+    for idx, m in enumerate(messages):
         unique_id = id_offset + m["id"]
         if m["id"] in existing_ids or unique_id in existing_ids:
             continue
@@ -121,24 +145,40 @@ def import_messages_for_chat(
         if m.get("entities"):
             msg.set_entities(m["entities"])
         batch.append(msg)
+        inserted_ids.append(unique_id)
+        if update_existing_ids:
+            existing_ids.add(unique_id)
         new_count += 1
 
-        if len(batch) >= 500:
-            db.bulk_save_objects(batch)
-            batch = []
+        if len(batch) >= FLUSH_EVERY:
+            _flush_batch_and_fts()
+            if progress_cb is not None:
+                progress_cb(idx + 1, total_msgs)
 
-    if batch:
-        db.bulk_save_objects(batch)
+    _flush_batch_and_fts()
+    if progress_cb is not None:
+        progress_cb(total_msgs, total_msgs)
 
-    # 同步 FTS 索引
-    db.execute(text("DELETE FROM messages_fts WHERE chat_id = :cid"), {"cid": chat_id})
-    db.execute(text(
-        "INSERT INTO messages_fts(text_plain, sender, chat_id, msg_id) "
-        "SELECT text_plain, sender, chat_id, id FROM messages WHERE chat_id = :cid AND text_plain IS NOT NULL AND text_plain != ''"
-    ), {"cid": chat_id})
+    # 增量同步 FTS 索引：只插入这次新增的消息，避免每次 DELETE 全 chat + 全表重灌
+    if inserted_ids:
+        for i in range(0, len(inserted_ids), FTS_CHUNK):
+            sub = inserted_ids[i:i + FTS_CHUNK]
+            placeholders = ",".join(f":id{k}" for k in range(len(sub)))
+            params = {f"id{k}": v for k, v in enumerate(sub)}
+            db.execute(text(
+                f"INSERT INTO messages_fts(text_plain, sender, chat_id, msg_id) "
+                f"SELECT text_plain, sender, chat_id, id FROM messages "
+                f"WHERE id IN ({placeholders}) AND text_plain IS NOT NULL AND text_plain != ''"
+            ), params)
 
     # 更新/创建导入记录
-    total_count = db.query(Message).filter(Message.chat_id == chat_id).count()
+    if skip_total_count:
+        # 50w 量级 batch 同步，每次都 COUNT(*) 全表扫太贵 —— 用估算值
+        # （收尾会有一次 skip_total_count=False 的调用补正确值）
+        prev = (existing.message_count if existing else 0) or 0
+        total_count = prev + new_count
+    else:
+        total_count = db.query(Message).filter(Message.chat_id == chat_id).count()
     if existing:
         existing.message_count = total_count
         existing.date_range = date_range
@@ -168,17 +208,6 @@ def import_messages_for_chat(
     )
 
 
-def _import_single_chat(parsed: dict, db: Session) -> ImportResult:
-    """从 parser.parse_export_file 返回的单个 chat dict 写入数据库（兼容老调用）。"""
-    return import_messages_for_chat(
-        db,
-        chat_id=parsed["chat_id"],
-        chat_name=parsed["chat_name"],
-        messages=parsed["messages"],
-        date_range=parsed["date_range"],
-    )
-
-
 _index_lock = threading.Lock()
 _index_queue: list[tuple[str, bool]] = []  # [(chat_id, force)]
 _index_progress: dict = {
@@ -190,6 +219,28 @@ _index_progress: dict = {
     "chat_details": {},       # chat_name → {stage, topic_done, topic_total, index_done, index_total, mode}
     "results": [],
 }
+
+# ---------- 文件 / 目录导入的进度（独立于索引构建） ----------
+# 上传 50w 条 JSON 不可能让前端阻塞等几十分钟，所以 import_chat / folder_scan
+# 改成后台任务模式：endpoint 立即返回 task_id，前端轮询 _import_progress。
+_import_progress: dict = {
+    "running": False,
+    "task_id": "",
+    "kind": "",                 # "upload" | "folder_scan"
+    "stage": "",                # "parsing" | "importing" | "done" | "error"
+    "current_chat_name": "",
+    "current_chat_done": 0,     # 当前 chat 已写入条数
+    "current_chat_total": 0,    # 当前 chat 总条数（解析后才知道）
+    "chats_done": 0,            # 已完成的 chat 数
+    "chats_total": 0,           # 总 chat 数（解析后才知道）
+    "files_done": 0,            # folder_scan 才用
+    "files_total": 0,
+    "started_at": None,
+    "finished_at": None,
+    "results": [],              # list[ImportResult dict]
+    "error": None,
+}
+_import_lock = threading.Lock()
 
 MAX_PARALLEL = 16  # 群聊级并发上限（实际 LLM/embed 并发由 llm_adapter 全局 semaphore 控制）
 
@@ -237,7 +288,10 @@ async def _index_runner():
         async with sem:
             db = SessionLocal()
             try:
-                imp = db.query(Import).filter(Import.chat_id == chat_id).first()
+                # async 函数主循环里做 sync db.query 会让前端轮询抖动；派 thread
+                imp = await asyncio.to_thread(
+                    lambda: db.query(Import).filter(Import.chat_id == chat_id).first()
+                )
                 chat_name = imp.chat_name if imp else chat_id
 
                 mode = "force" if force else "incremental"
@@ -272,31 +326,37 @@ async def _index_runner():
                         )
 
                     if imp:
-                        imp.index_built = True
-                        db.commit()
-                    _index_progress["results"].append({
-                        "chat_id": chat_id,
-                        "chat_name": chat_name,
-                        "status": "ok",
-                        "topics": indexed,
-                        "mode": mode,
-                    })
+                        def _mark_built():
+                            imp.index_built = True
+                            db.commit()
+                        await asyncio.to_thread(_mark_built)
+                    with _index_lock:
+                        _index_progress["results"].append({
+                            "chat_id": chat_id,
+                            "chat_name": chat_name,
+                            "status": "ok",
+                            "topics": indexed,
+                            "mode": mode,
+                        })
                     logger.info(f"构建完成 [{mode}]: {chat_name} ({indexed} chunks)")
                 except Exception as e:
                     logger.warning(f"构建失败({chat_name}): {e}")
-                    _index_progress["results"].append({
-                        "chat_id": chat_id,
-                        "chat_name": chat_name,
-                        "status": "error",
-                        "error": str(e)[:200],
-                    })
+                    with _index_lock:
+                        _index_progress["results"].append({
+                            "chat_id": chat_id,
+                            "chat_name": chat_name,
+                            "status": "error",
+                            "error": str(e)[:200],
+                        })
                     db.rollback()
                     # 标记为未索引（重建失败时旧的索引状态需失效）
                     try:
-                        imp_fail = db.query(Import).filter(Import.chat_id == chat_id).first()
-                        if imp_fail:
-                            imp_fail.index_built = False
-                            db.commit()
+                        def _mark_failed():
+                            imp_fail = db.query(Import).filter(Import.chat_id == chat_id).first()
+                            if imp_fail:
+                                imp_fail.index_built = False
+                                db.commit()
+                        await asyncio.to_thread(_mark_failed)
                     except Exception:
                         db.rollback()
                 finally:
@@ -325,57 +385,220 @@ async def _index_runner():
     if tasks:
         await asyncio.gather(*tasks)
 
-    _index_progress["running"] = False
-    _index_progress["current_chat"] = ""
-    _index_progress["active_chats"] = []
-    _index_progress["chat_details"] = {}
+    with _index_lock:
+        _index_progress["running"] = False
+        _index_progress["current_chat"] = ""
+        _index_progress["active_chats"] = []
+        _index_progress["chat_details"] = {}
 
 
-@router.post("/import", response_model=list[ImportResult])
+def _finish_import_progress(error: str | None = None) -> None:
+    with _import_lock:
+        _import_progress["running"] = False
+        _import_progress["stage"] = "error" if error else "done"
+        _import_progress["finished_at"] = datetime.utcnow().isoformat()
+        if error:
+            _import_progress["error"] = error
+
+
+def _import_one_parsed_with_progress(parsed: dict, db: Session) -> ImportResult:
+    """单个 chat 的导入：调用 import_messages_for_chat 并把进度写入 _import_progress。
+
+    会触发一次 _load_existing_ids（50w 条 ~30MB / 几秒）但只一次。
+    update_existing_ids=True：本次写入的 id 加回 set，避免文件内同一 chat 出现多份
+    分块时重复插入（极少数文件结构）。
+    """
+    chat_id = parsed["chat_id"]
+    chat_name = parsed["chat_name"]
+    msgs = parsed["messages"]
+
+    with _import_lock:
+        _import_progress["current_chat_name"] = chat_name
+        _import_progress["current_chat_total"] = len(msgs)
+        _import_progress["current_chat_done"] = 0
+        _import_progress["stage"] = "importing"
+
+    existing_ids = _load_existing_ids(db, chat_id)
+
+    def _on_batch(done: int, total: int):
+        with _import_lock:
+            _import_progress["current_chat_done"] = done
+
+    return import_messages_for_chat(
+        db,
+        chat_id=chat_id,
+        chat_name=chat_name,
+        messages=msgs,
+        date_range=parsed["date_range"],
+        existing_ids=existing_ids,
+        update_existing_ids=True,
+        skip_total_count=False,
+        progress_cb=_on_batch,
+    )
+
+
+def _run_upload_import(tmp_path: str, task_id: str) -> None:
+    """上传 import 的后台同步 worker：跑在 thread pool 里。
+
+    **按 chat 流式处理**：用 ``iter_export_chats`` generator 一次拉一个 chat，
+    处理完立即 ``del parsed`` 释放。对 500k 消息 / 500MB-2GB JSON 的场景，
+    峰值内存从 stdlib ``json.load`` 的 ~3-4GB 降到单 chat 的 parsed
+    messages list（典型 <1GB），避免 OOM。
+
+    注意：streaming 模式下无法预先知道 ``chats_total``；初始为 0，
+    每 yield 一个 chat 就递增 ``chats_done``，最后补写 ``chats_total``
+    为实际处理数。前端见 chats_total=0 时应显示"已处理 X 个"而非百分比。
+    """
+    db = SessionLocal()
+    imported_chat_ids: list[str] = []
+    chats_done_local = 0
+    try:
+        try:
+            for parsed in iter_export_chats(tmp_path):
+                chat_id = parsed.get("chat_id", "")
+                chat_name = parsed.get("chat_name", "")
+                try:
+                    result = _import_one_parsed_with_progress(parsed, db)
+                except Exception as e:
+                    logger.exception("导入单个 chat 失败 %s", chat_id)
+                    with _import_lock:
+                        _import_progress["results"].append({
+                            "chat_id": chat_id,
+                            "chat_name": chat_name,
+                            "status": "error",
+                            "error": str(e)[:300],
+                        })
+                        chats_done_local += 1
+                        _import_progress["chats_done"] = chats_done_local
+                    # 即便单 chat 失败也释放内存，继续下一个
+                    del parsed
+                    continue
+                with _import_lock:
+                    _import_progress["results"].append({
+                        "chat_id": result.chat_id,
+                        "chat_name": result.chat_name,
+                        "status": "ok",
+                        "message_count": result.message_count,
+                        "date_range": result.date_range,
+                    })
+                    chats_done_local += 1
+                    _import_progress["chats_done"] = chats_done_local
+                if result.message_count > 0:
+                    imported_chat_ids.append(result.chat_id)
+                # 立即释放：generator 下一次迭代就可以让 ijson buffer / 旧 chat dict 被 GC
+                del parsed
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+        if chats_done_local == 0:
+            _finish_import_progress(error="文件中没有有效消息")
+            return
+
+        # 收尾：把 chats_total 补成准确值（streaming 过程中一直是 0）
+        with _import_lock:
+            _import_progress["chats_total"] = chats_done_local
+
+        if imported_chat_ids:
+            _enqueue_index(imported_chat_ids)
+
+        _finish_import_progress()
+    except Exception as e:
+        logger.exception("upload import worker 失败")
+        _finish_import_progress(error=str(e)[:300])
+    finally:
+        db.close()
+
+
+@router.post("/import")
 async def import_chat(
     file: UploadFile = File(...),
-    db: Session = Depends(get_db),
 ):
-    """上传并导入 Telegram 导出的 JSON 文件（支持单群聊和全量导出）"""
+    """上传并导入 Telegram 导出的 JSON 文件（支持单群聊和全量导出）。
+
+    50w 条级别的 JSON 解析 + 入库要几分钟到几十分钟，不能让前端 HTTP 请求一直挂着；
+    所以本 endpoint 改成异步任务模式：
+
+    1. 接收上传文件，落到临时目录
+    2. 派后台 thread 跑 ``_run_upload_import``，状态写入全局 ``_import_progress``
+    3. 立即返回 ``{"status": "started", "task_id": ...}``
+    4. 前端轮询 ``GET /api/import-progress`` 拿实时进度
+    """
     if not file.filename or not file.filename.endswith(".json"):
         raise HTTPException(400, "请上传 .json 文件")
 
-    # 读取上传文件到临时目录
-    content = await file.read()
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="wb") as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
+    # 在写盘之前一次性"check + reserve"，避免两个并发上传都通过 running=False 检查后
+    # 都开始写盘 / 跑 worker（TOCTOU race）。
+    task_id = hashlib.sha256(
+        f"upload-{datetime.utcnow().isoformat()}".encode()
+    ).hexdigest()[:16]
+    with _import_lock:
+        if _import_progress["running"]:
+            raise HTTPException(409, "已有导入任务在运行，请等其完成后再试")
+        _import_progress.update({
+            "running": True,
+            "task_id": task_id,
+            "kind": "upload",
+            "stage": "parsing",
+            "current_chat_name": "",
+            "current_chat_done": 0,
+            "current_chat_total": 0,
+            "chats_done": 0,
+            "chats_total": 0,
+            "files_done": 0,
+            "files_total": 0,
+            "started_at": datetime.utcnow().isoformat(),
+            "finished_at": None,
+            "results": [],
+            "error": None,
+        })
 
+    # 流式写盘：避免一次性把几百 MB JSON 全读到 Python 内存（也避免长时间阻塞主循环）
     try:
-        chat_list = parse_export_file(tmp_path)
-    except (json.JSONDecodeError, KeyError) as e:
-        raise HTTPException(400, f"JSON 解析失败: {e}")
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="wb") as tmp:
+            while True:
+                chunk = await file.read(8 * 1024 * 1024)  # 8MB
+                if not chunk:
+                    break
+                tmp.write(chunk)
+            tmp_path = tmp.name
+    except Exception as e:
+        _finish_import_progress(error=f"接收上传失败: {e}")
+        raise HTTPException(500, f"接收上传失败: {e}")
 
-    if not chat_list:
-        raise HTTPException(400, "文件中没有有效消息，请确认文件格式正确")
+    # fire-and-forget：派 thread 跑同步 worker，主循环立即返回
+    asyncio.create_task(asyncio.to_thread(_run_upload_import, tmp_path, task_id))
 
-    results = []
-    imported_chat_ids = []
-    for parsed in chat_list:
-        result = _import_single_chat(parsed, db)
-        results.append(result)
-        if result.message_count > 0:
-            imported_chat_ids.append(result.chat_id)
+    return {"status": "started", "task_id": task_id}
 
-    # 向量索引构建放后台
-    if imported_chat_ids:
-        _enqueue_index(imported_chat_ids)
 
-    return results
+@router.get("/import-progress")
+def get_import_progress():
+    """查询当前文件 / 目录导入任务的实时进度。
+
+    返回前需要 deep-copy 可变字段（results list），否则 worker thread 在 FastAPI
+    序列化期间 append 会触发 ``RuntimeError: dictionary changed size during iteration``
+    或 ``list index out of range``。
+    """
+    with _import_lock:
+        snap = dict(_import_progress)
+        snap["results"] = list(_import_progress["results"])
+        return snap
 
 
 @router.get("/index-progress")
 def get_index_progress():
     """查询向量索引构建进度"""
     with _index_lock:
-        return {**_index_progress, "queued": len(_index_queue)}
+        # 同 /import-progress：list / dict 字段需要拷贝快照，
+        # 否则 FastAPI 序列化时 worker 协程并发修改会触发 RuntimeError
+        snap = dict(_index_progress)
+        snap["active_chats"] = list(_index_progress["active_chats"])
+        snap["results"] = list(_index_progress["results"])
+        snap["chat_details"] = {
+            k: dict(v) for k, v in _index_progress["chat_details"].items()
+        }
+        snap["queued"] = len(_index_queue)
+        return snap
 
 
 @router.post("/rebuild-index/{chat_id}")
@@ -600,129 +823,183 @@ def folder_delete(folder_id: int, db: Session = Depends(get_db)):
     return {"status": "ok"}
 
 
-@router.post("/folders/{folder_id}/scan", response_model=ScanResult)
-def folder_scan(folder_id: int, db: Session = Depends(get_db)):
-    """递归扫描绑定目录下的 result.json，导入未处理或 mtime 已变的文件"""
-    folder = db.query(WatchedFolder).filter(WatchedFolder.id == folder_id).first()
-    if not folder:
-        raise HTTPException(404, "目录未找到")
-
-    files = find_result_jsons(folder.path)
-    pending, skipped = diff_pending(db, folder.id, files)
-
-    file_results: list[ScanFileResult] = []
+def _run_folder_scan(folder_id: int, task_id: str) -> None:
+    """目录扫描的后台 worker。逻辑等同旧的 folder_scan 同步实现，
+    但每个 chat 都用 ``_import_one_parsed_with_progress`` 的高效路径，
+    并把进度写入 ``_import_progress``。
+    """
+    db = SessionLocal()
+    new_chat_ids: list[str] = []
+    file_results_local: list[dict] = []
     imported_count = 0
     failed_count = 0
-    new_chat_ids: list[str] = []
+    try:
+        folder = db.query(WatchedFolder).filter(WatchedFolder.id == folder_id).first()
+        if not folder:
+            _finish_import_progress(error="目录未找到")
+            return
 
-    for item in pending:
-        path = item["path"]
-        mtime = item.get("mtime") or 0.0
-        size = item.get("size") or 0
+        files = find_result_jsons(folder.path)
+        pending, skipped = diff_pending(db, folder.id, files)
 
-        if item.get("stat_error"):
-            err = f"读取文件信息失败: {item['stat_error']}"
+        with _import_lock:
+            _import_progress["files_total"] = len(pending)
+
+        for item in pending:
+            path = item["path"]
+            mtime = item.get("mtime") or 0.0
+            size = item.get("size") or 0
+
+            if item.get("stat_error"):
+                err = f"读取文件信息失败: {item['stat_error']}"
+                upsert_imported_file(
+                    db, folder_id=folder.id, abs_path=path, mtime=mtime,
+                    size=size, chat_count=0, status="error", error=err,
+                )
+                file_results_local.append({"path": path, "status": "error", "error": err})
+                failed_count += 1
+                with _import_lock:
+                    _import_progress["files_done"] += 1
+                continue
+
+            # 按 chat 流式处理：对 50w 条 / 500MB+ JSON 避免 list 全量 load 导致 OOM。
+            # 内层 try 捕 import 错误（该文件作废、db rollback、break）；
+            # 外层 try 捕 generator 在迭代中抛的 parse/IO 错误（ijson.IncompleteJSONError
+            # 等）。两者最终都归为文件级 error。
+            chat_results_local: list[dict] = []
+            file_error: str | None = None
+            try:
+                for parsed in iter_export_chats(path):
+                    try:
+                        r = _import_one_parsed_with_progress(parsed, db)
+                    except Exception as e:
+                        file_error = f"导入数据库失败: {e}"
+                        logger.exception("导入失败 %s", path)
+                        db.rollback()
+                        del parsed
+                        break
+                    chat_results_local.append({
+                        "chat_id": r.chat_id,
+                        "chat_name": r.chat_name,
+                        "message_count": r.message_count,
+                        "date_range": r.date_range,
+                    })
+                    with _import_lock:
+                        _import_progress["chats_total"] += 1
+                        _import_progress["chats_done"] += 1
+                        _import_progress["results"].append({
+                            "chat_id": r.chat_id,
+                            "chat_name": r.chat_name,
+                            "status": "ok",
+                            "message_count": r.message_count,
+                            "date_range": r.date_range,
+                        })
+                    if r.message_count > 0:
+                        new_chat_ids.append(r.chat_id)
+                    # 每处理完一个 chat 立即释放，下一次迭代前让 GC 回收
+                    del parsed
+            except Exception as e:
+                # 只剩 generator 抛出的 parse / IO 错误
+                # （ijson.common.IncompleteJSONError / ValueError / OSError / UnicodeDecodeError 等）
+                file_error = f"解析或读取失败: {e}"
+                logger.warning("解析失败 %s: %s", path, e)
+
+            if file_error:
+                upsert_imported_file(
+                    db, folder_id=folder.id, abs_path=path, mtime=mtime,
+                    size=size, chat_count=0, status="error", error=file_error,
+                )
+                db.commit()
+                file_results_local.append({"path": path, "status": "error", "error": file_error})
+                failed_count += 1
+                with _import_lock:
+                    _import_progress["files_done"] += 1
+                continue
+
+            if not chat_results_local:
+                err = "文件中没有有效消息"
+                upsert_imported_file(
+                    db, folder_id=folder.id, abs_path=path, mtime=mtime,
+                    size=size, chat_count=0, status="error", error=err,
+                )
+                db.commit()
+                file_results_local.append({"path": path, "status": "error", "error": err})
+                failed_count += 1
+                with _import_lock:
+                    _import_progress["files_done"] += 1
+                continue
+
             upsert_imported_file(
                 db, folder_id=folder.id, abs_path=path, mtime=mtime,
-                size=size, chat_count=0, status="error", error=err,
-            )
-            file_results.append(ScanFileResult(path=path, status="error", error=err))
-            failed_count += 1
-            continue
-
-        try:
-            chat_list = parse_export_file(path)
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            err = f"JSON 解析失败: {e}"
-            logger.warning("解析失败 %s: %s", path, e)
-            upsert_imported_file(
-                db, folder_id=folder.id, abs_path=path, mtime=mtime,
-                size=size, chat_count=0, status="error", error=err,
+                size=size, chat_count=len(chat_results_local), status="ok", error=None,
             )
             db.commit()
-            file_results.append(ScanFileResult(path=path, status="error", error=err))
-            failed_count += 1
-            continue
-        except OSError as e:
-            err = f"读取文件失败: {e}"
-            logger.warning("读取失败 %s: %s", path, e)
-            upsert_imported_file(
-                db, folder_id=folder.id, abs_path=path, mtime=mtime,
-                size=size, chat_count=0, status="error", error=err,
-            )
-            db.commit()
-            file_results.append(ScanFileResult(path=path, status="error", error=err))
-            failed_count += 1
-            continue
+            file_results_local.append({
+                "path": path, "status": "ok", "chats": chat_results_local, "error": None,
+            })
+            imported_count += 1
+            with _import_lock:
+                _import_progress["files_done"] += 1
 
-        if not chat_list:
-            err = "文件中没有有效消息"
-            upsert_imported_file(
-                db, folder_id=folder.id, abs_path=path, mtime=mtime,
-                size=size, chat_count=0, status="error", error=err,
-            )
-            db.commit()
-            file_results.append(ScanFileResult(path=path, status="error", error=err))
-            failed_count += 1
-            continue
-
-        chat_results: list[ImportResult] = []
-        try:
-            for parsed in chat_list:
-                r = _import_single_chat(parsed, db)
-                chat_results.append(r)
-                if r.message_count > 0:
-                    new_chat_ids.append(r.chat_id)
-        except Exception as e:
-            err = f"导入数据库失败: {e}"
-            logger.exception("导入失败 %s", path)
-            db.rollback()
-            upsert_imported_file(
-                db, folder_id=folder.id, abs_path=path, mtime=mtime,
-                size=size, chat_count=0, status="error", error=err,
-            )
-            db.commit()
-            file_results.append(ScanFileResult(path=path, status="error", error=err))
-            failed_count += 1
-            continue
-
-        upsert_imported_file(
-            db, folder_id=folder.id, abs_path=path, mtime=mtime,
-            size=size, chat_count=len(chat_results), status="ok", error=None,
-        )
+        # 更新 folder 扫描元数据
+        folder.last_scan_at = datetime.now()
+        folder.last_scan_total = len(files)
+        folder.last_scan_imported = imported_count
+        folder.last_scan_skipped = skipped
+        folder.last_scan_failed = failed_count
         db.commit()
-        file_results.append(ScanFileResult(
-            path=path, status="ok", chats=chat_results, error=None,
-        ))
-        imported_count += 1
 
-    # 更新 folder 扫描元数据
-    folder.last_scan_at = datetime.now()
-    folder.last_scan_total = len(files)
-    folder.last_scan_imported = imported_count
-    folder.last_scan_skipped = skipped
-    folder.last_scan_failed = failed_count
-    db.commit()
+        if new_chat_ids:
+            seen: set[str] = set()
+            unique_ids: list[str] = []
+            for cid in new_chat_ids:
+                if cid not in seen:
+                    seen.add(cid)
+                    unique_ids.append(cid)
+            _enqueue_index(unique_ids)
 
-    # 触发后台索引（去重 chat_id）
-    if new_chat_ids:
-        seen = set()
-        unique_ids = []
-        for cid in new_chat_ids:
-            if cid not in seen:
-                seen.add(cid)
-                unique_ids.append(cid)
-        _enqueue_index(unique_ids)
+        _finish_import_progress()
+    except Exception as e:
+        logger.exception("folder_scan worker 失败")
+        _finish_import_progress(error=str(e)[:300])
+    finally:
+        db.close()
 
-    return ScanResult(
-        folder_id=folder.id,
-        folder_path=folder.path,
-        total=len(files),
-        skipped=skipped,
-        imported=imported_count,
-        failed=failed_count,
-        files=file_results,
-    )
+
+@router.post("/folders/{folder_id}/scan")
+async def folder_scan(folder_id: int):
+    """递归扫描绑定目录下的 result.json，导入未处理或 mtime 已变的文件。
+
+    与 ``/api/import`` 一样改成后台任务，前端通过 ``/api/import-progress`` 轮询。
+    """
+    task_id = hashlib.sha256(
+        f"folder-{folder_id}-{datetime.utcnow().isoformat()}".encode()
+    ).hexdigest()[:16]
+    # check + reserve 原子操作，避免 TOCTOU
+    with _import_lock:
+        if _import_progress["running"]:
+            raise HTTPException(409, "已有导入任务在运行，请等其完成后再试")
+        _import_progress.update({
+            "running": True,
+            "task_id": task_id,
+            "kind": "folder_scan",
+            "stage": "parsing",
+            "current_chat_name": "",
+            "current_chat_done": 0,
+            "current_chat_total": 0,
+            "chats_done": 0,
+            "chats_total": 0,
+            "files_done": 0,
+            "files_total": 0,
+            "started_at": datetime.utcnow().isoformat(),
+            "finished_at": None,
+            "results": [],
+            "error": None,
+        })
+
+    asyncio.create_task(asyncio.to_thread(_run_folder_scan, folder_id, task_id))
+
+    return {"status": "started", "task_id": task_id, "folder_id": folder_id}
 
 
 # ---------- Admin: 一次性数据修复 ----------

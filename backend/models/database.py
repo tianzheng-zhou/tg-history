@@ -7,6 +7,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     Float,
+    Index,
     Integer,
     String,
     Text,
@@ -40,6 +41,13 @@ class Message(Base):
     entities = Column(Text)  # JSON: 链接、@提及等
     embedding_id = Column(String)
 
+    __table_args__ = (
+        # 热查询：按 chat 过滤 + 按时间排序（summarizer/qa_tools/_sync_runner 均涉及）
+        Index("ix_messages_chat_date", "chat_id", "date"),
+        # 话题内按时间拉取（embedding._collect_topic_chunks 、qa_tools.tool_fetch_topic_context）
+        Index("ix_messages_topic_date", "topic_id", "date"),
+    )
+
     def set_entities(self, data: list | dict | None):
         self.entities = json.dumps(data, ensure_ascii=False) if data else None
 
@@ -59,6 +67,11 @@ class Topic(Base):
     message_count = Column(Integer, default=0)
     summary = Column(Text)
     category = Column(String)  # tech / business / resource / general
+
+    __table_args__ = (
+        # topic_builder.build_topics_incremental 查 last_old_topic、embedding 全量重建拉取
+        Index("ix_topics_chat_end", "chat_id", "end_date"),
+    )
 
 
 class Import(Base):
@@ -193,8 +206,19 @@ def get_engine():
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragma(dbapi_conn, _):
         cursor = dbapi_conn.cursor()
+        # WAL: 多连接读不阻写
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA foreign_keys=ON")
+        # WAL 下官方推荐：仅在 checkpoint 时 fsync，平常 commit 不阻塞
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        # 64MB 页缓存（负数表示 KB）— 大幅减少热表磁盘读
+        cursor.execute("PRAGMA cache_size=-65536")
+        # 临时表/排序在内存 — 加速 GROUP BY / ORDER BY
+        cursor.execute("PRAGMA temp_store=MEMORY")
+        # 256MB mmap — 让大表走 page cache、减少 read 系统调用
+        cursor.execute("PRAGMA mmap_size=268435456")
+        # 写锁冲突时最多等 30s，避免 burst 并发下出现 SQLITE_BUSY
+        cursor.execute("PRAGMA busy_timeout=30000")
         cursor.close()
 
     return engine

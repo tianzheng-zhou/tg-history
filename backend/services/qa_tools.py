@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime
 
@@ -34,9 +35,10 @@ def _msg_to_dict(m: Message, preview_len: int = 400) -> dict:
 
 async def tool_list_chats(db: Session) -> dict:
     """列出所有已导入的群聊"""
-    imports = db.query(Import).order_by(Import.message_count.desc()).all()
-    return {
-        "chats": [
+
+    def _q():
+        imports = db.query(Import).order_by(Import.message_count.desc()).all()
+        return [
             {
                 "chat_id": i.chat_id,
                 "chat_name": i.chat_name,
@@ -46,7 +48,8 @@ async def tool_list_chats(db: Session) -> dict:
             }
             for i in imports
         ]
-    }
+
+    return {"chats": await asyncio.to_thread(_q)}
 
 
 async def tool_semantic_search(
@@ -102,32 +105,35 @@ async def tool_keyword_search(
     fetch_limit = min(limit * 3, 200)
     from sqlalchemy import text as sa_text
 
-    msgs: list[Message] = []
-    used_method = "fts5"
-    try:
-        rows = db.execute(
-            sa_text("SELECT rowid FROM messages_fts WHERE messages_fts MATCH :kw LIMIT :lim"),
-            {"kw": keyword, "lim": fetch_limit},
-        ).fetchall()
-        if rows:
-            ids = [r[0] for r in rows]
-            q = db.query(Message).filter(Message.id.in_(ids))
-            if chat_ids:
-                q = q.filter(Message.chat_id.in_(chat_ids))
-            msgs = q.order_by(Message.date).all()
-    except Exception as e:
-        used_method = f"fts5_err({type(e).__name__})"
+    def _fts_then_like() -> tuple[list[Message], str]:
+        msgs_local: list[Message] = []
+        method = "fts5"
+        try:
+            rows = db.execute(
+                sa_text("SELECT rowid FROM messages_fts WHERE messages_fts MATCH :kw LIMIT :lim"),
+                {"kw": keyword, "lim": fetch_limit},
+            ).fetchall()
+            if rows:
+                ids = [r[0] for r in rows]
+                q = db.query(Message).filter(Message.id.in_(ids))
+                if chat_ids:
+                    q = q.filter(Message.chat_id.in_(chat_ids))
+                msgs_local = q.order_by(Message.date).all()
+        except Exception as e:
+            method = f"fts5_err({type(e).__name__})"
 
-    # FTS 0 命中 → 用 LIKE 兜底（适配 trigram 不支持的短中文词）
-    if not msgs:
-        used_method = "like"
-        primary_kw = keyword.split(" OR ")[0].split()[0].strip('"').strip()
-        if primary_kw:
-            q = db.query(Message).filter(Message.text_plain.like(f"%{primary_kw}%"))
-            if chat_ids:
-                q = q.filter(Message.chat_id.in_(chat_ids))
-            msgs = q.order_by(Message.date.desc()).limit(fetch_limit).all()
-            msgs.reverse()
+        if not msgs_local:
+            method = "like"
+            primary_kw = keyword.split(" OR ")[0].split()[0].strip('"').strip()
+            if primary_kw:
+                q = db.query(Message).filter(Message.text_plain.like(f"%{primary_kw}%"))
+                if chat_ids:
+                    q = q.filter(Message.chat_id.in_(chat_ids))
+                msgs_local = q.order_by(Message.date.desc()).limit(fetch_limit).all()
+                msgs_local.reverse()
+        return msgs_local, method
+
+    msgs, used_method = await asyncio.to_thread(_fts_then_like)
 
     # rerank：用语义相关性重排候选结果
     reranked = False
@@ -170,12 +176,16 @@ async def tool_fetch_messages(
         return {"messages": [], "count": 0}
 
     limit = min(len(message_ids), 50)
-    msgs = (
-        db.query(Message)
-        .filter(Message.id.in_(message_ids[:limit]))
-        .order_by(Message.date)
-        .all()
-    )
+
+    def _q():
+        return (
+            db.query(Message)
+            .filter(Message.id.in_(message_ids[:limit]))
+            .order_by(Message.date)
+            .all()
+        )
+
+    msgs = await asyncio.to_thread(_q)
     preview_len = 2000 if full_text else 500
     return {
         "messages": [_msg_to_dict(m, preview_len=preview_len) for m in msgs],
@@ -190,17 +200,24 @@ async def tool_fetch_topic_context(
     max_messages: int = 30,
 ) -> dict:
     """获取某话题的完整消息列表（按时间排序）"""
-    topic = db.query(Topic).filter(Topic.id == topic_id).first()
+
+    def _q():
+        topic_local = db.query(Topic).filter(Topic.id == topic_id).first()
+        if not topic_local:
+            return None, []
+        msgs_local = (
+            db.query(Message)
+            .filter(Message.topic_id == topic_id)
+            .order_by(Message.date)
+            .limit(max_messages)
+            .all()
+        )
+        return topic_local, msgs_local
+
+    topic, msgs = await asyncio.to_thread(_q)
     if not topic:
         return {"error": f"话题 {topic_id} 不存在", "messages": []}
 
-    msgs = (
-        db.query(Message)
-        .filter(Message.topic_id == topic_id)
-        .order_by(Message.date)
-        .limit(max_messages)
-        .all()
-    )
     return {
         "topic_id": topic_id,
         "chat_id": topic.chat_id,
@@ -220,12 +237,16 @@ async def tool_search_by_sender(
     limit: int = 50,
 ) -> dict:
     """查询某发言人的消息，可选关键词过滤"""
-    q = db.query(Message).filter(Message.sender.like(f"%{sender}%"))
-    if chat_ids:
-        q = q.filter(Message.chat_id.in_(chat_ids))
-    if keyword:
-        q = q.filter(Message.text_plain.like(f"%{keyword}%"))
-    msgs = q.order_by(Message.date.desc()).limit(limit).all()
+
+    def _q():
+        q = db.query(Message).filter(Message.sender.like(f"%{sender}%"))
+        if chat_ids:
+            q = q.filter(Message.chat_id.in_(chat_ids))
+        if keyword:
+            q = q.filter(Message.text_plain.like(f"%{keyword}%"))
+        return q.order_by(Message.date.desc()).limit(limit).all()
+
+    msgs = await asyncio.to_thread(_q)
     return {
         "results": [_msg_to_dict(m, preview_len=300) for m in msgs],
         "count": len(msgs),
@@ -246,17 +267,20 @@ async def tool_search_by_date(
     except ValueError as e:
         return {"error": f"日期格式错误（应为 YYYY-MM-DD）: {e}", "messages": []}
 
-    msgs = (
-        db.query(Message)
-        .filter(
-            Message.chat_id == chat_id,
-            Message.date >= start_dt,
-            Message.date <= end_dt,
+    def _q():
+        return (
+            db.query(Message)
+            .filter(
+                Message.chat_id == chat_id,
+                Message.date >= start_dt,
+                Message.date <= end_dt,
+            )
+            .order_by(Message.date)
+            .limit(limit)
+            .all()
         )
-        .order_by(Message.date)
-        .limit(limit)
-        .all()
-    )
+
+    msgs = await asyncio.to_thread(_q)
     return {
         "messages": [_msg_to_dict(m, preview_len=300) for m in msgs],
         "count": len(msgs),

@@ -1,5 +1,6 @@
 """RAG 检索与问答引擎"""
 
+import asyncio
 import json
 from pathlib import Path
 from typing import AsyncIterator
@@ -37,23 +38,25 @@ async def _keyword_search(
     chat_ids: list[str] | None = None,
     limit: int = 10,
 ) -> list[Message]:
-    """基于 SQLite FTS5 的关键词搜索"""
-    try:
-        rows = db.execute(
-            text("SELECT rowid FROM messages_fts WHERE messages_fts MATCH :kw LIMIT :lim"),
-            {"kw": keyword, "lim": limit},
-        ).fetchall()
-    except Exception:
-        return []
+    """基于 SQLite FTS5 的关键词搜索（db 部分派 thread）"""
 
-    if not rows:
-        return []
+    def _q() -> list[Message]:
+        try:
+            rows = db.execute(
+                text("SELECT rowid FROM messages_fts WHERE messages_fts MATCH :kw LIMIT :lim"),
+                {"kw": keyword, "lim": limit},
+            ).fetchall()
+        except Exception:
+            return []
+        if not rows:
+            return []
+        ids = [r[0] for r in rows]
+        q = db.query(Message).filter(Message.id.in_(ids))
+        if chat_ids:
+            q = q.filter(Message.chat_id.in_(chat_ids))
+        return q.all()
 
-    ids = [r[0] for r in rows]
-    query = db.query(Message).filter(Message.id.in_(ids))
-    if chat_ids:
-        query = query.filter(Message.chat_id.in_(chat_ids))
-    return query.all()
+    return await asyncio.to_thread(_q)
 
 
 async def _semantic_search(
@@ -71,8 +74,8 @@ async def _semantic_search(
     return results
 
 
-def _get_topic_context(db: Session, message_ids: list[int], max_context: int = 10) -> list[Message]:
-    """获取消息所在话题的上下文"""
+def _get_topic_context_sync(db: Session, message_ids: list[int], max_context: int = 10) -> list[Message]:
+    """获取消息所在话题的上下文（同步版本，供 thread pool 调用）"""
     if not message_ids:
         return []
 
@@ -95,6 +98,11 @@ def _get_topic_context(db: Session, message_ids: list[int], max_context: int = 1
         .all()
     )
     return context_msgs
+
+
+async def _get_topic_context(db: Session, message_ids: list[int], max_context: int = 10) -> list[Message]:
+    """异步 wrapper：同步查询派到 thread，避免阻塞主循环"""
+    return await asyncio.to_thread(_get_topic_context_sync, db, message_ids, max_context)
 
 
 async def answer_question(
@@ -133,9 +141,11 @@ async def answer_question(
         )
 
     # 4. 获取话题上下文
-    context_msgs = _get_topic_context(db, all_msg_ids)
+    context_msgs = await _get_topic_context(db, all_msg_ids)
     if not context_msgs:
-        context_msgs = db.query(Message).filter(Message.id.in_(all_msg_ids)).order_by(Message.date).all()
+        context_msgs = await asyncio.to_thread(
+            lambda: db.query(Message).filter(Message.id.in_(all_msg_ids)).order_by(Message.date).all()
+        )
 
     # 5. 可选：用 Rerank 重排序
     if len(context_msgs) > 5:
@@ -261,10 +271,10 @@ async def answer_question_stream(
         # ---------- 4. 话题上下文扩展 ----------
         yield {"type": "status", "stage": "context_expand",
                "message": f"找到 {len(all_msg_ids)} 条相关消息，正在扩展话题上下文..."}
-        context_msgs = _get_topic_context(db, all_msg_ids)
+        context_msgs = await _get_topic_context(db, all_msg_ids)
         if not context_msgs:
-            context_msgs = (
-                db.query(Message)
+            context_msgs = await asyncio.to_thread(
+                lambda: db.query(Message)
                 .filter(Message.id.in_(all_msg_ids))
                 .order_by(Message.date)
                 .all()
