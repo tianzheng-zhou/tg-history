@@ -20,6 +20,7 @@ import {
   CheckSquare,
   X,
   Network,
+  Clock,
 } from "lucide-react";
 import {
   abortTelegramSync,
@@ -581,7 +582,12 @@ export default function TelegramSync({ onImported }) {
                               )}
                             </div>
                           ) : (
-                            <span className="text-muted-foreground">未导入</span>
+                            <div>
+                              <div className="text-muted-foreground">未导入</div>
+                              {d.last_message_id > 0 && (
+                                <div className="text-amber-600">约 {d.last_message_id.toLocaleString()} 条</div>
+                              )}
+                            </div>
                           )}
                         </td>
                         <td className="px-3 py-2.5 text-xs text-muted-foreground">
@@ -636,48 +642,147 @@ export default function TelegramSync({ onImported }) {
 
           {/* 同步进度面板 */}
           {progress && (progress.running || progress.completed > 0 || progress.results?.length > 0) && (
-            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-              <div className="flex items-center gap-2 mb-2">
-                {progress.running ? (
-                  <Loader2 size={16} className="text-blue-600 animate-spin" />
-                ) : (
-                  <CheckCircle2 size={16} className="text-blue-600" />
-                )}
-                <span className="font-medium text-blue-800 text-sm">
-                  {progress.running
-                    ? `正在拉取 (${progress.completed}/${progress.total})`
-                    : `同步完成 (${progress.completed}/${progress.total})`}
-                  {progress.aborting && <span className="ml-2 text-amber-700">— 正在终止…</span>}
-                </span>
-              </div>
-              <div className="w-full bg-blue-100 rounded-full h-2 mb-2">
-                <div
-                  className="bg-blue-500 h-2 rounded-full transition-all duration-500"
-                  style={{ width: progress.total ? `${(progress.completed / progress.total) * 100}%` : "0%" }}
-                />
-              </div>
-              {progress.running && progress.current_chat_name && (
-                <p className="text-xs text-blue-700">
-                  当前：<span className="font-medium">{progress.current_chat_name}</span>
-                  {" · 已拉取 "}{(progress.current_fetched || 0).toLocaleString()} 条
-                  {" · 已入库 "}{(progress.current_imported || 0).toLocaleString()} 条
-                </p>
-              )}
-              {!progress.running && progress.results?.length > 0 && (
-                <div className="mt-2 max-h-48 overflow-y-auto space-y-0.5">
-                  {progress.results.map((r, i) => (
-                    <p key={i} className={`text-xs ${r.status === "ok" ? "text-green-700" : "text-red-600"}`}>
-                      {r.status === "ok" ? "✓" : "✗"} {r.chat_name}
-                      {r.status === "ok"
-                        ? ` · 新增 ${r.message_count.toLocaleString()} 条`
-                        : ` · ${r.error}`}
-                    </p>
-                  ))}
-                </div>
-              )}
-            </div>
+            <SyncProgressPanel progress={progress} />
           )}
         </>
+      )}
+    </div>
+  );
+}
+
+// ---------- 同步进度面板 ----------
+
+function SyncProgressPanel({ progress }) {
+  // 倒计时本地 tick：仅在 FloodWait 中启动 1Hz interval 重渲染
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!progress?.flood_wait_until) return undefined;
+    const id = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(id);
+  }, [progress?.flood_wait_until]);
+
+  const floodWaitRemaining = useMemo(() => {
+    if (!progress?.flood_wait_until) return 0;
+    const deadline = new Date(progress.flood_wait_until).getTime();
+    if (!Number.isFinite(deadline)) return 0;
+    return Math.max(0, Math.ceil((deadline - now) / 1000));
+  }, [progress?.flood_wait_until, now]);
+
+  // 选择主进度的呈现维度（三档退化 — Phase H）：
+  //   1. grand_total > 0   → 全局消息维度（grand_fetched / grand_total），覆盖所有 chat 总量
+  //   2. current_chat_total > 0 → 当前 chat 消息维度（estimating 期间或 grand_total 估算失败时的兜底）
+  //   3. 否则               → chat 数维度（最弱兜底，旧行为）
+  const useGrandProgress = progress.running && progress.grand_total > 0;
+  const useChatMessageProgress =
+    progress.running && !useGrandProgress && progress.current_chat_total > 0;
+
+  let percent = 0;
+  let primaryLabel = "";
+  if (progress.estimating) {
+    percent = 0;
+    primaryLabel = "正在估算总量…";
+  } else if (useGrandProgress) {
+    const fetched = progress.grand_fetched || 0;
+    const total = progress.grand_total;
+    percent = Math.min(100, (fetched / total) * 100);
+    primaryLabel = `正在拉取 ${fetched.toLocaleString()} / 约 ${total.toLocaleString()} 条`;
+  } else if (useChatMessageProgress) {
+    const fetched = progress.current_fetched || 0;
+    const total = progress.current_chat_total;
+    percent = Math.min(100, (fetched / total) * 100);
+    primaryLabel = `正在拉取 ${fetched.toLocaleString()} / 约 ${total.toLocaleString()} 条`;
+  } else {
+    percent = progress.total
+      ? (progress.completed / progress.total) * 100
+      : 0;
+    primaryLabel = progress.running
+      ? `正在拉取 (${progress.completed}/${progress.total})`
+      : `同步完成 (${progress.completed}/${progress.total})`;
+  }
+
+  return (
+    <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+      <div className="flex items-center gap-2 mb-2">
+        {progress.running ? (
+          <Loader2 size={16} className="text-blue-600 animate-spin" />
+        ) : (
+          <CheckCircle2 size={16} className="text-blue-600" />
+        )}
+        <span className="font-medium text-blue-800 text-sm">
+          {primaryLabel}
+          {progress.aborting && (
+            <span className="ml-2 text-amber-700">— 正在终止…</span>
+          )}
+        </span>
+      </div>
+
+      <div className="w-full bg-blue-100 rounded-full h-2 mb-2">
+        <div
+          className="bg-blue-500 h-2 rounded-full transition-all duration-500"
+          style={{ width: `${percent}%` }}
+        />
+      </div>
+
+      {progress.running && progress.current_chat_name && (
+        <p className="text-xs text-blue-700">
+          当前：
+          <span className="font-medium">{progress.current_chat_name}</span>
+          {" · 已拉取 "}
+          {(progress.current_fetched || 0).toLocaleString()} 条
+          {" · 已入库 "}
+          {(progress.current_imported || 0).toLocaleString()} 条
+          {progress.total > 1 && (
+            <>
+              {" · 群 "}
+              {progress.completed + 1}/{progress.total}
+            </>
+          )}
+        </p>
+      )}
+
+      {/* FloodWait 倒计时横幅 */}
+      {progress.running && progress.flood_wait_until && floodWaitRemaining > 0 && (
+        <div className="mt-2 px-3 py-2 rounded border border-amber-200 bg-amber-50 flex items-center gap-2">
+          <Clock size={14} className="text-amber-600 shrink-0 animate-pulse" />
+          <div className="flex-1 min-w-0">
+            <div className="text-xs font-medium text-amber-800">
+              Telegram 限流中，自动等待 {floodWaitRemaining} 秒后续传...
+            </div>
+            <div className="w-full bg-amber-100 rounded-full h-1 mt-1">
+              <div
+                className="bg-amber-500 h-1 rounded-full transition-all duration-500"
+                style={{
+                  width: progress.flood_wait_seconds
+                    ? `${Math.min(
+                        100,
+                        ((progress.flood_wait_seconds - floodWaitRemaining) /
+                          progress.flood_wait_seconds) *
+                          100
+                      )}%`
+                    : "0%",
+                }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {!progress.running && progress.results?.length > 0 && (
+        <div className="mt-2 max-h-48 overflow-y-auto space-y-0.5">
+          {progress.results.map((r, i) => (
+            <p
+              key={i}
+              className={`text-xs ${
+                r.status === "ok" ? "text-green-700" : "text-red-600"
+              }`}
+            >
+              {r.status === "ok" ? "✓" : "✗"} {r.chat_name}
+              {r.status === "ok"
+                ? ` · 新增 ${r.message_count.toLocaleString()} 条`
+                : ` · ${r.error}`}
+            </p>
+          ))}
+        </div>
       )}
     </div>
   );

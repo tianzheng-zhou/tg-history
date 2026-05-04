@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -66,10 +66,16 @@ _sync_progress: dict[str, Any] = {
     "aborting": False,
     "total": 0,
     "completed": 0,
+    "estimating": False,
+    "grand_total": 0,
+    "grand_fetched": 0,
     "current_chat_id": None,
     "current_chat_name": None,
+    "current_chat_total": 0,
     "current_fetched": 0,
     "current_imported": 0,
+    "flood_wait_until": None,
+    "flood_wait_seconds": 0,
     "results": [],
     "started_at": None,
     "finished_at": None,
@@ -82,10 +88,16 @@ def _reset_progress(total: int) -> None:
         "aborting": False,
         "total": total,
         "completed": 0,
+        "estimating": False,
+        "grand_total": 0,
+        "grand_fetched": 0,
         "current_chat_id": None,
         "current_chat_name": None,
+        "current_chat_total": 0,
         "current_fetched": 0,
         "current_imported": 0,
+        "flood_wait_until": None,
+        "flood_wait_seconds": 0,
         "results": [],
         "started_at": datetime.utcnow(),
         "finished_at": None,
@@ -324,6 +336,38 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
     db = SessionLocal()
     new_chat_ids: list[str] = []
     try:
+        # ---------- 阶段 0：预扫描（Phase H：消息级总进度分母） ----------
+        # 对每个 chat 估算"待拉取条数"，累加成 grand_total，
+        # 让前端主进度条按消息维度显示总体进度（而不是 chat 数维度）。
+        # 串行调（避免对同一账号并发触发 FloodWait），每 chat ~200ms：
+        #   - 100 个群 ≈ 20 秒预扫描，可接受
+        #   - 单个 chat ≈ 0.2 秒，几乎无感
+        _sync_progress["estimating"] = True
+        pre_estimates: dict[str, int] = {}
+        for cid in chat_ids:
+            if _sync_progress.get("aborting"):
+                break
+
+            def _local_min(cid_=cid) -> int:
+                offset = _stable_id_offset(cid_)
+                row = (
+                    db.query(func.max(Message.id))
+                    .filter(Message.chat_id == cid_)
+                    .scalar()
+                )
+                return max(0, (row or 0) - offset) if row else 0
+
+            local_min = await asyncio.to_thread(_local_min)
+            try:
+                remote_max = await tg.get_chat_remote_max_id(api_id, api_hash, cid)
+            except Exception:
+                remote_max = 0
+            est = max(0, remote_max - local_min) if remote_max > local_min else 0
+            pre_estimates[cid] = est
+            _sync_progress["grand_total"] = sum(pre_estimates.values())
+        _sync_progress["estimating"] = False
+
+        # ---------- 阶段 1：实际同步 ----------
         for cid in chat_ids:
             if _sync_progress.get("aborting"):
                 break
@@ -368,12 +412,33 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
                         db.commit()
                     await asyncio.to_thread(_persist_name)
 
+            # 复用阶段 0 预扫描的估算（Phase H）：避免对同一 chat 重复调 API
+            estimated_total = pre_estimates.get(cid, 0)
+
             _sync_progress.update({
                 "current_chat_id": cid,
                 "current_chat_name": chat_name,
+                "current_chat_total": estimated_total,
                 "current_fetched": 0,
                 "current_imported": 0,
+                "flood_wait_until": None,
+                "flood_wait_seconds": 0,
             })
+
+            # FloodWait 回调：iter_chat_messages 在被限流时调用
+            #   wait > 0：开始等待 wait 秒 → 写 flood_wait_until + flood_wait_seconds
+            #   wait == 0：等待结束 → 清空
+            def _on_flood_wait(wait: int) -> None:
+                if wait > 0:
+                    # 用 timezone-aware UTC，保证 Pydantic 序列化时带 +00:00 后缀
+                    # → 前端 new Date() 能按 UTC 正确解析
+                    _sync_progress["flood_wait_until"] = (
+                        datetime.now(timezone.utc) + timedelta(seconds=wait)
+                    )
+                    _sync_progress["flood_wait_seconds"] = wait
+                else:
+                    _sync_progress["flood_wait_until"] = None
+                    _sync_progress["flood_wait_seconds"] = 0
 
             batch: list[dict] = []
             min_dt: datetime | None = None
@@ -386,8 +451,11 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
                     api_id, api_hash, cid,
                     min_id=min_id,
                     abort_check=lambda: _sync_progress.get("aborting", False),
+                    on_flood_wait=_on_flood_wait,
                 ):
                     _sync_progress["current_fetched"] = _sync_progress.get("current_fetched", 0) + 1
+                    # 跨 chat 累加（Phase H）：让前端主进度条能按消息维度显示总进度
+                    _sync_progress["grand_fetched"] = _sync_progress.get("grand_fetched", 0) + 1
                     batch.append(converted)
                     dt = converted.get("date")
                     if dt:
@@ -417,9 +485,10 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
 
                 # 正常走完：剩余 batch 在下方统一 flush（避免与 except 分支重复）
             except FloodWaitError as e:
-                # Telethon 不会自动 sleep > 60s 的等待 —— 直接报错给前端
-                error = f"Telegram 限流，需等待 {e.seconds} 秒"
-                logger.warning("FloodWait on %s: %ds", cid, e.seconds)
+                # 兜底：iter_chat_messages 已经会自动 sleep ≤ flood_wait_max（30 分钟）的限流；
+                # 走到这里说明等待时间超过上限，让用户知道并继续下一个 chat
+                error = f"Telegram 限流，需等待 {e.seconds} 秒（超过自动等待上限）"
+                logger.warning("FloodWait on %s: %ds（超过上限放弃）", cid, e.seconds)
             except Exception as e:
                 error = str(e)[:300]
                 logger.exception("同步 %s 失败", cid)
@@ -462,9 +531,13 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
 
     finally:
         _sync_progress["running"] = False
+        _sync_progress["estimating"] = False
         _sync_progress["finished_at"] = datetime.utcnow()
         _sync_progress["current_chat_id"] = None
         _sync_progress["current_chat_name"] = None
+        _sync_progress["current_chat_total"] = 0
+        _sync_progress["flood_wait_until"] = None
+        _sync_progress["flood_wait_seconds"] = 0
         db.close()
 
     # 触发后台索引构建（去重）

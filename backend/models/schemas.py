@@ -389,10 +389,16 @@ class TelegramSyncProgress(BaseModel):
     aborting: bool = False
     total: int = 0                            # 待同步 chat 数
     completed: int = 0                        # 已完成 chat 数
+    estimating: bool = False                  # 是否在做开局总量预扫描
+    grand_total: int = 0                      # 所有勾选 chat 的预估待拉取消息总数（0 = 未估算/未知）
+    grand_fetched: int = 0                    # 所有 chat 累计已拉取消息数（跨 chat 累加）
     current_chat_id: str | None = None
     current_chat_name: str | None = None
+    current_chat_total: int = 0               # 当前 chat 预估待拉取条数（0 = 未知）
     current_fetched: int = 0                  # 当前 chat 已拉取条数
     current_imported: int = 0                 # 当前 chat 累计入库条数
+    flood_wait_until: datetime | None = None  # FloodWait 等待截止时间（UTC）；非空表示正在限流等待
+    flood_wait_seconds: int = 0               # 本次 FloodWait 总秒数（用于 UI 倒计时分母）
     results: list[dict] = []                  # 每个 chat 完成后追加 {chat_id, chat_name, status, message_count, error?}
     started_at: datetime | None = None
     finished_at: datetime | None = None

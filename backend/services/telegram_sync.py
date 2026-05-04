@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 
 from telethon import TelegramClient
 from telethon.errors import (
+    FloodWaitError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
     PhoneNumberInvalidError,
@@ -625,25 +626,43 @@ async def iter_chat_messages(
     *,
     min_id: int = 0,
     on_progress: Optional[Callable[[int], Awaitable[None] | None]] = None,
+    on_flood_wait: Optional[Callable[[int], Awaitable[None] | None]] = None,
     abort_check: Optional[Callable[[], bool]] = None,
-    max_retries: int = 3,
+    max_retries: int = 10,
+    flood_wait_max: int = 1800,
 ):
     """异步生成器：迭代某个 chat 的消息（id > min_id），按 id 升序。
 
     每条 yield 的是 ``convert_message`` 输出的 dict（已跳过 None）。
-    on_progress(fetched_count) 每 50 条调一次。
-    abort_check() 返回 True 时立刻停止。
 
-    对于大群聊（几万条消息），iter_messages 持续数分钟时 MTProto 连接
-    可能被服务器/代理主动关闭 → telethon 抛 ConnectionError。
-    本函数会**断点续传**：记录 last_id，断线后自动重连并从 last_id 继续。
-    最多重试 ``max_retries`` 次，每次间隔 2/4/8 秒（指数退避）。
+    回调：
+      - on_progress(fetched_count) 每 50 条调一次。
+      - on_flood_wait(seconds) 在被 Telegram 限流时调一次（>0 表示开始等待，0 表示等完）。
+      - abort_check() 返回 True 时立刻停止。
+
+    自动恢复策略：
+      1. **FloodWait（限流）**：自动 sleep 服务器要求的秒数 + 2 秒缓冲，然后续传。
+         不消耗 retry 预算（限流是 Telegram 正常节流，不算错误）。
+         若要求等待 > ``flood_wait_max`` 秒（默认 30 分钟）则放弃并抛出。
+      2. **ConnectionError / OSError / TimeoutError**：把 client 主动断开后指数退避重连
+         （2/4/8/16/32/60 秒，最多 ``max_retries`` 次）。
+
+    断点续传：记录已 yield 的最大 last_id，每次重新 ``iter_messages(min_id=last_id)``，
+    既不会重复也不会跳过。
     """
     import asyncio as _asyncio
 
     fetched = 0
-    last_id = min_id  # 已成功 yield 的最大 message id（断线续传基准）
+    last_id = min_id  # 已成功 yield 的最大 message id（断线/限流续传基准）
     attempt = 0
+    client: TelegramClient | None = None
+
+    async def _maybe_call(cb, *args):
+        if cb is None:
+            return
+        res = cb(*args)
+        if hasattr(res, "__await__"):
+            await res
 
     while True:
         try:
@@ -666,10 +685,36 @@ async def iter_chat_messages(
                 if converted is not None:
                     yield converted
                 if on_progress and fetched % 50 == 0:
-                    res = on_progress(fetched)
-                    if hasattr(res, "__await__"):
-                        await res
+                    await _maybe_call(on_progress, fetched)
             return  # 正常走完
+        except FloodWaitError as e:
+            # Telegram 限流 → 自动等待（不计入 attempt）
+            wait = max(int(getattr(e, "seconds", 0) or 0), 1) + 2
+            if wait > flood_wait_max:
+                logger.error(
+                    "iter_messages(%s) FloodWait 要求等待 %ds，超过上限 %ds，放弃",
+                    chat_id, wait, flood_wait_max,
+                )
+                raise
+            logger.warning(
+                "iter_messages(%s) FloodWait %ds @ msg_id=%d，自动等待后续传...",
+                chat_id, wait, last_id,
+            )
+            await _maybe_call(on_flood_wait, wait)
+            try:
+                # FloodWait 期间也要响应 abort（按秒分片 sleep）
+                slept = 0
+                while slept < wait:
+                    if abort_check and abort_check():
+                        return
+                    step = min(1, wait - slept)
+                    await _asyncio.sleep(step)
+                    slept += step
+            finally:
+                # 通知 UI 等待结束
+                await _maybe_call(on_flood_wait, 0)
+            # 不 disconnect 也不 reset auth cache —— 继续 while 循环重启 iter_messages(min_id=last_id)
+            continue
         except (ConnectionError, OSError, _asyncio.TimeoutError) as e:
             attempt += 1
             if attempt > max_retries:
@@ -678,14 +723,14 @@ async def iter_chat_messages(
                     chat_id, max_retries, e,
                 )
                 raise
-            delay = min(2 ** attempt, 10)
+            delay = min(2 ** attempt, 60)
             logger.warning(
                 "iter_messages(%s) 断开于 msg_id=%d（%s），%ds 后第 %d/%d 次重连续传...",
                 chat_id, last_id, str(e)[:100], delay, attempt, max_retries,
             )
             # 主动断开旧连接让下次循环重建（避免 telethon 内部状态卡住）
             try:
-                if client.is_connected():
+                if client is not None and client.is_connected():
                     await client.disconnect()
             except Exception:
                 pass
@@ -738,6 +783,32 @@ async def get_chat_display_name(api_id: int, api_hash: str, chat_id: str) -> str
     except Exception as e:
         logger.warning("get_chat_display_name(%s) 失败: %s", chat_id, e)
         return chat_id
+
+
+async def get_chat_remote_max_id(api_id: int, api_hash: str, chat_id: str) -> int:
+    """取对端 chat 的最新一条消息 id。失败/无消息返回 0。
+
+    用途：同步前估算"待拉取条数 = remote_max - local_max"，给前端进度条提供分母。
+    一次 API call（``iter_messages(limit=1, reverse=False)``），网络开销 ~200ms，
+    被 FloodWait 时直接失败回 0（让进度按未知处理，不阻塞同步主流程）。
+    """
+    try:
+        client = await get_client(api_id, api_hash)
+        if not client.is_connected():
+            await client.connect()
+        if not await client.is_user_authorized():
+            return 0
+        entity = await _resolve_entity(client, chat_id)
+        # iter_messages 默认按时间倒序，取第一条 = 最新
+        async for tl_msg in client.iter_messages(entity, limit=1):
+            return int(getattr(tl_msg, "id", 0) or 0)
+        return 0
+    except FloodWaitError:
+        # 被限流就不估算了，让 UI 显示"未知"分母而不是阻塞主同步
+        return 0
+    except Exception as e:
+        logger.warning("get_chat_remote_max_id(%s) 失败: %s", chat_id, e)
+        return 0
 
 
 def date_range_string(min_dt: Optional[datetime], max_dt: Optional[datetime]) -> str:
