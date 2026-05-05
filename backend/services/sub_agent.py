@@ -34,7 +34,11 @@ _CHARS_PER_TOKEN = 1.8  # 中英混合粗估
 # 子 Agent 可用的工具：
 # - 排除 research（防递归）
 # - 排除 artifact 工具（它们是 Orchestrator 的最终交付职责，且需 session 上下文）
-_SUB_EXCLUDED_TOOLS = {"research", "create_artifact", "update_artifact", "rewrite_artifact"}
+_SUB_EXCLUDED_TOOLS = {
+    "research",
+    "create_artifact", "update_artifact", "rewrite_artifact",
+    "list_artifacts", "read_artifact",
+}
 SUB_TOOL_SCHEMAS = [t for t in TOOL_SCHEMAS if t["function"]["name"] not in _SUB_EXCLUDED_TOOLS]
 
 # filters 会被自动注入到这些检索类工具的 args 里（若 args 没显式给该字段）
@@ -240,6 +244,8 @@ def _build_user_prompt(
     """构造子 Agent 首轮 user 消息内容。
 
     结构：
+      [系统提示：当前时间是 ...]   # 自动注入，帮子 Agent 处理相对时间表达
+
       [Task]
       <task>
 
@@ -252,7 +258,10 @@ def _build_user_prompt(
       [Expected Output] # 可选
       <expected_output>
     """
-    parts: list[str] = [f"[Task]\n{task}"]
+    # 延迟 import 避免循环依赖
+    from backend.services.qa_agent import build_current_time_hint
+
+    parts: list[str] = [build_current_time_hint(), f"\n[Task]\n{task}"]
     if scope:
         parts.append(f"\n[Scope]\n{scope}")
     if filters:

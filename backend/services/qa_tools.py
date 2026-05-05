@@ -789,6 +789,96 @@ async def tool_rewrite_artifact(
     }
 
 
+async def tool_list_artifacts(
+    db: Session,
+    *,
+    session_id: str,
+) -> dict:
+    """列出当前 session 已有的所有 artifacts（仅元数据 + 正文预览，不返回完整内容）。
+
+    用途：
+    - Agent 想知道之前创建过哪些 artifact、避免重复建同主题
+    - update / rewrite 之前先 list 确认 key 拼写
+    """
+    if not session_id:
+        return {"error": "list_artifacts 需要在会话上下文中调用"}
+
+    def _do():
+        arts = artifact_service.list_artifacts(db, session_id)
+        result = []
+        for art in arts:
+            ver = artifact_service.get_version(db, art.id)
+            preview = ""
+            content_length = 0
+            if ver and ver.content:
+                content_length = len(ver.content)
+                preview = ver.content[:200] + ("..." if content_length > 200 else "")
+            result.append({
+                "artifact_key": art.artifact_key,
+                "title": art.title,
+                "current_version": art.current_version,
+                "content_length": content_length,
+                "preview": preview,
+                "updated_at": art.updated_at.isoformat() if art.updated_at else None,
+            })
+        return result
+
+    items = await asyncio.to_thread(_do)
+    return {
+        "ok": True,
+        "count": len(items),
+        "artifacts": items,
+    }
+
+
+async def tool_read_artifact(
+    db: Session,
+    *,
+    session_id: str,
+    artifact_key: str,
+    version: int | None = None,
+) -> dict:
+    """读取指定 artifact 的完整内容（指定 version=None 则取最新）。
+
+    用途：
+    - 在 update_artifact 之前查看现有正文（确定 old_str 锚点）
+    - 在用户问"之前的 artifact 写了什么"时复盘
+    - 在新 research 之前看历史结论避免重复劳动
+    """
+    if not session_id:
+        return {"error": "read_artifact 需要在会话上下文中调用"}
+
+    def _do():
+        art = artifact_service.get_artifact(db, session_id, artifact_key)
+        if art is None:
+            return None, None
+        ver = artifact_service.get_version(db, art.id, version)
+        return art, ver
+
+    art, ver = await asyncio.to_thread(_do)
+    if art is None:
+        return {
+            "error": f"artifact '{artifact_key}' 不存在",
+            "code": "not_found",
+            "suggestion": "用 list_artifacts 看看现有 key；或如果是新主题，用 create_artifact 新建",
+        }
+    if ver is None:
+        return {
+            "error": f"artifact '{artifact_key}' 没有 version={version}",
+            "code": "version_not_found",
+        }
+    return {
+        "ok": True,
+        "artifact_key": art.artifact_key,
+        "title": art.title,
+        "version": ver.version,
+        "current_version": art.current_version,
+        "content_length": len(ver.content),
+        "content": ver.content,
+        "updated_at": art.updated_at.isoformat() if art.updated_at else None,
+    }
+
+
 # ---------------------- Tool schemas（OpenAI function calling） ----------------------
 
 TOOL_SCHEMAS = [
@@ -1163,6 +1253,48 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_artifacts",
+            "description": (
+                "列出当前 session 已有的所有 artifacts（仅元数据 + 正文预览 200 字符，不返回完整内容）。\n"
+                "**何时用**：\n"
+                "- session 启动时已经在 user message 注入了 artifacts 摘要——一般不需要再调用本工具\n"
+                "- 但如果你刚 create/update 了一篇、想确认状态、或忘了之前的 key 拼写时调用\n"
+                "返回字段：artifact_key / title / current_version / content_length / preview / updated_at"
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_artifact",
+            "description": (
+                "读取指定 artifact 的完整正文。\n"
+                "**何时用**：\n"
+                "- update_artifact 之前需要查看现有正文（确定 old_str 锚点的精确文本）\n"
+                "- 用户问'之前的报告里 X 那部分是怎么写的'\n"
+                "- 想基于已有 artifact 拓展（不重复劳动）\n"
+                "**注意**：完整正文可能很长（5K~30K tokens），不需要时不要随便调；优先用 list_artifacts 的 preview"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "artifact_key": {
+                        "type": "string",
+                        "description": "要读取的 artifact 的 key",
+                    },
+                    "version": {
+                        "type": "integer",
+                        "description": "可选：历史版本号（≥1）。不传则取最新版本",
+                    },
+                },
+                "required": ["artifact_key"],
+            },
+        },
+    },
 ]
 
 
@@ -1186,6 +1318,8 @@ ARTIFACT_TOOL_HANDLERS = {
     "create_artifact": tool_create_artifact,
     "update_artifact": tool_update_artifact,
     "rewrite_artifact": tool_rewrite_artifact,
+    "list_artifacts": tool_list_artifacts,
+    "read_artifact": tool_read_artifact,
 }
 
 

@@ -21,13 +21,14 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator
 
 from sqlalchemy.orm import Session
 
 from backend.config import settings
 from backend.models.database import Message
-from backend.services import llm_adapter
+from backend.services import artifact_service, llm_adapter
 from backend.services.qa_tools import TOOL_SCHEMAS, dispatch_tool
 
 # Orchestrator 拥有全部工具：简单查询直接搜，复杂调研走子 Agent
@@ -238,10 +239,22 @@ SYSTEM_PROMPT = """你是一个 Telegram 聊天记录分析的智能助手（Orc
 
 **例外**：用户明确说"快速告诉我" / "TL;DR" / "一句话回答" 时不用 artifact。单点事实也不用。
 
-**工具**：
-- **create_artifact**(artifact_key, title, content)
-- **update_artifact**(artifact_key, old_str, new_str) — old_str 必须在正文**恰好出现一次**
-- **rewrite_artifact**(artifact_key, content[, title]) — 整体重写（代价大）
+### ✨ session 启动时已注入 artifacts 摘要
+**每次对话开始时**，user message 前缀会自动注入"## 当前 session 已有 artifacts (N 篇)"
+段——你启动就能看到当前 session 有哪些 artifacts（key / title / 字符数 / 预览）。
+**用户的新问题如果与某个已有 artifact 同主题，优先 update / rewrite，不要建重复主题的新 artifact**。
+
+### 工具
+- **create_artifact**(artifact_key, title, content) — 新建（key 同 session 不可重复）
+- **update_artifact**(artifact_key, old_str, new_str) — 增量修改，old_str 必须在正文**恰好出现一次**
+- **rewrite_artifact**(artifact_key, content[, title]) — 整体重写（代价大、慎用）
+- **list_artifacts**() — 列当前 session 所有 artifacts（启动注入摘要后一般不必再调）
+- **read_artifact**(artifact_key, version?) — 读完整正文（update 前确定锚点 / 查看历史结论时用）
+
+**判断同主题 vs 新主题的标准**：
+- 用户问"在原报告里加 X"、"修一下"、"补充 Y" → **update / rewrite 已有 artifact**
+- 用户问完全新方向（不同群聊、不同主题）→ **create 新 artifact**（用不同 key）
+- 不确定时先 `read_artifact(key)` 看现有内容再决定
 
 同一 session 可以有多篇 artifact（独立主题分开建，artifact_key 用英文小写 slug）。
 小改动优先 update，大重构才用 rewrite。
@@ -401,6 +414,71 @@ async def _stream_llm_step(
     yield {"type": "done"}
 
 
+_BEIJING_TZ = timezone(timedelta(hours=8))
+_WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+def build_current_time_hint() -> str:
+    """生成 '[系统提示：当前时间是 2026-05-05 14:05（周一，北京时间 UTC+8）]' 的注入行。
+
+    让 agent 能处理相对时间表达（"最近一周"、"这个月"）——它没有时钟。
+    同时让 agent 选日期过滤器时有参考点。
+    """
+    now = datetime.now(_BEIJING_TZ)
+    return (
+        f"[系统提示：当前时间是 {now.strftime('%Y-%m-%d %H:%M')}"
+        f"（{_WEEKDAY_CN[now.weekday()]}，北京时间 UTC+8）]"
+    )
+
+
+def _build_artifact_summary(db: Session, session_id: str | None) -> str:
+    """构造当前 session 已有 artifacts 的摘要，注入到 user message 前缀。
+
+    让 agent 启动时就知道有什么 artifacts，避免：
+      - 重复创建同主题的新 artifact
+      - 在 update 时不知道现有 key 拼写
+      - 用户问"上次的报告"时一脸茫然
+
+    返回格式（仅 ≤ 5 篇时全展开；更多时只列 key+title）：
+      ## 当前 session 已有 artifacts (N 篇)
+      - `key1` v3 — 标题1 (1234 字符) — 预览：...
+      - `key2` v1 — 标题2 (567 字符) — 预览：...
+
+    无 session_id 或无 artifacts 时返回空串。
+    """
+    if not session_id:
+        return ""
+    try:
+        arts = artifact_service.list_artifacts(db, session_id)
+    except Exception:
+        return ""
+    if not arts:
+        return ""
+
+    lines = [f"## 当前 session 已有 artifacts ({len(arts)} 篇)"]
+    show_preview = len(arts) <= 5
+    for art in arts:
+        try:
+            ver = artifact_service.get_version(db, art.id)
+        except Exception:
+            ver = None
+        content_len = len(ver.content) if ver and ver.content else 0
+        line = f"- `{art.artifact_key}` v{art.current_version} — {art.title} ({content_len} 字符)"
+        if show_preview and ver and ver.content:
+            preview = ver.content[:120].replace("\n", " ").strip()
+            if len(ver.content) > 120:
+                preview += "..."
+            line += f" — 预览：{preview}"
+        lines.append(line)
+
+    lines.append(
+        "\n**重要规则**：用户的新问题如果与某个已有 artifact **同主题**，"
+        "优先用 `update_artifact` 或 `rewrite_artifact` 修改它，**不要建重复主题的新 artifact**。"
+        "需要看完整内容时调用 `read_artifact(artifact_key=...)`。"
+    )
+    return "\n".join(lines)
+
+
 async def run_agent(
     db: Session,
     question: str,
@@ -415,6 +493,9 @@ async def run_agent(
             缺失时这些工具会返回 ``no_session`` 错误（不会让整个 agent 崩）。
     """
     # 构造 user 消息；如果指定了 chat_ids，注入上下文
+    # 注意：时间戳和 artifact 摘要的注入发生在上游 run_registry._run_worker 中
+    #（那边同时写入 DB + 传给这里），目的是让保存的历史和传给 LLM 的一致，
+    # 从而前缀缓存能覆盖整段历史。这里不要重复注入。
     user_content = question
     if chat_ids:
         user_content += f"\n\n[用户限定只在这些群聊 chat_id 中检索: {json.dumps(chat_ids, ensure_ascii=False)}]"

@@ -18,7 +18,11 @@ from typing import AsyncIterator
 
 from backend.models.database import SessionLocal
 from backend.services import session_service
-from backend.services.qa_agent import run_agent
+from backend.services.qa_agent import (
+    _build_artifact_summary,
+    build_current_time_hint,
+    run_agent,
+)
 from backend.services.rag_engine import answer_question_stream
 
 
@@ -286,7 +290,23 @@ async def _run_worker(run: Run) -> None:
     try:
         run.status = "running"
 
-        # 读取 session 现有 history（不含当前 question）——此时 user turn 还未 append
+        # 构造 **agent 模式** 的注入前缀（时间戳 + 当前 artifacts 快照）。
+        # 这段前缀**不落到 ChatTurn.content**（content 保持干净的原始 question），
+        # 而是存到 meta["injected_prefix"] —— LLM 看到的 user content 会由
+        # `get_history_messages` 在重放时用 prefix+content 拼出。
+        # 这样：
+        #   1. 前端 / 搜索 / 导出 / 标题生成 都用 content（纯净的用户问题）
+        #   2. LLM 历史重放时拿到 `prefix+content`，和上次传给 LLM 的一致 → 前缀缓存命中
+        #   3. artifact 摘要是"当时"的快照，事后不变 → 缓存稳定
+        injected_prefix = ""
+        if run.mode == "agent":
+            parts: list[str] = [build_current_time_hint()]
+            artifact_summary = _build_artifact_summary(db, run.session_id)
+            if artifact_summary:
+                parts.append(artifact_summary)
+            injected_prefix = "\n\n---\n\n".join(parts)
+
+        # 读取 session 现有 history（含历史的 injected_prefix）——此时 user turn 还未 append
         history = session_service.get_history_messages(db, run.session_id)
 
         # 先把 user turn 落库，这样前端即使中途断开也能看到自己的问题
@@ -295,13 +315,21 @@ async def _run_worker(run: Run) -> None:
                 db,
                 run.session_id,
                 role="user",
-                content=run.question,
+                content=run.question,  # 纯净的用户问题
                 mode=run.mode,
-                meta={"run_id": run.id},
+                meta={
+                    "run_id": run.id,
+                    **({"injected_prefix": injected_prefix} if injected_prefix else {}),
+                },
             )
         except Exception:
             traceback.print_exc()
             db.rollback()
+
+        # 当前轮传给 LLM 的 user content = 前缀 + 原始 question
+        augmented_user_content = (
+            f"{injected_prefix}\n\n---\n\n{run.question}" if injected_prefix else run.question
+        )
 
         if run.mode == "rag":
             async for ev in answer_question_stream(
@@ -324,7 +352,7 @@ async def _run_worker(run: Run) -> None:
         else:  # agent
             async for ev in run_agent(
                 db=db,
-                question=run.question,
+                question=augmented_user_content,
                 chat_ids=run.chat_ids,
                 history=history if history else None,
                 session_id=run.session_id,

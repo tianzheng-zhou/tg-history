@@ -291,12 +291,24 @@ def get_history_messages(db: Session, session_id: str) -> list[dict]:
     """返回给 agent 用的对话历史（仅 role + content，忽略 trajectory）。
 
     不含当前正在生成的 turn（调用此函数时尚未追加）。
+
+    **前缀缓存关键**：user turn 的 content 只存纯净的用户问题，
+    但 LLM 看到的 user message 实际是 `meta.injected_prefix + content`
+    （时间戳 + artifact 快照等注入信息）。这里重放历史时**重新拼出那份内容**，
+    保证和上一轮提交给 LLM 的 user message 完全一致，从而前缀缓存能命中。
     """
     turns = get_turns(db, session_id)
     result: list[dict] = []
     for t in turns:
-        if t.role in ("user", "assistant") and t.content:
-            result.append({"role": t.role, "content": t.content})
+        if t.role not in ("user", "assistant") or not t.content:
+            continue
+        content = t.content
+        if t.role == "user":
+            meta = _parse_json(t.meta) or {}
+            prefix = meta.get("injected_prefix")
+            if prefix:
+                content = f"{prefix}\n\n---\n\n{content}"
+        result.append({"role": t.role, "content": content})
     return result
 
 
