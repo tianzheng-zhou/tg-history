@@ -65,6 +65,89 @@ def is_kimi_model(model: str) -> bool:
     return model.startswith("kimi-") or model.startswith("kimi/")
 
 
+def is_qwen_model(model: str) -> bool:
+    """判断是否为 Qwen 系列模型（DashScope 兼容协议、支持 cache_control）"""
+    return model.startswith("qwen") or model.startswith("qvq") or model.startswith("qwq")
+
+
+# 显式缓存最小阈值：阿里云要求 ≥1024 token 才会真正建缓存块
+# 用 char 数估算：CHARS_PER_TOKEN ≈ 1.8（中英混合）→ 1024 token ≈ 1843 char
+CACHE_CONTROL_MIN_CHARS = 1843
+
+
+def inject_cache_control(messages: list[dict]) -> list[dict]:
+    """给 messages 列表的最后一条 content 非空消息打 cache_control 标记。
+
+    用于 Qwen 系列模型的显式缓存：从 messages 开头到被标记位置（含）的所有内容
+    会作为一个 ephemeral 缓存块，5 分钟内可命中（命中后续期）。
+
+    实现要点：
+    - **不修改原列表**，返回新列表（仅最后一条消息被替换）
+    - 把 content 从 string 升级为 [{"type":"text","text":"...","cache_control":{...}}]
+    - 已经是 array 格式的 content 也兼容（取第一个 text 项追加 cache_control）
+    - 估算总字符数 < CACHE_CONTROL_MIN_CHARS 时不打（避免浪费 1.25× 创建费）
+    - 找不到合适锚点（最后一条消息 content 为空）时退化为不打
+    """
+    if not messages:
+        return messages
+
+    # 估算总字符数（粗略）
+    total_chars = 0
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            total_chars += len(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict):
+                    total_chars += len(part.get("text", "") or "")
+        tcs = m.get("tool_calls")
+        if tcs:
+            try:
+                import json as _json
+                total_chars += len(_json.dumps(tcs, ensure_ascii=False))
+            except Exception:
+                pass
+    if total_chars < CACHE_CONTROL_MIN_CHARS:
+        return messages
+
+    # 找最后一条 content 非空的消息（优先 tool / assistant，其次 user / system）
+    target_idx: int | None = None
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        content = m.get("content")
+        if isinstance(content, str) and content.strip():
+            target_idx = i
+            break
+        if isinstance(content, list) and content:
+            target_idx = i
+            break
+    if target_idx is None:
+        return messages
+
+    # 构造新列表（只复制被改的那条消息）
+    new_messages = list(messages)
+    target = dict(new_messages[target_idx])
+    content = target.get("content")
+    if isinstance(content, str):
+        target["content"] = [
+            {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+        ]
+    elif isinstance(content, list) and content:
+        # 已经是 array 格式：在第一个 text 段加 cache_control（保留其他段）
+        new_parts = []
+        marked = False
+        for part in content:
+            if not marked and isinstance(part, dict) and part.get("type") == "text":
+                new_parts.append({**part, "cache_control": {"type": "ephemeral"}})
+                marked = True
+            else:
+                new_parts.append(part)
+        target["content"] = new_parts
+    new_messages[target_idx] = target
+    return new_messages
+
+
 def _is_dashscope_kimi(model: str) -> bool:
     """判断是否为百炼直供 Kimi（kimi/ 前缀，走 DashScope client）"""
     return model.startswith("kimi/")
@@ -148,21 +231,31 @@ def get_context_window(model: str) -> int:
 #
 # 数据来源：https://help.aliyun.com/zh/model-studio/model-pricing（2026-05 时点）
 # (input, output, cached_input)  —— cached_input 为 0 表示不支持/无折扣
+# 注：cached_input 列对 Qwen 系列填的是 **显式缓存命中价**（输入单价 × 10%）；
+# 隐式缓存命中按 20% 算，但 DashScope 实测 qwen 隐式命中率近 0%，因此 P0.6
+# 接入 cache_control 后实际命中走的是显式缓存。kimi 系列不支持 cache_control，
+# 走自家隐式缓存，价格已在表里给出（百炼直供 16.9% / 17.5%；moonshot 官方无折扣）。
 MODEL_PRICING: dict[str, tuple[float, float, float]] = {
     # 百炼直供 Kimi（隐式缓存）
     "kimi/kimi-k2.6": (6.5, 27.0, 6.5 * 0.169),   # 缓存 16.9%
     "kimi/kimi-k2.5": (4.0, 21.0, 4.0 * 0.175),    # 缓存 17.5%
-    # 阿里云部署 Kimi
+    # 阿里云部署 Kimi（不支持 cache_control，无折扣）
     "kimi-k2.6": (6.5, 27.0, 0),
     "kimi-k2.5": (4.0, 21.0, 0),
-    # Qwen Plus
-    "qwen3.6-plus": (2.0, 12.0, 0),
-    "qwen3.5-plus": (0.8, 4.8, 0),
-    "qwen-plus": (0.8, 2.0, 0),
-    # Qwen Flash
-    "qwen3.5-flash": (0.0, 0.0, 0),   # 免费
-    "qwen-flash": (0.0, 0.0, 0),
-    # Embedding / Rerank
+    # Qwen Plus（cached = 显式缓存命中价 = 输入 × 10%）
+    "qwen3.6-plus": (2.0, 12.0, 2.0 * 0.1),
+    "qwen3.5-plus": (0.8, 4.8, 0.8 * 0.1),
+    "qwen-plus": (0.8, 2.0, 0.8 * 0.1),
+    # Qwen Flash（有 100 万 Token 免费额度，用完后按阶梯计费，这里取 ≤128K 最低档）
+    # qwen3.5-flash 完整阶梯：≤128K 0.2/2；128K~256K 0.8/8；256K~1M 1.2/12
+    # qwen-flash   完整阶梯：≤128K 0.15/1.5；128K~256K 0.6/6；256K~1M 1.2/12
+    "qwen3.5-flash": (0.2, 2.0, 0.2 * 0.1),
+    "qwen-flash": (0.15, 1.5, 0.15 * 0.1),
+    # Qwen Max（阶梯价，这里取 ≤32K 最低档；超长请求会低估费用，可接受）
+    # 完整阶梯：0<Token≤32K 2.5/10；32K<Token≤128K 4/16；128K<Token≤252K 7/28
+    "qwen3-max": (2.5, 10.0, 2.5 * 0.1),
+    "qwen-max": (2.5, 10.0, 2.5 * 0.1),
+    # Embedding / Rerank（不涉及缓存）
     "text-embedding-v4": (0.5, 0, 0),
     "text-embedding-v3": (0.5, 0, 0),
     "qwen3-rerank": (0.5, 0, 0),
@@ -181,13 +274,16 @@ def _match_pricing(model: str) -> tuple[float, float, float]:
 
 
 def parse_usage(usage) -> dict:
-    """从 OpenAI usage 对象提取 token 计数（含 cached_tokens）。
+    """从 OpenAI usage 对象提取 token 计数（含 cached / cache_creation）。
 
-    兼容 DashScope 的 prompt_tokens_details.cached_tokens。
+    兼容 DashScope 的 prompt_tokens_details.cached_tokens / cache_creation_input_tokens。
     usage 可以是对象（有属性）或 dict。
     """
     if usage is None:
-        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0}
+        return {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "cached_tokens": 0, "cache_creation_tokens": 0,
+        }
 
     def _get(obj, key, default=0):
         if isinstance(obj, dict):
@@ -198,33 +294,43 @@ def parse_usage(usage) -> dict:
     completion = _get(usage, "completion_tokens")
     total = _get(usage, "total_tokens")
 
-    # cached_tokens 藏在 prompt_tokens_details 里
+    # cached_tokens / cache_creation_input_tokens 藏在 prompt_tokens_details 里
     cached = 0
+    cache_creation = 0
     details = _get(usage, "prompt_tokens_details", None)
     if details is not None:
         cached = _get(details, "cached_tokens")
+        cache_creation = _get(details, "cache_creation_input_tokens")
 
     return {
         "prompt_tokens": int(prompt),
         "completion_tokens": int(completion),
         "total_tokens": int(total),
         "cached_tokens": int(cached),
+        "cache_creation_tokens": int(cache_creation),
     }
 
 
 def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int,
-                  cached_tokens: int = 0) -> float:
-    """根据模型定价估算费用（元）。
+                  cached_tokens: int = 0, cache_creation_tokens: int = 0) -> float:
+    """根据模型定价估算费用（元）。四价计费：
 
-    cached_tokens 是 prompt_tokens 中命中缓存的部分，
-    按缓存价计费，剩余按正常输入价。
+    - 命中缓存：cached_tokens × 缓存命中价 (输入 × 10% / 16.9% / 17.5% 等)
+    - 创建显式缓存：cache_creation_tokens × 输入 × 1.25 (qwen 显式缓存创建溢价)
+    - 未命中输入：(prompt - cached - cache_creation) × 输入单价
+    - 输出：completion_tokens × 输出单价
+
+    注：kimi 系列不支持显式 cache_control，cache_creation_tokens 恒为 0，
+    本算式天然兼容（创建项不产生费用）。
     """
     input_price, output_price, cache_price = _match_pricing(model)
+    create_price = input_price * 1.25  # 显式缓存创建溢价
     per_m = 1_000_000
 
-    uncached_input = max(prompt_tokens - cached_tokens, 0)
-    cost = (uncached_input / per_m) * input_price
+    uncached = max(prompt_tokens - cached_tokens - cache_creation_tokens, 0)
+    cost = (uncached / per_m) * input_price
     cost += (cached_tokens / per_m) * cache_price
+    cost += (cache_creation_tokens / per_m) * create_price
     cost += (completion_tokens / per_m) * output_price
     return round(cost, 6)
 

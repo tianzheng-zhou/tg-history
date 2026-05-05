@@ -33,7 +33,7 @@ from backend.services.qa_tools import TOOL_SCHEMAS, dispatch_tool
 # Orchestrator 拥有全部工具：简单查询直接搜，复杂调研走子 Agent
 ORCHESTRATOR_TOOL_SCHEMAS = list(TOOL_SCHEMAS)
 
-MAX_STEPS = 30  # 最大 agent 迭代轮数，防止死循环
+MAX_STEPS = 20  # 最大 agent 迭代轮数，防止死循环（调低：子 Agent 承担大块检索）
 MAX_TOOL_OUTPUT_CHARS = 50000  # 塞回 LLM 的单次工具输出最大字符数（降低防止上下文溢出）
 CONTEXT_RESERVE_TOKENS = 40000  # 为 LLM 输出预留的 token 数
 CHARS_PER_TOKEN = 1.8  # 中英混合文本的大致 chars/token 比
@@ -89,56 +89,134 @@ def _trim_messages_to_budget(messages: list[dict], model: str) -> tuple[list[dic
     return result, True
 
 
-SYSTEM_PROMPT = """你是一个 Telegram 聊天记录分析的智能助手。你同时拥有直接检索工具、子 Agent 委派能力，以及 Artifact 协同文档工具。
+SYSTEM_PROMPT = """你是一个 Telegram 聊天记录分析的智能助手（Orchestrator）。
+你拥有直接检索工具 + 子 Agent 委派（research）+ Artifact 协同文档三类能力。
+**你的角色偏重"规划 + 合成"**：检索的苦活尽量外包给 research，但**任务要拆得足够细**——
+子 Agent 用 qwen3.5-plus，**128K 是它的关键性能阈值**：
+- 上下文 < 128K：模型注意力集中，能精准引用、严守指令
+- 上下文 ≥ 128K：注意力衰减明显（容易漏引用、跑偏指令、复读重复内容），且费用 2.5x ↑
+- 上下文 ≥ 256K：质量塌方，费用 5x ↑
+所以单个 research 任务要小到子 Agent **天然装不满 128K**——单次 ~100 条消息原文 ≈ 30K~50K tokens。
 
-## 工具选择策略
+## 决策树：先判断问题类型
 
-### 简单/精确查询 → 直接使用检索工具
-当问题简单明确时（“XX 说了什么”、“某天发生了什么”、“找包含 XX 的消息”），直接用以下工具搜索：
-- **semantic_search**: 语义检索，首选工具，适合自然语言查询
-- **keyword_search**: 关键词精确匹配（型号、URL、代码等）
-- **search_by_sender**: 按发言人搜索
-- **search_by_date**: 按日期范围查询
-- **fetch_messages / fetch_topic_context**: 获取完整消息内容
+1. **单点事实 / 精确关键词**（"X 说过啥"、"包含 Y 的消息"、"某天的消息"）
+   → 直接用检索工具 1~3 次搞定，不要派 research
 
-直接搜索更快、更省 token，适合 1-3 次工具调用即可回答的问题。
+2. **中等广度**（"最近讨论 GPU 的话题"、"讨论过哪几个方案"）
+   → 先 `list_topics` 或 `semantic_search(limit=50~100)` 扫一次，够用就直接合成答案
 
-### 复杂/大范围查询 → 委派子 Agent
-当问题需要多维度、跨群、或多轮检索时（“全面梳理 XX”、“对比 XX 和 YY”、“各群讨论了哪些方案”），用 **research** 工具委派给子 Agent：
-- 每个子 Agent 拥有独立上下文窗口，会自主多轮搜索
-- 一次性发起多个 research 调用来并行执行（放在同一轮 tool_calls 中）
-- 每个子任务描述要详细：要搜什么、关注哪些方面、预期返回什么
+3. **调研型 / 列举型 / 跨维度 / 跨群**（"全面梳理"、"找出所有 X"、"按人对比"、"timeline"）
+   → **必须并行拆成多个 research**（通常 3~5 个），见下面"拆分原则"
 
-任务拆分原则：
-- **对比/列举型**：2-3 个 research，按维度分
-- **复杂调研型**：3-5 个 research，按子主题分
+## ⚠️ 关键规则：通过"横向多拆 research"实现完整搜索，而不是"单个 research 穷举"
+
+**核心思路**：你想完整覆盖一个广话题，**正确做法是横向拆成多个 research 各管一片**，
+而不是给一个子 Agent 说"找全部 X"——后者会让子 Agent 上下文爆炸 + 性能塌方。
+
+**症状识别**：一个 research 跑了 > 60 秒、调用 > 12 次工具，几乎一定是任务太重——
+子 Agent 试图穷举导致上下文撑到 128K+ 进入性能衰减区。**这种 research 的报告也会很烂**
+（漏引用、复读、跑偏）。
+
+**正确的拆分（每个 research 都"窄而完整"）**：
+- 每个 research 的范围要**窄**：限定一个主题维度 + 一个关键词集合（3~5 个词）
+- 在那个窄范围内，要让子 Agent **完整搜索**——不要写"代表性样本即可"这种偷懒话术
+- 全局完整性靠**多个 research 横向覆盖** + **多轮迭代**实现，不靠单个 research 穷举
+
+## 开放式多轮 research：直到信息完整 ✨
+
+**research 不限于一轮、两轮——根据每轮结果决定下一轮，直到能完整回答用户问题再停**。
+单轮拆几个 research 只是起点；收到报告后必须**评估完整性**再决定下一步。
+
+### 每轮收到报告后的检查清单
+- **稀薄**：某 research 只返回 1~3 条结果，但任务本身应该有更多 → 换关键词 / 换维度再发
+- **缺引用**：报告说"群里讨论了 X 方案"但没给具体 [msg:id] → 发**验证 research** 拉原文
+- **维度缺失**：用户问"哪些人在用 X"但报告只列了 X 没列人 → 发**补维度 research**
+- **新线索**：报告里出现没想到的关键词/产品/人 → 发**拓展 research** 顺藤摸瓜
+- **越界线索**：子 Agent 在 "## 越界线索" 区块汇报的新方向 → 决定要不要单独发 research 跟进
+- **矛盾**：两个 research 给出冲突信息 → 发**交叉验证 research**
+
+### 后续轮次 research 的写法
+后续轮次任务要更聚焦（已经知道在找什么）：
+- "**验证型**：拉取 [msg:1234, 1567, 1890] 的完整原文 + 前后 3 条邻居（fetch_messages context_window=3），
+  确认 EFunCard 是否支持 USDT 充值"
+- "**拓展型**：搜 'monobank'、'Wise' 这两个新出现的卡平台，找它们的提及和用途"
+- "**补维度型**：列出第一轮提到 EFunCard 的所有发言人 + 评价倾向（正/负/中性）"
+
+### 整体节奏
+```
+用户提问
+  ↓
+第 1 轮：3~5 个 research 并行（按主题/关键词集合维度横切）
+  ↓
+评估：稀薄? 缺引用? 缺维度? 越界线索? 矛盾?
+  ↓
+第 N 轮（N=2,3,4...）：按需补查 / 验证 / 拓展，每轮 1~3 个 research
+  ↓
+当信息能覆盖用户问题的所有维度，且关键事实都有引用 → 写最终答案
+```
+**判断"够了"的标准**：把最终答案的初稿在脑中过一遍——每个论点都有 [msg:id]、覆盖了用户问的所有维度、没有"我估计/可能/大概"这种含糊词——OK 了再停。
+**判断"还要查"的标准**：你心里在用"应该"、"可能"、"听起来"这种猜测词——立即发补查 research，不要把不确定写进最终答案。
+
+## research 拆分原则
+
+### 列举/搜集型（"找出所有 X"、"哪些人提到 Y"）
+按**关键词集合**或**子类别**横向切，每个 research 负责一个集合：
+- 例：找虚拟卡 → research-A "找 EFunCard/Roogoo/野卡 等已知卡平台"
+       + research-B "找 USDT/支付宝/Apple Pay 充值相关讨论"
+       + research-C "找 GPT/Claude/Netflix 订阅卡相关讨论"
+- **不要**用一个 research 说 "找所有提到的虚拟卡"——这会让子 Agent 反复穷举
+
+### 对比型（"X 和 Y 哪个好"）
+按**对比对象**纵向切：每个 research 负责一个对象的全部信息
+
+### 时间线型
+按**时间段**切：每个 research 负责 1~3 个月
+
+### 多群聊场景
+若涉及 ≥3 个群聊且每群消息量大，**先用 `list_chats` + `list_topics` 评估规模**，
+然后按群聊或话题维度再切一层。
+
+## research 调用规范
+`research` 启动一个独立上下文的子 Agent。**每个 task 必须包含**：
+1) **搜什么**：具体主题 + 3~5 个关键词（不要超过 5 个，否则范围太宽）
+2) **分析维度**：时间线 / 按人 / 按平台 / 列表
+3) **期望输出格式**：bullet / 表格 / "平台名 + 链接 + 用途" 三元组
+4) **范围边界**：明确告诉子 Agent "在这个范围内尽量完整，超出范围的新线索写在'## 越界线索'区块"
+5) **排除项**（可选）：避免方向跑偏
+
+**结构化字段优先于 task 文本**：
+- `filters` 字段：chat_ids / senders / date 直接传，比 task 里写更可靠（自动注入工具调用）
+- `scope` 字段：自然语言说明范围
+- `expected_output`：对输出结构的硬性要求
+- `max_steps`：默认按任务自适应（8/12/16）。一般不用显式给——任务范围窄了步数自然就够
+
+**并行**：独立的 research 必须在**同一个 assistant 回合里**同时发起（一次返回多个 tool_calls）。
+
+## 检索工具速查（直接用 / 给 research 参考）
+- **semantic_search**：语义检索首选。chat_ids / topic_ids / 日期 / senders / min_messages_in_chunk 过滤。调研 limit=50~100，精确 10~30
+- **keyword_search**：精确词 / FTS5。keywords 列表 OR 合并
+- **list_topics**：列话题（带 summary + 时间段）——拿 topic_id 后传给 semantic_search/fetch_topic_context 深挖
+- **list_chats**：评估群聊规模时先看看
+- **fetch_topic_context**：整话题原文
+- **fetch_messages**：按 id 拉原文 + 可选 `context_window` 拉前后 N 条邻居
+- **search_by_sender / search_by_date**：按人 / 按日期
 
 ## Artifact：产出可迭代的侧边文档
+当用户请求需要**结构化长文档**（梳理 / 汇总 / 报告 / 知识库），预期 ≥ 30 行 Markdown 时，主动用 artifact 工具：
+- **create_artifact**(artifact_key, title, content)
+- **update_artifact**(artifact_key, old_str, new_str) — old_str 必须在正文**恰好出现一次**
+- **rewrite_artifact**(artifact_key, content[, title]) — 整体重写（代价大）
 
-当用户的请求需要产出**结构化长文档**（梳理 / 汇总 / 列表 / 报告 / 知识库），且预期内容超过 ~30 行 markdown 时，
-**主动用 artifact 工具**产出可侧边浏览的活文档；用户会在右侧面板看到，并能复制 / 导出。
+短回答 / 单条事实**不要**建 artifact。建好后最终答复只需一句"已生成 artifact 《标题》"，不要复读全文。
 
-工具：
-- **create_artifact**(artifact_key, title, content) — 新建一篇
-- **update_artifact**(artifact_key, old_str, new_str) — 小改动专用，old_str 必须在当前正文恰好出现一次
-- **rewrite_artifact**(artifact_key, content[, title]) — 整体重写
+## 最终答案规范
+- Markdown 格式，分段清晰
+- **每个事实标注来源**：发言人 + 日期；引用用 `[msg:123]` 或 `[topic:456]` 锚点
+- 数据不足时直说"未找到 X"+ 列已查过的关键词/过滤器——**不要编造**
+- 多 research 间矛盾时指出来，不要掩盖
 
-使用规则：
-1. **何时建**：长篇结构化交付（梳理 / 汇总 / 列表 / 行动项）。**不要**给单条事实、短解释建 artifact
-2. **多篇**：一个 session 可以有多篇 artifact——主题独立时分开建（如 `tech-summary` + `links-roundup`）
-3. **artifact_key**：英文小写 slug，如 `tech-summary` / `gpu-pricing` / `decisions-2025q4`，session 内 unique
-4. **优先 update**：小改动用 update_artifact 省 token；只在大幅重构时用 rewrite_artifact
-5. **str_replace 规则**：old_str 必须在正文中**恰好出现一次**——不唯一时扩大 old_str 范围（多带几行上下文）
-6. **简短复述**：建好 artifact 后，最终答复中只需短短一句"已生成 artifact 《标题》"指向侧边面板，不要重复完整内容
-
-## 通用规则
-- 如果不确定数据范围，可先用 **list_chats** 了解可用群聊
-- 收到子 Agent 报告后，综合所有报告生成结构化最终答案
-- 如果某个子任务报告信息不足，可发起补充 research 或直接用检索工具补查
-- 最终答案用 Markdown 格式，**标注来源**（发言人 + 日期）
-- 信息不足时大方承认“根据现有记录未找到”，不要编造
-
-你最多可以进行 {max_steps} 轮工具调用。请高效完成任务。
+你最多 {max_steps} 轮工具调用，超出强制总结。**能外包就外包、外包就拆细、能并行就并行**。
 """.format(max_steps=MAX_STEPS)
 
 
@@ -160,14 +238,26 @@ async def _stream_llm_step(
        - {"type": "reasoning_content", "text": str}  (完整思考内容，供回传上下文)
        - {"type": "usage", "prompt_tokens", "completion_tokens", "total_tokens", "model"}
        - {"type": "done"}
+
+    Qwen 模型 + enable_qwen_explicit_cache=True 时会在最后一条消息加
+    cache_control 标记（需 ≥1024 token 阈值）。
     """
     model = settings.llm_model_qa
     client = llm_adapter.get_client_for_model(model)
     is_kimi = llm_adapter.is_kimi_model(model)
 
+    # 显式缓存注入：仅 qwen 模型 + 开关打开时
+    effective_messages = messages
+    if (
+        settings.enable_qwen_explicit_cache
+        and llm_adapter.is_qwen_model(model)
+        and not is_kimi
+    ):
+        effective_messages = llm_adapter.inject_cache_control(messages)
+
     kwargs = dict(
         model=model,
-        messages=messages,
+        messages=effective_messages,
         tools=ORCHESTRATOR_TOOL_SCHEMAS,
         tool_choice="auto",
         stream=True,
@@ -258,6 +348,7 @@ async def _stream_llm_step(
             "completion_tokens": last_usage["completion_tokens"],
             "total_tokens": last_usage["total_tokens"],
             "cached_tokens": last_usage["cached_tokens"],
+            "cache_creation_tokens": last_usage.get("cache_creation_tokens", 0),
             "max_context": max_ctx,
             "percent": round(last_usage["prompt_tokens"] / max_ctx, 4) if max_ctx else 0.0,
             "model": model,
@@ -305,8 +396,18 @@ async def run_agent(
     final_text_parts: list[str] = []
 
     # 累计 token 用量（含子 Agent）
-    cumulative_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0}
-    sub_agent_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0}
+    cumulative_usage = {
+        "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+        "cached_tokens": 0, "cache_creation_tokens": 0,
+    }
+    sub_agent_usage = {
+        "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+        "cached_tokens": 0, "cache_creation_tokens": 0,
+    }
+    # 是否走到了"达到 MAX_STEPS 强制总结"分支（前端可提示"被截断"）
+    forced_summary = False
+    # 最终实际用到的步数（未被截断时 = 正常结束步；被截断时 = MAX_STEPS）
+    actual_steps = 0
 
     def _add_usage(target: dict, u: dict):
         for k in target:
@@ -391,6 +492,7 @@ async def run_agent(
         # 没有 tool_calls —— LLM 给出最终答案，循环结束
         if not step_tool_calls:
             final_text_parts.append(step_text)
+            actual_steps = step
             yield {"type": "step_done", "step": step, "had_tool_calls": False}
             break
 
@@ -555,6 +657,8 @@ async def run_agent(
 
     else:
         # 走到 MAX_STEPS 仍在调用工具——强制让 LLM 基于已有信息总结答案（禁用工具）
+        forced_summary = True
+        actual_steps = MAX_STEPS
         yield {"type": "status", "message": f"已达最大步数 {MAX_STEPS}，强制总结..."}
         messages.append({
             "role": "user",
@@ -567,9 +671,16 @@ async def run_agent(
         messages, _ = _trim_messages_to_budget(messages, _model)
         try:
             _client = llm_adapter.get_client_for_model(_model)
+            _effective_messages = messages
+            if (
+                settings.enable_qwen_explicit_cache
+                and llm_adapter.is_qwen_model(_model)
+                and not llm_adapter.is_kimi_model(_model)
+            ):
+                _effective_messages = llm_adapter.inject_cache_control(messages)
             _force_kwargs = dict(
                 model=_model,
-                messages=messages,
+                messages=_effective_messages,
                 stream=True,
             )
             if llm_adapter.is_kimi_model(_model):
@@ -596,27 +707,65 @@ async def run_agent(
     # 构造 sources（从引用过的消息中选前 5 条，按话题去重）
     sources = _build_sources(db, cited_message_ids)
 
-    # 计算预估费用
-    model = settings.llm_model_qa
-    estimated_cost = llm_adapter.estimate_cost(
-        model,
-        cumulative_usage["prompt_tokens"],
-        cumulative_usage["completion_tokens"],
-        cumulative_usage["cached_tokens"],
+    # 计算预估费用 —— 主/子 分模型计价。
+    # cumulative_usage 包含主+子（子的 usage 在处理 research 结果时被加进去了），
+    # 主仅 = cumulative - sub。max(0, ...) 防边界。
+    main_model = settings.llm_model_qa
+    sub_model = settings.effective_sub_agent_model
+    has_sub = sub_agent_usage["total_tokens"] > 0
+
+    main_usage = {
+        k: max(cumulative_usage[k] - sub_agent_usage[k], 0)
+        for k in cumulative_usage
+    }
+    main_cost = llm_adapter.estimate_cost(
+        main_model,
+        main_usage["prompt_tokens"],
+        main_usage["completion_tokens"],
+        main_usage["cached_tokens"],
+        main_usage["cache_creation_tokens"],
     )
+    sub_cost = llm_adapter.estimate_cost(
+        sub_model,
+        sub_agent_usage["prompt_tokens"],
+        sub_agent_usage["completion_tokens"],
+        sub_agent_usage["cached_tokens"],
+        sub_agent_usage["cache_creation_tokens"],
+    ) if has_sub else 0.0
+    total_cost = round(main_cost + sub_cost, 6)
+
+    task_usage: dict = {
+        # 新结构：主/子明细
+        "main": {
+            "model": main_model,
+            **main_usage,
+            "cost_yuan": main_cost,
+        },
+        # 汇总字段（兼容老前端读取）
+        **cumulative_usage,
+        "estimated_cost_yuan": total_cost,
+        "model": main_model,
+        # 循环诊断信息
+        "steps": actual_steps or MAX_STEPS,
+        "max_steps": MAX_STEPS,
+        "forced_summary": forced_summary,
+        # 老兼容字段（老 session 读取不会报错）
+        "sub_agent_prompt_tokens": sub_agent_usage["prompt_tokens"],
+        "sub_agent_completion_tokens": sub_agent_usage["completion_tokens"],
+        "sub_agent_cached_tokens": sub_agent_usage["cached_tokens"],
+    }
+    if has_sub:
+        task_usage["sub"] = {
+            "model": sub_model,
+            **sub_agent_usage,
+            "cost_yuan": sub_cost,
+        }
 
     yield {
         "type": "final_answer",
         "answer": "".join(final_text_parts),
         "sources": sources,
-        "task_usage": {
-            **cumulative_usage,
-            "sub_agent_prompt_tokens": sub_agent_usage["prompt_tokens"],
-            "sub_agent_completion_tokens": sub_agent_usage["completion_tokens"],
-            "sub_agent_cached_tokens": sub_agent_usage["cached_tokens"],
-            "estimated_cost_yuan": estimated_cost,
-            "model": model,
-        },
+        "task_usage": task_usage,
     }
 
 
@@ -657,6 +806,12 @@ async def _force_summarize_recovery(messages: list[dict], cited_ids: set[int]) -
     try:
         client = llm_adapter.get_client_for_model(model)
         sem = llm_adapter.get_chat_semaphore(model)
+        if (
+            settings.enable_qwen_explicit_cache
+            and llm_adapter.is_qwen_model(model)
+            and not llm_adapter.is_kimi_model(model)
+        ):
+            recovery_msgs = llm_adapter.inject_cache_control(recovery_msgs)
         kwargs = dict(
             model=model,
             messages=recovery_msgs,

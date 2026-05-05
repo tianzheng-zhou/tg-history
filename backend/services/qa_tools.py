@@ -37,6 +37,96 @@ def _msg_to_dict(m: Message, preview_len: int = 400) -> dict:
     }
 
 
+def _parse_date(s: str | None) -> datetime | None:
+    """解析 YYYY-MM-DD 日期字符串。空/非法返回 None。"""
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+
+
+def _coerce_str_list(v) -> list[str]:
+    """宽容地转为 list[str]：接受单个 str / list / None。"""
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v] if v.strip() else []
+    if isinstance(v, (list, tuple)):
+        return [str(x) for x in v if x is not None and str(x).strip()]
+    return []
+
+
+def _coerce_int_list(v) -> list[int]:
+    """宽容地转为 list[int]：接受单个 int / list / None。"""
+    if v is None:
+        return []
+    if isinstance(v, int):
+        return [v]
+    if isinstance(v, (list, tuple)):
+        out: list[int] = []
+        for x in v:
+            try:
+                out.append(int(x))
+            except (ValueError, TypeError):
+                pass
+        return out
+    return []
+
+
+def _build_chroma_where(
+    chat_ids: list[str] | None,
+    topic_ids: list[int] | None,
+    start_date: str | None,
+    end_date: str | None,
+) -> dict | None:
+    """构造 Chroma metadata 过滤表达式。多条件 $and 合并。
+
+    按 metadata 字段：chat_id / topic_id / start_date / end_date。
+    返回 None 表示无过滤（避免传空 dict 给 chromadb）。
+    """
+    clauses: list[dict] = []
+    if chat_ids:
+        if len(chat_ids) == 1:
+            clauses.append({"chat_id": chat_ids[0]})
+        else:
+            clauses.append({"chat_id": {"$in": list(chat_ids)}})
+    if topic_ids:
+        if len(topic_ids) == 1:
+            clauses.append({"topic_id": topic_ids[0]})
+        else:
+            clauses.append({"topic_id": {"$in": list(topic_ids)}})
+    # 日期过滤：chunk 的 [start_date, end_date] 区间与查询区间有交集
+    # chunk.end_date >= query.start_date AND chunk.start_date <= query.end_date
+    sd = _parse_date(start_date)
+    ed = _parse_date(end_date)
+    if sd is not None:
+        clauses.append({"end_date": {"$gte": sd.isoformat()}})
+    if ed is not None:
+        clauses.append({"start_date": {"$lte": ed.isoformat() + "T23:59:59"}})
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
+def _post_filter_msgs_by_sender(
+    db: Session, msg_ids: list[int], senders: list[str]
+) -> set[int]:
+    """从 SQL messages 表查出 sender 匹配的 message_id 集合（senders 之间 OR）。"""
+    if not msg_ids or not senders:
+        return set(msg_ids or [])
+    sender_clauses = [Message.sender.like(f"%{s}%") for s in senders]
+    rows = (
+        db.query(Message.id)
+        .filter(Message.id.in_(msg_ids), or_(*sender_clauses))
+        .all()
+    )
+    return {r[0] for r in rows}
+
+
 # ---------------------- Tool handlers ----------------------
 
 async def tool_list_chats(db: Session) -> dict:
@@ -62,29 +152,53 @@ async def tool_semantic_search(
     db: Session,
     query: str,
     chat_ids: list[str] | None = None,
-    top_k: int = 30,
+    limit: int = 30,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    topic_ids: list[int] | None = None,
+    senders: list[str] | None = None,
+    min_messages_in_chunk: int = 0,
 ) -> dict:
-    """向量语义检索（top_k 上限 200）"""
-    top_k = max(1, min(int(top_k), 200))
-    where_filter = None
-    if chat_ids:
-        if len(chat_ids) == 1:
-            where_filter = {"chat_id": chat_ids[0]}
-        else:
-            where_filter = {"chat_id": {"$in": chat_ids}}
+    """向量语义检索（limit 上限 200）。支持多维交叉过滤：
 
-    results = await search_similar(query, n_results=top_k, where=where_filter)
+    - chat_ids / topic_ids / start_date / end_date → Chroma metadata 过滤
+    - senders → SQL post-filter（metadata 只有 participants 汇总串，无法精确命中）
+    - min_messages_in_chunk → post-filter 小 chunk
+    """
+    limit = max(1, min(int(limit), 200))
+    chat_ids = _coerce_str_list(chat_ids) or None
+    topic_ids = _coerce_int_list(topic_ids) or None
+    senders = _coerce_str_list(senders) or None
 
-    # 把 chunk metadata 展开；保持 preview 紧凑以便容纳更多结果
+    where_filter = _build_chroma_where(chat_ids, topic_ids, start_date, end_date)
+
+    # senders / min_messages 是 post-filter；为了保证最终返回足够，启用 post-filter
+    # 时预取更多候选。
+    fetch_n = limit
+    if senders or min_messages_in_chunk > 0:
+        fetch_n = min(limit * 4, 200)
+
+    results = await search_similar(query, n_results=fetch_n, where=where_filter)
+
+    # 展开 chunk metadata
     items = []
+    all_msg_ids: list[int] = []
     for r in results:
         meta = r.get("metadata", {})
-        msg_ids = meta.get("message_ids", [])
-        if isinstance(msg_ids, str):
+        msg_ids_raw = meta.get("message_ids", [])
+        if isinstance(msg_ids_raw, str):
+            # 兼容两种编码：JSON（新版）和 Python repr（老版）
+            parsed = None
             try:
-                msg_ids = json.loads(msg_ids)
+                parsed = json.loads(msg_ids_raw)
             except Exception:
-                msg_ids = []
+                try:
+                    import ast
+                    parsed = ast.literal_eval(msg_ids_raw)
+                except Exception:
+                    parsed = []
+            msg_ids_raw = parsed or []
+        msg_ids = [int(x) for x in (msg_ids_raw or []) if isinstance(x, (int, str))]
         items.append({
             "chunk_preview": (r.get("document") or "")[:1000],
             "distance": round(r.get("distance") or 0, 4),
@@ -92,24 +206,76 @@ async def tool_semantic_search(
             "topic_id": meta.get("topic_id"),
             "start_date": meta.get("start_date"),
             "end_date": meta.get("end_date"),
-            "message_ids": msg_ids[:30],  # 单 chunk 最多 30 个 msg_id
+            "participants": meta.get("participants"),
+            "message_ids": msg_ids[:30],
             "total_messages_in_chunk": len(msg_ids),
         })
+        all_msg_ids.extend(msg_ids)
+
+    # senders post-filter：一次 SQL 拉所有 chunk 覆盖的 message，按 sender 过滤
+    if senders and all_msg_ids:
+        def _q():
+            return _post_filter_msgs_by_sender(db, all_msg_ids, senders)
+        matched = await asyncio.to_thread(_q)
+        items = [it for it in items if any(mid in matched for mid in it["message_ids"])]
+
+    if min_messages_in_chunk > 0:
+        items = [it for it in items if it["total_messages_in_chunk"] >= min_messages_in_chunk]
+
+    items = items[:limit]
     return {"results": items, "count": len(items)}
 
 
 async def tool_keyword_search(
     db: Session,
-    keyword: str,
+    keyword: str | None = None,
+    keywords: list[str] | None = None,
     chat_ids: list[str] | None = None,
     limit: int = 30,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    senders: list[str] | None = None,
+    topic_ids: list[int] | None = None,
 ) -> dict:
-    """关键词检索：优先 FTS5（trigram），命中 0 时回退 LIKE 模糊匹配（兼容短中文词）。
-    结果经 rerank 模型按相关性排序。"""
+    """关键词检索：FTS5 trigram 优先，0 命中时回退 LIKE。rerank 按相关性重排。
+
+    参数：
+    - keyword: 单关键词 / FTS5 表达式（兼容老参数名）
+    - keywords: 多关键词列表，自动 OR 拼接
+    - chat_ids / topic_ids / start_date / end_date / senders: SQL where 过滤
+    """
+    # 参数规范化
+    kws = _coerce_str_list(keywords)
+    if keyword:
+        kws.append(keyword)
+    kws = [k.strip() for k in kws if k and k.strip()]
+    if not kws:
+        return {"results": [], "count": 0, "error": "需提供 keyword 或 keywords"}
+    fts_query = " OR ".join(kws)
+    primary_kw = kws[0]
+
+    chat_ids = _coerce_str_list(chat_ids)
+    topic_ids = _coerce_int_list(topic_ids)
+    senders = _coerce_str_list(senders)
+    sd = _parse_date(start_date)
+    ed = _parse_date(end_date)
+
     limit = max(1, min(int(limit), 200))
-    # 先多取一些候选，再 rerank 筛选
     fetch_limit = min(limit * 3, 200)
     from sqlalchemy import text as sa_text
+
+    def _apply_filters(q):
+        if chat_ids:
+            q = q.filter(Message.chat_id.in_(chat_ids))
+        if topic_ids:
+            q = q.filter(Message.topic_id.in_(topic_ids))
+        if sd is not None:
+            q = q.filter(Message.date >= sd)
+        if ed is not None:
+            q = q.filter(Message.date <= ed.replace(hour=23, minute=59, second=59))
+        if senders:
+            q = q.filter(or_(*[Message.sender.like(f"%{s}%") for s in senders]))
+        return q
 
     def _fts_then_like() -> tuple[list[Message], str]:
         msgs_local: list[Message] = []
@@ -117,24 +283,22 @@ async def tool_keyword_search(
         try:
             rows = db.execute(
                 sa_text("SELECT rowid FROM messages_fts WHERE messages_fts MATCH :kw LIMIT :lim"),
-                {"kw": keyword, "lim": fetch_limit},
+                {"kw": fts_query, "lim": fetch_limit},
             ).fetchall()
             if rows:
                 ids = [r[0] for r in rows]
                 q = db.query(Message).filter(Message.id.in_(ids))
-                if chat_ids:
-                    q = q.filter(Message.chat_id.in_(chat_ids))
+                q = _apply_filters(q)
                 msgs_local = q.order_by(Message.date).all()
         except Exception as e:
             method = f"fts5_err({type(e).__name__})"
 
         if not msgs_local:
             method = "like"
-            primary_kw = keyword.split(" OR ")[0].split()[0].strip('"').strip()
-            if primary_kw:
-                q = db.query(Message).filter(Message.text_plain.like(f"%{primary_kw}%"))
-                if chat_ids:
-                    q = q.filter(Message.chat_id.in_(chat_ids))
+            kw_clean = primary_kw.split(" OR ")[0].split()[0].strip('"').strip()
+            if kw_clean:
+                q = db.query(Message).filter(Message.text_plain.like(f"%{kw_clean}%"))
+                q = _apply_filters(q)
                 msgs_local = q.order_by(Message.date.desc()).limit(fetch_limit).all()
                 msgs_local.reverse()
         return msgs_local, method
@@ -147,7 +311,7 @@ async def tool_keyword_search(
         try:
             docs = [(m.text_plain or "")[:500] for m in msgs]
             rerank_results = await llm_adapter.rerank(
-                query=keyword, documents=docs, top_n=min(limit, len(msgs)),
+                query=fts_query, documents=docs, top_n=min(limit, len(msgs)),
             )
             if rerank_results:
                 reranked_msgs = []
@@ -159,7 +323,6 @@ async def tool_keyword_search(
                 reranked = True
                 used_method += "+rerank"
         except Exception:
-            # rerank 失败，fallback 到原始顺序并截断
             pass
 
     if not reranked:
@@ -176,36 +339,95 @@ async def tool_fetch_messages(
     db: Session,
     message_ids: list[int],
     full_text: bool = False,
+    limit: int | None = None,
+    context_window: int = 0,
 ) -> dict:
-    """按 message_id 列表获取完整消息内容"""
+    """按 message_id 列表获取完整消息内容。
+
+    - limit: 返回上限（默认 50 / 最大 200）
+    - context_window: >0 时顺带拉每条消息在同 chat 时序上的前后 N 条上下文
+    """
+    message_ids = _coerce_int_list(message_ids)
     if not message_ids:
         return {"messages": [], "count": 0}
 
-    limit = min(len(message_ids), 50)
+    eff_limit = limit if limit else 50
+    eff_limit = max(1, min(int(eff_limit), 200))
+    truncated = len(message_ids) > eff_limit
+    target_ids = message_ids[:eff_limit]
+    context_window = max(0, min(int(context_window or 0), 20))
 
     def _q():
-        return (
+        base = (
             db.query(Message)
-            .filter(Message.id.in_(message_ids[:limit]))
+            .filter(Message.id.in_(target_ids))
             .order_by(Message.date)
             .all()
         )
+        if context_window <= 0 or not base:
+            return base, []
 
-    msgs = await asyncio.to_thread(_q)
+        # 按 chat_id 分组收集时序邻居的 id（SQL 起点：Message.date 有索引）
+        extra_ids: set[int] = set()
+        for m in base:
+            if not m.date or not m.chat_id:
+                continue
+            before = (
+                db.query(Message.id)
+                .filter(
+                    Message.chat_id == m.chat_id,
+                    Message.date < m.date,
+                    Message.id != m.id,
+                )
+                .order_by(Message.date.desc())
+                .limit(context_window)
+                .all()
+            )
+            after = (
+                db.query(Message.id)
+                .filter(
+                    Message.chat_id == m.chat_id,
+                    Message.date > m.date,
+                    Message.id != m.id,
+                )
+                .order_by(Message.date)
+                .limit(context_window)
+                .all()
+            )
+            extra_ids.update(b[0] for b in before)
+            extra_ids.update(a[0] for a in after)
+        base_id_set = {m.id for m in base}
+        extra_ids -= base_id_set
+        if not extra_ids:
+            return base, []
+        ctx = (
+            db.query(Message)
+            .filter(Message.id.in_(extra_ids))
+            .order_by(Message.chat_id, Message.date)
+            .all()
+        )
+        return base, ctx
+
+    msgs, ctx_msgs = await asyncio.to_thread(_q)
     preview_len = 2000 if full_text else 500
-    return {
+    out: dict = {
         "messages": [_msg_to_dict(m, preview_len=preview_len) for m in msgs],
         "count": len(msgs),
-        "truncated": len(message_ids) > limit,
+        "truncated": truncated,
     }
+    if ctx_msgs:
+        out["context_messages"] = [_msg_to_dict(m, preview_len=preview_len) for m in ctx_msgs]
+        out["context_count"] = len(ctx_msgs)
+    return out
 
 
 async def tool_fetch_topic_context(
     db: Session,
     topic_id: int,
-    max_messages: int = 30,
+    limit: int = 30,
 ) -> dict:
-    """获取某话题的完整消息列表（按时间排序）"""
+    """获取某话题的完整消息列表（按时间排序）。limit 默认 30、最大 200。"""
+    limit = max(1, min(int(limit), 200))
 
     def _q():
         topic_local = db.query(Topic).filter(Topic.id == topic_id).first()
@@ -215,7 +437,7 @@ async def tool_fetch_topic_context(
             db.query(Message)
             .filter(Message.topic_id == topic_id)
             .order_by(Message.date)
-            .limit(max_messages)
+            .limit(limit)
             .all()
         )
         return topic_local, msgs_local
@@ -231,25 +453,57 @@ async def tool_fetch_topic_context(
         "end_date": topic.end_date.strftime("%Y-%m-%d %H:%M") if topic.end_date else None,
         "participant_count": topic.participant_count,
         "message_count": topic.message_count,
+        "summary": topic.summary,
+        "category": topic.category,
         "messages": [_msg_to_dict(m, preview_len=400) for m in msgs],
     }
 
 
 async def tool_search_by_sender(
     db: Session,
-    sender: str,
+    senders: list[str] | None = None,
+    sender: str | None = None,
     chat_ids: list[str] | None = None,
+    keywords: list[str] | None = None,
     keyword: str | None = None,
+    topic_ids: list[int] | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
     limit: int = 50,
 ) -> dict:
-    """查询某发言人的消息，可选关键词过滤"""
+    """查询某些发言人的消息。senders 和 keywords 组内都是 OR 关系。"""
+    senders_list = _coerce_str_list(senders)
+    if sender:
+        senders_list.append(sender)
+    senders_list = [s.strip() for s in senders_list if s and s.strip()]
+    if not senders_list:
+        return {"results": [], "count": 0, "error": "需提供 sender 或 senders"}
+
+    keywords_list = _coerce_str_list(keywords)
+    if keyword:
+        keywords_list.append(keyword)
+    keywords_list = [k.strip() for k in keywords_list if k and k.strip()]
+
+    chat_ids = _coerce_str_list(chat_ids)
+    topic_ids = _coerce_int_list(topic_ids)
+    sd = _parse_date(start_date)
+    ed = _parse_date(end_date)
+    limit = max(1, min(int(limit), 200))
 
     def _q():
-        q = db.query(Message).filter(Message.sender.like(f"%{sender}%"))
+        q = db.query(Message).filter(
+            or_(*[Message.sender.like(f"%{s}%") for s in senders_list])
+        )
         if chat_ids:
             q = q.filter(Message.chat_id.in_(chat_ids))
-        if keyword:
-            q = q.filter(Message.text_plain.like(f"%{keyword}%"))
+        if topic_ids:
+            q = q.filter(Message.topic_id.in_(topic_ids))
+        if keywords_list:
+            q = q.filter(or_(*[Message.text_plain.like(f"%{k}%") for k in keywords_list]))
+        if sd is not None:
+            q = q.filter(Message.date >= sd)
+        if ed is not None:
+            q = q.filter(Message.date <= ed.replace(hour=23, minute=59, second=59))
         return q.order_by(Message.date.desc()).limit(limit).all()
 
     msgs = await asyncio.to_thread(_q)
@@ -261,35 +515,112 @@ async def tool_search_by_sender(
 
 async def tool_search_by_date(
     db: Session,
-    chat_id: str,
     start_date: str,
     end_date: str | None = None,
+    chat_ids: list[str] | None = None,
+    chat_id: str | None = None,
+    senders: list[str] | None = None,
+    keywords: list[str] | None = None,
+    keyword: str | None = None,
     limit: int = 50,
 ) -> dict:
-    """按日期范围查询消息。start_date / end_date 格式: YYYY-MM-DD"""
-    try:
-        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d") if end_date else datetime.now()
-    except ValueError as e:
-        return {"error": f"日期格式错误（应为 YYYY-MM-DD）: {e}", "messages": []}
+    """按日期范围查询消息。start_date / end_date 格式: YYYY-MM-DD。
+
+    - chat_ids / senders / keywords 均为可选过滤
+    - chat_id / keyword 是老参数别名
+    """
+    sd = _parse_date(start_date)
+    if sd is None:
+        return {"messages": [], "count": 0,
+                "error": f"start_date 格式错误（应为 YYYY-MM-DD）: {start_date!r}"}
+    ed = _parse_date(end_date) if end_date else datetime.now()
+    if ed is None:
+        return {"messages": [], "count": 0,
+                "error": f"end_date 格式错误（应为 YYYY-MM-DD）: {end_date!r}"}
+    ed = ed.replace(hour=23, minute=59, second=59)
+
+    chat_ids_list = _coerce_str_list(chat_ids)
+    if chat_id:
+        chat_ids_list.append(chat_id)
+
+    senders_list = _coerce_str_list(senders)
+    keywords_list = _coerce_str_list(keywords)
+    if keyword:
+        keywords_list.append(keyword)
+    keywords_list = [k.strip() for k in keywords_list if k and k.strip()]
+    limit = max(1, min(int(limit), 200))
 
     def _q():
-        return (
-            db.query(Message)
-            .filter(
-                Message.chat_id == chat_id,
-                Message.date >= start_dt,
-                Message.date <= end_dt,
-            )
-            .order_by(Message.date)
-            .limit(limit)
-            .all()
-        )
+        q = db.query(Message).filter(Message.date >= sd, Message.date <= ed)
+        if chat_ids_list:
+            q = q.filter(Message.chat_id.in_(chat_ids_list))
+        if senders_list:
+            q = q.filter(or_(*[Message.sender.like(f"%{s}%") for s in senders_list]))
+        if keywords_list:
+            q = q.filter(or_(*[Message.text_plain.like(f"%{k}%") for k in keywords_list]))
+        return q.order_by(Message.date).limit(limit).all()
 
     msgs = await asyncio.to_thread(_q)
     return {
         "messages": [_msg_to_dict(m, preview_len=300) for m in msgs],
         "count": len(msgs),
+    }
+
+
+async def tool_list_topics(
+    db: Session,
+    chat_ids: list[str] | None = None,
+    chat_id: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    category: str | None = None,
+    limit: int = 30,
+) -> dict:
+    """列出符合条件的话题，按 end_date 降序。
+
+    - chat_ids: 限定群聊（可单可多）
+    - start_date / end_date: 话题区间与查询区间相交（YYYY-MM-DD）
+    - category: tech / business / resource / general（按数据库实际值）
+    """
+    chat_ids_list = _coerce_str_list(chat_ids)
+    if chat_id:
+        chat_ids_list.append(chat_id)
+    sd = _parse_date(start_date)
+    ed = _parse_date(end_date)
+    if ed is not None:
+        ed = ed.replace(hour=23, minute=59, second=59)
+    limit = max(1, min(int(limit), 200))
+
+    def _q():
+        q = db.query(Topic)
+        if chat_ids_list:
+            q = q.filter(Topic.chat_id.in_(chat_ids_list))
+        # 话题区间 [topic.start_date, topic.end_date] 与查询区间 [sd, ed] 相交
+        if sd is not None:
+            q = q.filter(Topic.end_date >= sd)
+        if ed is not None:
+            q = q.filter(Topic.start_date <= ed)
+        if category:
+            q = q.filter(Topic.category == category)
+        q = q.order_by(Topic.end_date.desc()).limit(limit)
+        return q.all()
+
+    topics = await asyncio.to_thread(_q)
+    return {
+        "topics": [
+            {
+                "topic_id": t.id,
+                "chat_id": t.chat_id,
+                "start_date": t.start_date.strftime("%Y-%m-%d %H:%M") if t.start_date else None,
+                "end_date": t.end_date.strftime("%Y-%m-%d %H:%M") if t.end_date else None,
+                "participant_count": t.participant_count,
+                "message_count": t.message_count,
+                "category": t.category,
+                "summary_preview": (t.summary or "")[:200],
+            }
+            for t in topics
+        ],
+        "count": len(topics),
     }
 
 
@@ -475,10 +806,10 @@ TOOL_SCHEMAS = [
         "function": {
             "name": "semantic_search",
             "description": "**首选检索工具**。用向量相似度语义搜索相关消息片段。适合自然语言查询、找概念/主题相关内容。"
-                           "返回的每个结果是一个消息片段（可能含多条消息），带 message_ids 和 topic_id。"
-                           "**针对'调研型'问题（统计/对比/全面梳理）建议设较大 top_k=50~150**，"
-                           "针对'精确事实'问题用小 top_k=10~20 即可。"
-                           "如需完整内容请用 fetch_messages / fetch_topic_context。",
+                           "返回的每个结果是一个消息片段（可能含多条消息），带 message_ids、topic_id、participants。"
+                           "**针对'调研型'问题（统计/对比/全面梳理）建议设较大 limit=50~150**，"
+                           "精确事实问题 limit=10~20 即可。"
+                           "支持多维交叉过滤（chat_ids / topic_ids / 日期 / senders）以精确缩小检索空间。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -486,12 +817,28 @@ TOOL_SCHEMAS = [
                     "chat_ids": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "可选：限定在这些群聊 ID 中搜索（注意是 chat_id 不是 chat_name）",
+                        "description": "可选：限定在这些群聊 ID 中搜索（chat_id，非 chat_name）",
                     },
-                    "top_k": {
+                    "limit": {
                         "type": "integer",
                         "default": 30,
                         "description": "返回片段数量。范围 1-200。简单问题 10-20，调研性问题 50-150",
+                    },
+                    "start_date": {"type": "string", "description": "YYYY-MM-DD，只返回 end_date ≥ 该日期的 chunk"},
+                    "end_date": {"type": "string", "description": "YYYY-MM-DD，只返回 start_date ≤ 该日期的 chunk"},
+                    "topic_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "可选：限定在这些话题 ID 内（用于同一话题的深挖）",
+                    },
+                    "senders": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选：只保留含这些发言人的 chunk（SQL post-filter，支持昵称模糊）",
+                    },
+                    "min_messages_in_chunk": {
+                        "type": "integer",
+                        "description": "可选：只保留消息数 ≥ 该值的 chunk（过滤嘈杂小片段）",
                     },
                 },
                 "required": ["query"],
@@ -502,21 +849,30 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "keyword_search",
-            "description": "关键词搜索（FTS5 trigram，0 命中时自动回退 LIKE 模糊匹配，兼容短中文词）。"
+            "description": "关键词搜索（FTS5 trigram，0 命中时自动回退 LIKE，兼容短中文词）。"
                            "适合找具体的词/短语/代码/URL 等精确匹配内容，语义检索找不到时作为备选。"
-                           "支持 FTS5 操作符（AND/OR/NEAR），但回退 LIKE 时只用第一个关键词。",
+                           "支持多关键词（keywords 列表自动 OR 拼接）、日期/发言人/群聊/话题多维过滤。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "keyword": {"type": "string", "description": "关键词或 FTS5 表达式，如 \"GPU 租\" 或 \"H100 OR A100\""},
+                    "keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "关键词列表（多个自动 OR），如 [\"H100\", \"A100\", \"B200\"]",
+                    },
+                    "keyword": {"type": "string", "description": "单关键词或 FTS5 表达式（兼容老参数名）"},
                     "chat_ids": {"type": "array", "items": {"type": "string"}},
+                    "topic_ids": {"type": "array", "items": {"type": "integer"}},
+                    "senders": {"type": "array", "items": {"type": "string"}, "description": "发言人列表（模糊匹配）"},
+                    "start_date": {"type": "string", "description": "YYYY-MM-DD"},
+                    "end_date": {"type": "string", "description": "YYYY-MM-DD"},
                     "limit": {
                         "type": "integer",
                         "default": 30,
                         "description": "返回数量。范围 1-200。调研性问题建议 50-100",
                     },
                 },
-                "required": ["keyword"],
+                "required": [],
             },
         },
     },
@@ -524,19 +880,29 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "fetch_messages",
-            "description": "按 message_id 列表获取消息的完整文本内容（用于查看检索到的消息细节）。",
+            "description": "按 message_id 列表获取消息的完整文本内容（用于查看检索到的消息细节）。"
+                           "可选 context_window 顺带拉每条消息前后 N 条同 chat 上下文，便于还原语境。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "message_ids": {
                         "type": "array",
                         "items": {"type": "integer"},
-                        "description": "消息 ID 列表（最多 50 个）",
+                        "description": "消息 ID 列表（默认最多 50 个，可用 limit 扩展到 200）",
                     },
                     "full_text": {
                         "type": "boolean",
                         "default": False,
                         "description": "是否返回完整原文（true）还是 500 字预览（false）",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "返回上限（默认 50 / 最大 200）",
+                    },
+                    "context_window": {
+                        "type": "integer",
+                        "default": 0,
+                        "description": "每条消息在同 chat 时序上的前后 N 条上下文（0 = 不拉，最大 20）",
                     },
                 },
                 "required": ["message_ids"],
@@ -553,7 +919,11 @@ TOOL_SCHEMAS = [
                 "type": "object",
                 "properties": {
                     "topic_id": {"type": "integer"},
-                    "max_messages": {"type": "integer", "default": 30},
+                    "limit": {
+                        "type": "integer",
+                        "default": 30,
+                        "description": "返回消息数上限（默认 30 / 最大 200）",
+                    },
                 },
                 "required": ["topic_id"],
             },
@@ -563,16 +933,25 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "search_by_sender",
-            "description": "查询某个用户的发言。可附加关键词过滤。",
+            "description": "查询某些发言人的消息。支持多发言人（OR）、多关键词（OR）、群聊/话题/日期过滤。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "sender": {"type": "string", "description": "发言人昵称（支持模糊匹配）"},
+                    "senders": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "发言人列表（模糊匹配）。多人之间 OR 关系",
+                    },
+                    "sender": {"type": "string", "description": "单个发言人（兼容老参数名）"},
                     "chat_ids": {"type": "array", "items": {"type": "string"}},
-                    "keyword": {"type": "string", "description": "可选的关键词过滤"},
-                    "limit": {"type": "integer", "default": 50},
+                    "topic_ids": {"type": "array", "items": {"type": "integer"}},
+                    "keywords": {"type": "array", "items": {"type": "string"}, "description": "关键词列表（OR）"},
+                    "keyword": {"type": "string", "description": "单关键词（兼容老参数名）"},
+                    "start_date": {"type": "string", "description": "YYYY-MM-DD"},
+                    "end_date": {"type": "string", "description": "YYYY-MM-DD"},
+                    "limit": {"type": "integer", "default": 50, "description": "范围 1-200"},
                 },
-                "required": ["sender"],
+                "required": [],
             },
         },
     },
@@ -580,16 +959,45 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "search_by_date",
-            "description": "按日期范围查询某群聊的消息（按时间顺序）。适合'某月发生了什么'这种时间型问题。",
+            "description": "按日期范围查询消息（按时间顺序）。适合'某月发生了什么'这种时间型问题。"
+                           "可选 chat_ids / senders / keywords 做进一步过滤。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "chat_id": {"type": "string"},
                     "start_date": {"type": "string", "description": "YYYY-MM-DD"},
-                    "end_date": {"type": "string", "description": "YYYY-MM-DD，可选"},
+                    "end_date": {"type": "string", "description": "YYYY-MM-DD，缺省为今天"},
+                    "chat_ids": {"type": "array", "items": {"type": "string"}},
+                    "chat_id": {"type": "string", "description": "单群聊（兼容老参数名）"},
+                    "senders": {"type": "array", "items": {"type": "string"}},
+                    "keywords": {"type": "array", "items": {"type": "string"}, "description": "关键词列表（OR）"},
+                    "keyword": {"type": "string", "description": "单关键词（兼容老参数名）"},
                     "limit": {"type": "integer", "default": 50},
                 },
-                "required": ["chat_id", "start_date"],
+                "required": ["start_date"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_topics",
+            "description": "列出符合条件的话题（按 end_date 降序）。"
+                           "用于获取话题的整体概览、定位相关话题 id，然后交给 semantic_search(topic_ids=...) "
+                           "或 fetch_topic_context 深挖。比 semantic_search 更适合'某群最近讨论了哪些话题'之类的问题。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat_ids": {"type": "array", "items": {"type": "string"}},
+                    "chat_id": {"type": "string", "description": "单群聊（兼容老参数名）"},
+                    "start_date": {"type": "string", "description": "YYYY-MM-DD"},
+                    "end_date": {"type": "string", "description": "YYYY-MM-DD"},
+                    "category": {
+                        "type": "string",
+                        "description": "可选分类过滤：tech / business / resource / general",
+                    },
+                    "limit": {"type": "integer", "default": 30, "description": "范围 1-200"},
+                },
+                "required": [],
             },
         },
     },
@@ -597,21 +1005,64 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "research",
-            "description": "委派一个独立的检索子任务给子 Agent。子 Agent 拥有独立上下文窗口，"
-                           "会自主执行多轮搜索和分析，返回详细报告。"
-                           "你应该将复杂问题拆分为多个子任务，并行发起多个 research 调用。"
-                           "每个子任务描述要详细，包含：要搜什么、关注哪些方面、预期返回什么信息。",
+            "description": (
+                "委派一个独立的检索子任务给子 Agent。子 Agent 拥有独立上下文窗口，"
+                "会自主执行多轮搜索和分析，返回详细报告。\n"
+                "**何时用**：用户问题规模大（需跨多个维度/时间段/群聊汇总）、单轮 "
+                "semantic_search 一次拉不完、或主 Agent 不想被检索细节占满上下文时。\n"
+                "⚠️ **不要给单个 research 过重的任务**：子 Agent 上下文越长，费用阶梯式上涨（128K 后翻倍、"
+                "256K 后再翻倍）、质量衰减。**完整覆盖广话题靠'横向多拆 research + 多轮迭代'**，"
+                "而不是一个 research 说'找出所有 X'让子 Agent 穷举。\n"
+                "**写好 task 的关键**（子 Agent 用较弱模型，必须把指令写清楚）：\n"
+                "  1) 具体要搜什么：主题 + 3~5 个关键词（不要超过 5）\n"
+                "  2) 分析维度：时间/发言人/平台/观点对比\n"
+                "  3) 期望输出结构：列表 / 按人汇总 / 时间线 / '平台名+链接+用途'三元组\n"
+                "  4) 范围边界：'在这个范围内尽量完整，越界新线索写在 ## 越界线索 区块'\n"
+                "  5) 排除项：如'不需要闲聊'\n"
+                "**多轮迭代**：第一轮收到报告后评估完整性——稀薄/缺引用/缺维度/有越界线索/有矛盾 → 发后续轮次 "
+                "research 验证、补维度、拓展。直到信息完整再写最终答案。\n"
+                "**并行策略**：独立子任务同一轮多发几个 research 调用，子 Agent 并发跑。\n"
+                "**filters 建议**：把主 Agent 已经清楚的约束（时间段/群聊/发言人）直接传给子 "
+                "Agent，子 Agent 会把这些注入每次工具调用，避免无效搜索。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "task": {
                         "type": "string",
-                        "description": "详细的检索任务描述（要搜什么、关注哪些方面、预期返回什么）",
+                        "description": "详细的检索任务描述，建议 3 段以上：1) 搜什么 2) 分析维度 3) 期望输出结构",
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "可选：对检索范围的自然语言说明（例：'最近三个月内'、'只看 A 群'），"
+                                       "和 filters 互补——scope 给语境，filters 给机器可执行的约束",
+                    },
+                    "filters": {
+                        "type": "object",
+                        "description": "结构化约束，子 Agent 会在每次工具调用里注入这些字段",
+                        "properties": {
+                            "chat_ids": {"type": "array", "items": {"type": "string"}},
+                            "topic_ids": {"type": "array", "items": {"type": "integer"}},
+                            "senders": {"type": "array", "items": {"type": "string"}},
+                            "start_date": {"type": "string", "description": "YYYY-MM-DD"},
+                            "end_date": {"type": "string", "description": "YYYY-MM-DD"},
+                        },
+                    },
+                    "expected_output": {
+                        "type": "string",
+                        "description": "希望子 Agent 报告包含的字段/结构。例："
+                                       "'按月份 timeline + 每条 bullet 标 [msg:123]'，"
+                                       "'按发言人分组汇总，每人列核心观点 2-3 条'",
+                    },
+                    "max_steps": {
+                        "type": "integer",
+                        "description": "可选：子 Agent 最大工具调用轮数（默认按任务难度自适应 8~16，硬上限 20）。"
+                                       "一般不用显式给——任务范围窄了步数自然就够；很复杂的验证任务才显式给 16+"
                     },
                     "chat_ids": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "可选：限定搜索范围的群聊 ID 列表",
+                        "description": "老参数名，等价于 filters.chat_ids（保留兼容）",
                     },
                 },
                 "required": ["task"],
@@ -725,6 +1176,7 @@ TOOL_HANDLERS = {
     "fetch_topic_context": tool_fetch_topic_context,
     "search_by_sender": tool_search_by_sender,
     "search_by_date": tool_search_by_date,
+    "list_topics": tool_list_topics,
     # research 工具在 dispatch_tool 中特殊处理（调用 sub_agent）
 }
 
@@ -735,6 +1187,26 @@ ARTIFACT_TOOL_HANDLERS = {
     "update_artifact": tool_update_artifact,
     "rewrite_artifact": tool_rewrite_artifact,
 }
+
+
+def _normalize_tool_args(name: str, args: dict) -> dict:
+    """老参数名 → 新参数名兼容映射（只做单向 rename，不删信息）。
+
+    - semantic_search: top_k → limit
+    - fetch_topic_context: max_messages → limit
+
+    其他工具（keyword_search / search_by_sender / search_by_date / list_topics /
+    fetch_messages）的 handler 签名已直接兼容老参数名（keyword|keywords、
+    sender|senders、chat_id|chat_ids 等），无需在此处理。
+    """
+    if not args:
+        return args
+    args = dict(args)
+    if name == "semantic_search" and "top_k" in args and "limit" not in args:
+        args["limit"] = args.pop("top_k")
+    if name == "fetch_topic_context" and "max_messages" in args and "limit" not in args:
+        args["limit"] = args.pop("max_messages")
+    return args
 
 
 async def dispatch_tool(
@@ -749,20 +1221,33 @@ async def dispatch_tool(
     Args:
         context: 调用方上下文，目前只用 ``session_id``（artifact 类工具必需）。
     """
+    args = _normalize_tool_args(name, args or {})
+
     # research 工具特殊处理：调用子 Agent
     if name == "research":
         from backend.services.sub_agent import run_sub_agent
+        # filters 字典里的 chat_ids 优先于顶层 chat_ids（两处都给时以 filters 为准）
+        filters = args.get("filters") or {}
+        effective_chat_ids = filters.get("chat_ids") or args.get("chat_ids")
         try:
             return await run_sub_agent(
                 db=db,
                 task=args.get("task", ""),
-                chat_ids=args.get("chat_ids"),
+                chat_ids=effective_chat_ids,
+                scope=args.get("scope"),
+                filters=filters if filters else None,
+                expected_output=args.get("expected_output"),
+                max_steps=args.get("max_steps"),
                 event_callback=event_callback,
             )
         except Exception as e:
             import traceback
             traceback.print_exc()
-            return {"error": f"子 Agent 执行失败: {e}"}
+            return {
+                "error": f"子 Agent 执行失败: {e}",
+                "suggestion": "可尝试简化 task 描述，或把 task 拆成更小的 research；也可直接用 "
+                              "semantic_search / keyword_search 自己查",
+            }
 
     # Artifact 工具：需要 session_id 上下文
     artifact_handler = ARTIFACT_TOOL_HANDLERS.get(name)
@@ -772,24 +1257,49 @@ async def dispatch_tool(
             return {
                 "error": "Artifact 工具必须在会话上下文中调用（缺失 session_id）",
                 "code": "no_session",
+                "suggestion": "artifact 只能在聊天会话中使用，不能在独立脚本里调用",
             }
         try:
             return await artifact_handler(db, session_id=session_id, **args)
         except TypeError as e:
-            return {"error": f"参数错误: {e}", "code": "bad_args"}
+            return {
+                "error": f"参数错误: {e}",
+                "code": "bad_args",
+                "suggestion": "检查参数名拼写和类型。create_artifact 需要 (artifact_key, title, content)；"
+                              "update_artifact 需要 (artifact_key, old_str, new_str)",
+            }
         except Exception as e:
             import traceback
             traceback.print_exc()
-            return {"error": f"Artifact 工具执行失败: {e}"}
+            return {
+                "error": f"Artifact 工具执行失败: {e}",
+                "suggestion": "检查 artifact_key 是否存在（update/rewrite 需要 create 过）；"
+                              "update 时 old_str 必须在当前正文恰好出现一次",
+            }
 
     handler = TOOL_HANDLERS.get(name)
     if not handler:
-        return {"error": f"未知工具: {name}"}
+        return {
+            "error": f"未知工具: {name}",
+            "suggestion": f"可用工具：{sorted(list(TOOL_HANDLERS.keys()) + ['research'])}",
+        }
     try:
         return await handler(db, **args)
     except TypeError as e:
-        return {"error": f"参数错误: {e}"}
+        # 构造针对性 suggestion：列出该工具的合法参数名
+        schema = next((s for s in TOOL_SCHEMAS if s["function"]["name"] == name), None)
+        valid_params: list[str] = []
+        if schema:
+            valid_params = list(schema["function"]["parameters"].get("properties", {}).keys())
+        return {
+            "error": f"参数错误: {e}",
+            "suggestion": f"{name} 合法参数：{valid_params}。注意 chat_ids/senders/keywords 等是 list 类型，"
+                          "date 用 YYYY-MM-DD",
+        }
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return {"error": f"工具执行失败: {e}"}
+        return {
+            "error": f"工具执行失败: {e}",
+            "suggestion": "可尝试缩小查询范围（加日期/群聊过滤），或换一个工具（semantic_search ↔ keyword_search）",
+        }

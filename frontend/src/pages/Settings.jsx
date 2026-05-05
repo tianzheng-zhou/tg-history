@@ -38,6 +38,8 @@ export default function Settings() {
     moonshot_api_key: "",
     llm_model_map: "qwen3.5-plus",
     llm_model_qa: "qwen3.6-plus",
+    llm_model_sub_agent: "",  // 空 = 跟随 QA 模型
+    enable_qwen_explicit_cache: true,
     embedding_model: "text-embedding-v4",
     rerank_model: "qwen3-rerank",
   });
@@ -52,6 +54,8 @@ export default function Settings() {
         ...prev,
         llm_model_map: data.llm_model_map,
         llm_model_qa: data.llm_model_qa,
+        llm_model_sub_agent: data.llm_model_sub_agent ?? "",
+        enable_qwen_explicit_cache: data.enable_qwen_explicit_cache ?? true,
         embedding_model: data.embedding_model,
         rerank_model: data.rerank_model,
       }));
@@ -150,7 +154,7 @@ export default function Settings() {
             </div>
             <div>
               <label className="block text-sm text-muted-foreground mb-1">
-                问答模型
+                问答模型（主 Agent）
               </label>
               <select
                 value={form.llm_model_qa}
@@ -165,6 +169,43 @@ export default function Settings() {
               </select>
               <p className="text-xs text-muted-foreground mt-1">
                 kimi-k2.6 需配置 Moonshot Key
+              </p>
+            </div>
+            <div>
+              <label className="block text-sm text-muted-foreground mb-1">
+                子 Agent 模型（research 委派）
+              </label>
+              <select
+                value={form.llm_model_sub_agent}
+                onChange={(e) => update("llm_model_sub_agent", e.target.value)}
+                className="w-full border border-border rounded-md px-3 py-2 text-sm"
+              >
+                <option value="">跟随问答模型</option>
+                {withCurrentValue(MODEL_OPTIONS.llm_qa, form.llm_model_sub_agent).map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-muted-foreground mt-1">
+                用便宜模型如 qwen3.5-plus 可降本 ~5–10x
+              </p>
+            </div>
+            <div>
+              <label className="block text-sm text-muted-foreground mb-1">
+                Qwen 显式缓存
+              </label>
+              <label className="flex items-center gap-2 mt-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.enable_qwen_explicit_cache}
+                  onChange={(e) => update("enable_qwen_explicit_cache", e.target.checked)}
+                  className="w-4 h-4"
+                />
+                <span className="text-sm">启用（推荐）</span>
+              </label>
+              <p className="text-xs text-muted-foreground mt-1">
+                Agent 多步循环隐式命中率近 0%，显式 cache_control 命中 99%+、命中价 10%。仅 Qwen 生效
               </p>
             </div>
           </div>

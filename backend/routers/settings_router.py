@@ -13,6 +13,9 @@ def _build_response() -> SettingsResponse:
     return SettingsResponse(
         llm_model_map=settings.llm_model_map,
         llm_model_qa=settings.llm_model_qa,
+        llm_model_sub_agent=settings.llm_model_sub_agent,
+        sub_agent_context_window=llm_adapter.get_context_window(settings.effective_sub_agent_model),
+        enable_qwen_explicit_cache=settings.enable_qwen_explicit_cache,
         qa_context_window=llm_adapter.get_context_window(settings.llm_model_qa),
         embedding_model=settings.embedding_model,
         rerank_model=settings.rerank_model,
@@ -41,6 +44,10 @@ def update_settings(req: SettingsUpdate):
         settings.llm_model_map = req.llm_model_map
     if req.llm_model_qa is not None:
         settings.llm_model_qa = req.llm_model_qa
+    if req.llm_model_sub_agent is not None:
+        settings.llm_model_sub_agent = req.llm_model_sub_agent
+    if req.enable_qwen_explicit_cache is not None:
+        settings.enable_qwen_explicit_cache = req.enable_qwen_explicit_cache
     if req.embedding_model is not None:
         settings.embedding_model = req.embedding_model
     if req.rerank_model is not None:
@@ -62,6 +69,8 @@ def _persist_env():
         "MOONSHOT_BASE_URL": settings.moonshot_base_url,
         "LLM_MODEL_MAP": settings.llm_model_map,
         "LLM_MODEL_QA": settings.llm_model_qa,
+        "LLM_MODEL_SUB_AGENT": settings.llm_model_sub_agent,
+        "ENABLE_QWEN_EXPLICIT_CACHE": str(settings.enable_qwen_explicit_cache).lower(),
         "EMBEDDING_MODEL": settings.embedding_model,
         "RERANK_MODEL": settings.rerank_model,
         "DATA_DIR": settings.data_dir,

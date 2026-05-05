@@ -3,7 +3,7 @@
 由主 Agent（Orchestrator）通过 research 工具调用。每个子 Agent 拥有：
   - 独立的 messages 列表（不共享主 Agent 上下文）
   - 全部 7 个检索工具（不含 research，防递归）
-  - 自己的 tool-calling 循环（最多 SUB_MAX_STEPS 步）
+  - 自己的 tool-calling 循环（轮数按任务自适应 8~16，硬上限 20，上下文软上限 100K tokens）
 
 返回值是 LLM 生成的文本报告（一般 ≤ 8k tokens），不会撑爆主 Agent 上下文。
 """
@@ -20,8 +20,16 @@ from backend.config import settings
 from backend.services import llm_adapter
 from backend.services.qa_tools import TOOL_SCHEMAS, dispatch_tool
 
-SUB_MAX_STEPS = 15  # 子 Agent 最大步数
-MAX_TOOL_OUTPUT_CHARS = 50000  # 单次工具输出截断
+SUB_MAX_STEPS_DEFAULT = 12   # 子 Agent 默认最大步数（开放式多轮，不要太严苛）
+SUB_MAX_STEPS_HARD_CAP = 20  # 硬上限（防死循环）
+MAX_TOOL_OUTPUT_CHARS = 40_000  # 单次工具输出 backstop（≈22K tokens）；优先按列表条目级截断
+MAX_LIST_ITEMS_PER_TOOL = 60  # 单次工具结果最多保留多少条 list 项（messages / topics 等）
+
+# 子 Agent 上下文软上限（estimated tokens）。仅用作后端 safety net，**不向模型暴露**——
+# 让模型自然按任务规模工作，到达上限再静默触发 forced_summary。
+# 阈值 100K：留 28K buffer 防 qwen3.5-plus 进入 128K 高价/低性能档。
+SUB_CONTEXT_SOFT_LIMIT_TOKENS = 100_000
+_CHARS_PER_TOKEN = 1.8  # 中英混合粗估
 
 # 子 Agent 可用的工具：
 # - 排除 research（防递归）
@@ -29,39 +37,215 @@ MAX_TOOL_OUTPUT_CHARS = 50000  # 单次工具输出截断
 _SUB_EXCLUDED_TOOLS = {"research", "create_artifact", "update_artifact", "rewrite_artifact"}
 SUB_TOOL_SCHEMAS = [t for t in TOOL_SCHEMAS if t["function"]["name"] not in _SUB_EXCLUDED_TOOLS]
 
-SUB_SYSTEM_PROMPT = """你是一个 Telegram 聊天记录检索子助手，负责完成一个具体的搜索任务。
+# filters 会被自动注入到这些检索类工具的 args 里（若 args 没显式给该字段）
+_FILTER_INJECTABLE_TOOLS = {
+    "semantic_search", "keyword_search",
+    "search_by_sender", "search_by_date",
+    "list_topics",
+}
+_INJECTABLE_FILTER_KEYS = {"chat_ids", "topic_ids", "senders", "start_date", "end_date"}
 
-你被授予一组检索工具来查询聊天数据库。
+SUB_SYSTEM_PROMPT = """你是一个 Telegram 聊天记录检索子助手。
+主 Agent 已经把具体任务写在了 user 消息里——请认真完整地完成它。
 
-工作流程：
-1. 根据任务描述，选择合适的检索工具广泛搜索
-2. 阅读相关消息的完整内容确认相关性
-3. 如果初次搜索结果不够，调整查询再搜一次或换工具
-4. 综合所有发现，输出详细报告
+## 你的目标：在 task 范围内尽可能完整
 
-检索建议：
-- **semantic_search** 是首选——用自然语言描述你要找什么
-- **检索数量要够**：调研型任务建议 top_k=80~150；精确型任务 top_k=15~30
-- **keyword_search** 用于精确关键词（型号、URL、代码等）
-- 找到 message_ids / topic_id 后用 fetch_messages / fetch_topic_context 读完整内容
+主 Agent 已经把"全局问题"拆成了你这个子任务，给了明确的范围（关键词集合 / 主题维度 /
+时间段 / 群聊）。**在这个范围内你要做扎实**：
+- 所有相关线索都要查到、追下去
+- 多角度验证（比如同一事实在多人发言中是否一致）
+- 关键消息拉原文 + 上下文（用 `fetch_messages` 的 `context_window`）
+- 不要"敷衍交差"——你的报告会被主 Agent 合成给用户，缺漏会变成最终答案的盲点
 
-报告要求：
-- 按主题/时间/人物组织信息
-- 引用具体发言人和日期
-- 如果信息不足，明确说明"未找到相关记录"
-- 不要省略重要细节，你的报告会交给上层 Agent 合成最终答案
-- 用 Markdown 格式
+## 但不要越界
 
-你最多可以进行 {max_steps} 轮工具调用。请高效完成任务。
-""".format(max_steps=SUB_MAX_STEPS)
+主 Agent 会发**多个并行 research** 覆盖不同子范围。你只负责自己这一片：
+- 出现的新线索如果**超出你的 task 范围**（比如任务说找虚拟卡，结果消息提到卡网），
+  在报告末尾用 "## 越界线索（建议主 Agent 跟进）" 列出来——不要自己跑去搜
+- 主 Agent 会基于你的报告决定要不要发新的 research
+
+## 高效检索的几个原则
+
+**广→窄 漏斗式**：
+1. 先 `semantic_search`（limit=50~80）或 `list_topics` 看版图
+2. 拿 topic_id / 关键 msg_id 后用 `fetch_topic_context` / `fetch_messages(context_window=3)` 读原文
+3. 缺什么具体维度（按人 / 按日期）再用 `search_by_sender` / `search_by_date` 补
+
+**反模式（这些是无效努力，不是认真努力）**：
+- ❌ 同一关键词反复搜不同 limit
+- ❌ 用近义词链式扩搜（"虚拟卡"→"卡平台"→"充值卡"→"信用卡"...）—— 一次 semantic_search 已经覆盖语义近邻
+- ❌ 在 task 范围外漫游搜索（看到新名词就追下去）
+
+**搜索结果较多时**：工具结果可能带 `_truncated` 标记（系统按条目截断保护上下文）——
+基于已展示的样本判断够不够，需要更多就**缩小过滤范围**（加日期/topic_ids/senders）再搜，
+而不是反复用同一查询。
+
+## 可用工具
+- **semantic_search**：语义检索首选。支持 chat_ids / topic_ids / start_date / end_date / senders / min_messages_in_chunk 过滤。调研 limit=50~100、精确 15~30
+- **keyword_search**：精确关键词 / FTS5。keywords 列表 OR 合并 + 多维过滤
+- **list_topics**：列群聊话题（带 summary + 时间段 + 参与人数）
+- **fetch_topic_context**：按 topic_id 拉整话题原文
+- **fetch_messages**：按 ids 拉原文；`context_window=N` 顺带前后 N 条同 chat 邻居（还原语境很有用）
+- **search_by_sender / search_by_date**：按人或日期 + 多维过滤
+
+## 过滤器注入
+任务里如有 `[Filters: ...]` 段，**每次工具调用主动带上**这些参数
+（chat_ids / topic_ids / senders / start_date / end_date）。
+即便忘了，系统会自动补（仅在你没显式给时）。
+
+## 报告要求
+- 严格按主 Agent 要求的结构组织（timeline / 按人分组 / 观点-证据对 / 列表）
+- **每个事实必须有引用**：`[msg:<id>]` 或 `[topic:<id>]`；日期/发言人尽量写出
+- **越界线索**：单独列在末尾"## 越界线索"区块（如有）
+- 信息缺失时直说"未找到 X，已尝试关键词 [...]"——主 Agent 会决定补查
+- 用 Markdown 格式，简洁但不省略关键证据
+"""
 
 
 def _truncate_tool_output(obj: dict) -> str:
-    """把工具输出 dict 转为 JSON 字符串，过长时截断"""
-    s = json.dumps(obj, ensure_ascii=False)
+    """把工具输出 dict 转为 JSON 字符串，过长时智能截断。
+
+    策略（优先级从高到低，保持 JSON 结构有效）：
+      1. 找出 obj 顶层的 list 字段（如 messages / topics / results / chats），
+         若长度 > MAX_LIST_ITEMS_PER_TOOL，截断到该值并加 `_truncated_*` 元数据
+      2. 序列化后若仍超 MAX_TOOL_OUTPUT_CHARS，再退化为字符串截断（少见）
+
+    这样 agent 能看到：还有多少条没展示、被截断字段是什么——而不是 JSON 中间被砍断。
+    """
+    if not isinstance(obj, dict):
+        return json.dumps(obj, ensure_ascii=False)[:MAX_TOOL_OUTPUT_CHARS]
+
+    # 第一步：list 字段截条目
+    truncated_obj = dict(obj)
+    truncation_meta: dict = {}
+    for key, val in obj.items():
+        if isinstance(val, list) and len(val) > MAX_LIST_ITEMS_PER_TOOL:
+            truncated_obj[key] = val[:MAX_LIST_ITEMS_PER_TOOL]
+            truncation_meta[key] = {
+                "shown": MAX_LIST_ITEMS_PER_TOOL,
+                "total": len(val),
+                "hidden": len(val) - MAX_LIST_ITEMS_PER_TOOL,
+            }
+    if truncation_meta:
+        truncated_obj["_truncated"] = truncation_meta
+        truncated_obj["_truncation_hint"] = (
+            "结果较多，已展示前 N 条；如需更多，可缩小过滤范围（加日期/发言人/topic_ids）后再搜，"
+            "或基于这些样本判断够不够再决定是否补查"
+        )
+
+    s = json.dumps(truncated_obj, ensure_ascii=False)
+
+    # 第二步：字符级 backstop（每条消息原文很长时才会触发）
     if len(s) > MAX_TOOL_OUTPUT_CHARS:
-        s = s[:MAX_TOOL_OUTPUT_CHARS] + f"\n\n...[截断，完整长度 {len(s)} 字符]"
+        s = s[:MAX_TOOL_OUTPUT_CHARS] + (
+            f'\n\n...[字符级截断 backstop，完整长度 {len(s)} 字符]'
+        )
     return s
+
+
+def _estimate_messages_tokens(messages: list[dict]) -> int:
+    """粗略估算 messages 累积 token 数（中英混合按 1.8 chars/token）。
+
+    用途：检查子 Agent 上下文是否接近软上限，及时强制总结。
+    """
+    total_chars = 0
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            total_chars += len(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict):
+                    t = part.get("text") or part.get("content") or ""
+                    if isinstance(t, str):
+                        total_chars += len(t)
+        rc = m.get("reasoning_content")
+        if rc:
+            total_chars += len(rc)
+        # tool_calls 的 arguments
+        for tc in m.get("tool_calls", []) or []:
+            args = tc.get("function", {}).get("arguments")
+            if isinstance(args, str):
+                total_chars += len(args)
+    return int(total_chars / _CHARS_PER_TOKEN)
+
+
+def _auto_max_steps(task: str, expected_output: str | None, override: int | None) -> int:
+    """根据任务难度估算子 Agent 的最大工具调用轮数。
+
+    设计哲学：开放式多轮——给子 Agent 足够空间在 task 范围内完整搜索 + 验证。
+    上下文软上限（SUB_CONTEXT_SOFT_LIMIT_TOKENS）作为后端 safety net 兜底。
+
+    规则：
+    - override > 0 时优先（受 HARD_CAP 约束）
+    - 超短任务（<200 字符 且 无 expected_output） → 8
+    - 默认 → 12
+    - 复杂信号关键词 → 16（验证 + 多角度搜索都需要轮次）
+    """
+    if isinstance(override, int) and override > 0:
+        return max(1, min(override, SUB_MAX_STEPS_HARD_CAP))
+
+    text = (task or "") + " " + (expected_output or "")
+    length = len(text)
+    lower = text.lower()
+
+    complex_signals = [
+        "汇总", "对比", "比较", "timeline", "时间线",
+        "按月", "按周", "按人", "按群", "跨群",
+        "梳理", "整理", "综述", "统计", "分布", "验证", "交叉",
+    ]
+    if any(s in lower for s in complex_signals):
+        return min(16, SUB_MAX_STEPS_HARD_CAP)
+
+    if length < 200 and not expected_output:
+        return 8
+    return SUB_MAX_STEPS_DEFAULT
+
+
+def _build_user_prompt(
+    task: str,
+    scope: str | None,
+    filters: dict | None,
+    expected_output: str | None,
+) -> str:
+    """构造子 Agent 首轮 user 消息内容。
+
+    结构：
+      [Task]
+      <task>
+
+      [Scope]          # 可选
+      <scope>
+
+      [Filters]        # 可选
+      <filters json>
+
+      [Expected Output] # 可选
+      <expected_output>
+    """
+    parts: list[str] = [f"[Task]\n{task}"]
+    if scope:
+        parts.append(f"\n[Scope]\n{scope}")
+    if filters:
+        # 只保留可注入的字段，避免把未知字段也写进去
+        clean = {k: v for k, v in filters.items() if k in _INJECTABLE_FILTER_KEYS and v}
+        if clean:
+            parts.append(f"\n[Filters]\n{json.dumps(clean, ensure_ascii=False)}")
+    if expected_output:
+        parts.append(f"\n[Expected Output]\n{expected_output}")
+    return "\n".join(parts)
+
+
+def _inject_filters_into_args(tool_name: str, args: dict, filters: dict | None) -> dict:
+    """若 filters 非空且工具支持过滤字段，把 filters 的值注入 args（仅补未给的字段）。"""
+    if not filters or tool_name not in _FILTER_INJECTABLE_TOOLS:
+        return args
+    new_args = dict(args)
+    for k in _INJECTABLE_FILTER_KEYS:
+        v = filters.get(k)
+        if v and k not in new_args:
+            new_args[k] = v
+    return new_args
 
 
 async def _stream_sub_llm(
@@ -71,14 +255,25 @@ async def _stream_sub_llm(
     """子 Agent 的单轮 LLM 流式调用（走 semaphore）。
 
     yield 事件和 qa_agent._stream_llm_step 类似，但使用 SUB_TOOL_SCHEMAS。
+    Qwen 模型 + enable_qwen_explicit_cache=True 时会在最后一条消息
+    加 cache_control 标记（足 1024 token 阈值才生效）。
     """
     client = llm_adapter.get_client_for_model(model)
     is_kimi = llm_adapter.is_kimi_model(model)
     sem = llm_adapter.get_chat_semaphore(model)
 
+    # 显式缓存注入：仅 qwen 模型 + 开关打开时
+    effective_messages = messages
+    if (
+        settings.enable_qwen_explicit_cache
+        and llm_adapter.is_qwen_model(model)
+        and not is_kimi
+    ):
+        effective_messages = llm_adapter.inject_cache_control(messages)
+
     kwargs = dict(
         model=model,
-        messages=messages,
+        messages=effective_messages,
         tools=SUB_TOOL_SCHEMAS,
         tool_choice="auto",
         stream=True,
@@ -148,17 +343,32 @@ async def run_sub_agent(
     db: Session,
     task: str,
     chat_ids: list[str] | None = None,
+    scope: str | None = None,
+    filters: dict | None = None,
+    expected_output: str | None = None,
+    max_steps: int | None = None,
     event_callback=None,
 ) -> dict:
-    """运行检索子 Agent，返回 {"report", "message_ids", "steps", "tool_calls_count"}。
+    """运行检索子 Agent，返回 {"report", "message_ids", "steps", "tool_calls_count", "usage", "model"}。
 
-    event_callback: 可选的 async callable(event_dict) 用于向上层透传进度事件。
+    Args:
+        task: 详细的任务描述（必填）
+        chat_ids: 兼容老参数——等价于 filters["chat_ids"]；两者都给时 filters 优先
+        scope: 可选的自然语言范围说明
+        filters: 结构化过滤器，子 Agent 会把这些字段自动注入每次工具调用的 args
+        expected_output: 希望子 Agent 报告包含的字段/结构
+        max_steps: 显式上限；未给时按 task 难度自适应（6/12/18）
+        event_callback: 可选 async callable(event_dict)，向上层透传进度事件
     """
-    model = settings.llm_model_qa
+    model = settings.effective_sub_agent_model
 
-    user_content = task
-    if chat_ids:
-        user_content += f"\n\n[限定在这些群聊中检索: {json.dumps(chat_ids, ensure_ascii=False)}]"
+    # 合并 chat_ids 与 filters.chat_ids（filters 优先）
+    effective_filters: dict = dict(filters) if isinstance(filters, dict) else {}
+    if chat_ids and not effective_filters.get("chat_ids"):
+        effective_filters["chat_ids"] = list(chat_ids)
+
+    step_cap = _auto_max_steps(task, expected_output, max_steps)
+    user_content = _build_user_prompt(task, scope, effective_filters, expected_output)
 
     messages: list[dict] = [
         {"role": "system", "content": SUB_SYSTEM_PROMPT},
@@ -167,7 +377,10 @@ async def run_sub_agent(
 
     cited_message_ids: set[int] = set()
     total_tool_calls = 0
-    cumulative_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0}
+    cumulative_usage = {
+        "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+        "cached_tokens": 0, "cache_creation_tokens": 0,
+    }
 
     def _add_usage(u: dict):
         for k in cumulative_usage:
@@ -177,7 +390,21 @@ async def run_sub_agent(
         if event_callback:
             await event_callback(event)
 
-    for step in range(1, SUB_MAX_STEPS + 1):
+    # 标记：是否因为上下文软上限提前 break（决定要不要走强制总结分支）
+    soft_limit_hit = False
+
+    for step in range(1, step_cap + 1):
+        # 上下文软上限检查（静默 safety net，不暴露给模型，避免诱发偷懒）：
+        # 累积 token 超过软上限就强制总结，避免进入 qwen3.5-plus 的 128K 高价/低性能档
+        ctx_tokens = _estimate_messages_tokens(messages)
+        if ctx_tokens > SUB_CONTEXT_SOFT_LIMIT_TOKENS:
+            await _emit({
+                "type": "sub_status",
+                "message": f"已收集 {ctx_tokens} tokens 资料，进入总结阶段",
+            })
+            soft_limit_hit = True
+            break
+
         await _emit({"type": "sub_step", "step": step})
 
         step_text = ""
@@ -206,6 +433,7 @@ async def run_sub_agent(
                     "steps": step,
                     "tool_calls_count": total_tool_calls,
                     "usage": cumulative_usage,
+                    "model": model,
                 }
             return {
                 "report": f"子 Agent LLM 调用失败: {e}",
@@ -213,6 +441,7 @@ async def run_sub_agent(
                 "steps": step,
                 "tool_calls_count": total_tool_calls,
                 "usage": cumulative_usage,
+                "model": model,
             }
 
         # 构建 assistant 消息
@@ -239,6 +468,7 @@ async def run_sub_agent(
                 "steps": step,
                 "tool_calls_count": total_tool_calls,
                 "usage": cumulative_usage,
+                "model": model,
             }
 
         # 执行工具
@@ -249,6 +479,9 @@ async def run_sub_agent(
                 args = json.loads(args_str) if args_str else {}
             except json.JSONDecodeError:
                 args = {}
+
+            # 自动注入 effective_filters（子 Agent 没显式给该字段时才补）
+            args = _inject_filters_into_args(name, args, effective_filters)
 
             t0 = time.time()
             result = await dispatch_tool(db, name, args)
@@ -273,18 +506,27 @@ async def run_sub_agent(
                 "content": result_str,
             })
 
-    # 达到 SUB_MAX_STEPS 仍在调用工具 → 强制总结
-    messages.append({
-        "role": "user",
-        "content": "你已达到最大工具调用次数。请基于上面已收集到的所有工具结果，"
-                   "输出你的最终报告。**不要再调用任何工具**。",
-    })
+    # 达到 step_cap 或上下文软上限 → 强制总结
+    # 措辞中性：避免让模型误以为"被惩罚"而输出敷衍内容
+    force_msg = (
+        "你已经收集到足够的资料。请基于上面所有工具结果，按 task 要求的结构输出最终报告。"
+        "**不要再调用任何工具**。如果还有未覆盖的子方向（task 范围外的新线索），"
+        "在报告末尾的 '## 越界线索' 区块列出，主 Agent 会决定是否再发 research 跟进。"
+    )
+    messages.append({"role": "user", "content": force_msg})
     try:
         sem = llm_adapter.get_chat_semaphore(model)
         client = llm_adapter.get_client_for_model(model)
+        force_messages = messages
+        if (
+            settings.enable_qwen_explicit_cache
+            and llm_adapter.is_qwen_model(model)
+            and not llm_adapter.is_kimi_model(model)
+        ):
+            force_messages = llm_adapter.inject_cache_control(messages)
         force_kwargs = dict(
             model=model,
-            messages=messages,
+            messages=force_messages,
             stream=False,
         )
         if llm_adapter.is_kimi_model(model):
@@ -301,9 +543,10 @@ async def run_sub_agent(
     return {
         "report": report,
         "message_ids": sorted(cited_message_ids),
-        "steps": SUB_MAX_STEPS,
+        "steps": step_cap,
         "tool_calls_count": total_tool_calls,
         "usage": cumulative_usage,
+        "model": model,
     }
 
 

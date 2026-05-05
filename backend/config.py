@@ -18,6 +18,15 @@ class Settings(BaseSettings):
     # 默认开思考模式吃额外的思考链 token。
     llm_model_map: str = "qwen3.5-flash"
     llm_model_qa: str = "qwen3.6-plus"
+    # 子 Agent 模型（research 工具委派给的 sub-agent 用的模型）。
+    # 空字符串 = 跟随 llm_model_qa；推荐用便宜模型如 qwen3.5-plus 或 qwen3.5-flash。
+    # 主 Agent 给 research 写详细 task，弱模型也能完成。
+    llm_model_sub_agent: str = ""
+
+    # 显式缓存开关（仅 qwen 系列生效，kimi 走自家缓存机制不受影响）
+    # qwen 隐式缓存实测命中率近 0%（DashScope 路由策略保守），
+    # 改成显式 cache_control 后命中率 99%+，命中价 10%。
+    enable_qwen_explicit_cache: bool = True
 
     # Embedding / Rerank
     embedding_model: str = "text-embedding-v4"
@@ -31,6 +40,11 @@ class Settings(BaseSettings):
     # 格式：socks5://127.0.0.1:7891 或 http://127.0.0.1:7890
     # 留空时回退读取 HTTPS_PROXY / ALL_PROXY 环境变量；都没有则直连
     telegram_proxy: str = ""
+
+    @property
+    def effective_sub_agent_model(self) -> str:
+        """子 Agent 实际使用的模型：未显式配置时跟随主 QA 模型"""
+        return self.llm_model_sub_agent or self.llm_model_qa
 
     @property
     def db_path(self) -> Path:

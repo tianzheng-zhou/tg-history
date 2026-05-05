@@ -272,6 +272,8 @@ class SettingsUpdate(BaseModel):
     moonshot_api_key: str | None = None
     llm_model_map: str | None = None
     llm_model_qa: str | None = None
+    llm_model_sub_agent: str | None = None  # 空 "" = 跟随 llm_model_qa
+    enable_qwen_explicit_cache: bool | None = None
     embedding_model: str | None = None
     rerank_model: str | None = None
 
@@ -279,6 +281,9 @@ class SettingsUpdate(BaseModel):
 class SettingsResponse(BaseModel):
     llm_model_map: str
     llm_model_qa: str
+    llm_model_sub_agent: str = ""  # 空字符串表示"跟随 QA 模型"
+    sub_agent_context_window: int = 131072  # 子 Agent 实际使用模型的上下文窗口
+    enable_qwen_explicit_cache: bool = True
     qa_context_window: int = 131072  # 当前 QA 模型的最大上下文窗口
     embedding_model: str
     rerank_model: str
