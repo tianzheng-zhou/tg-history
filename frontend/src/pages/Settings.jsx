@@ -8,15 +8,29 @@ const MODEL_OPTIONS = {
     "qwen3.5-plus",
     "qwen3.6-plus",
   ],
+  // QA 模型列表必须和 backend/services/llm_adapter.py 的 CONTEXT_WINDOWS 一致。
+  // kimi 分两种 provider：
+  //   - kimi/kimi-k2.6  百炼直供（DashScope，RPM 30k，需 DASHSCOPE_API_KEY）
+  //   - kimi-k2.6       Moonshot 官方（并发 = 3，需 MOONSHOT_API_KEY）
   llm_qa: [
     "qwen3.5-flash",
     "qwen3.5-plus",
     "qwen3.6-plus",
+    "kimi/kimi-k2.6",
     "kimi-k2.6",
   ],
   embedding: ["text-embedding-v4"],
   rerank: ["qwen3-rerank"],
 };
+
+/** 把当前 form 值插入 options 列表（若不在的话）——
+ *  避免 <select> value 不在 <option> 里时浏览器默认选第一项，
+ *  却让 state 保留旧值造成"UI 显示 A 但后端保存的是 B"。
+ */
+function withCurrentValue(options, currentValue) {
+  if (!currentValue || options.includes(currentValue)) return options;
+  return [currentValue, ...options];
+}
 
 export default function Settings() {
   const [form, setForm] = useState({
@@ -124,7 +138,7 @@ export default function Settings() {
                 onChange={(e) => update("llm_model_map", e.target.value)}
                 className="w-full border border-border rounded-md px-3 py-2 text-sm"
               >
-                {MODEL_OPTIONS.llm.map((m) => (
+                {withCurrentValue(MODEL_OPTIONS.llm, form.llm_model_map).map((m) => (
                   <option key={m} value={m}>
                     {m}
                   </option>
@@ -143,7 +157,7 @@ export default function Settings() {
                 onChange={(e) => update("llm_model_qa", e.target.value)}
                 className="w-full border border-border rounded-md px-3 py-2 text-sm"
               >
-                {MODEL_OPTIONS.llm_qa.map((m) => (
+                {withCurrentValue(MODEL_OPTIONS.llm_qa, form.llm_model_qa).map((m) => (
                   <option key={m} value={m}>
                     {m}
                   </option>
