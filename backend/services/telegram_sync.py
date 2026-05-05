@@ -29,6 +29,7 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     PhoneNumberInvalidError,
     SessionPasswordNeededError,
+    TakeoutInitDelayError,
 )
 from telethon.tl.custom.dialog import Dialog
 from telethon.tl.custom.message import Message as TLMessage
@@ -625,20 +626,36 @@ async def iter_chat_messages(
     chat_id: str,
     *,
     min_id: int = 0,
+    expected_new: int = 0,
     on_progress: Optional[Callable[[int], Awaitable[None] | None]] = None,
     on_flood_wait: Optional[Callable[[int], Awaitable[None] | None]] = None,
+    on_takeout_pending: Optional[Callable[[int], Awaitable[None] | None]] = None,
     abort_check: Optional[Callable[[], bool]] = None,
     max_retries: int = 10,
     flood_wait_max: int = 1800,
+    use_takeout: bool = True,
 ):
     """异步生成器：迭代某个 chat 的消息（id > min_id），按 id 升序。
 
-    每条 yield 的是 ``convert_message`` 输出的 dict（已跳过 None）。
+    每条 yield 的是 ``convert_message`` 输出的 dict（已跳过 None)。
+
+    参数：
+      - ``expected_new``：上层预扫描估算的待拉新消息条数（``remote_max - local_max``）。
+        >0 启用 takeout fallback：takeout 通道走完后若 0 条 raw 消息（包括 service /
+        被过滤的）但远端明显有内容，自动切普通通道重试一次。
 
     回调：
       - on_progress(fetched_count) 每 50 条调一次。
       - on_flood_wait(seconds) 在被 Telegram 限流时调一次（>0 表示开始等待，0 表示等完）。
+      - on_takeout_pending(seconds) 当 Takeout 需要用户授权时调一次（seconds 为最大等待秒数）。
       - abort_check() 返回 True 时立刻停止。
+
+    Takeout 模式 (``use_takeout=True``)：
+      包一层 ``client.takeout(...)``，让所有 ``iter_messages`` RPC 走 Telegram
+      **官方数据导出通道**，享有更宽松的 flood limit；配合 ``wait_time=0`` 跳过 Telethon
+      默认每 100 条 sleep 1 秒的保守节流，30w 群同步从 ~70min → ~10min。
+      首次启用会触发 ``TakeoutInitDelayError`` —— 用户必须在另一台 Telegram 客户端
+      点击「同意导出」才能继续，之后 ``takeout_id`` 持久化在 session，永不再问。
 
     自动恢复策略：
       1. **FloodWait（限流）**：自动 sleep 服务器要求的秒数 + 2 秒缓冲，然后续传。
@@ -646,16 +663,27 @@ async def iter_chat_messages(
          若要求等待 > ``flood_wait_max`` 秒（默认 30 分钟）则放弃并抛出。
       2. **ConnectionError / OSError / TimeoutError**：把 client 主动断开后指数退避重连
          （2/4/8/16/32/60 秒，最多 ``max_retries`` 次）。
+      3. **TakeoutInitDelayError**：takeout 授权挂起 —— 直接抛出（用户操作问题，
+         自动 sleep 解决不了）。
+      4. **Takeout 静默 0 条**：takeout 通道完成但 raw=0 且 ``expected_new > 0`` →
+         退出 takeout，重新 ``while`` 循环用普通通道。仅尝试一次（``takeout_fallback_done``
+         flag 兜底）。命中场景：群启用 protected content / Telegram 服务端对该
+         entity + takeout scope 拒绝返回数据。
 
     断点续传：记录已 yield 的最大 last_id，每次重新 ``iter_messages(min_id=last_id)``，
     既不会重复也不会跳过。
     """
     import asyncio as _asyncio
 
-    fetched = 0
-    last_id = min_id  # 已成功 yield 的最大 message id（断线/限流续传基准）
+    fetched = 0           # convert_message 返回非 None 的（即真正 yield 出去的）条数
+    raw_fetched = 0       # iter_messages 实际拿到的 raw 消息条数（含 service / 空消息）
+    last_id = min_id      # 已 yield/拉到的最大 message id（断线/限流续传基准）
     attempt = 0
     client: TelegramClient | None = None
+    takeout_ctx = None    # _TakeoutClient context manager（finalize=False，不主动结束 takeout）
+    rpc_client = None     # 真正用于发 iter_messages 的 client（普通 client 或 takeout proxy）
+    takeout_active = use_takeout       # 当前这次 iter 是否走 takeout 通道（fallback 时翻成 False）
+    takeout_fallback_done = False      # 已经尝试过一次 takeout→普通的 fallback，避免无限循环
 
     async def _maybe_call(cb, *args):
         if cb is None:
@@ -664,78 +692,169 @@ async def iter_chat_messages(
         if hasattr(res, "__await__"):
             await res
 
-    while True:
-        try:
-            client = await get_client(api_id, api_hash)
-            if not client.is_connected():
-                await client.connect()
-            if not await client.is_user_authorized():
-                raise RuntimeError("未登录")
+    async def _ensure_takeout(c: TelegramClient):
+        """进入 takeout context；首次会触发用户授权（InitTakeoutSessionRequest）。
 
-            # entity 解析：Telethon get_entity 接受 int id（带 -100 前缀） / username / Peer
-            entity = await _resolve_entity(client, chat_id)
+        - session.takeout_id 已存在 → 直接复用（不传 scope 参数，否则
+          Telethon 会抛 "Can't send a takeout request while another takeout..." ValueError）
+        - session.takeout_id 为空 → 必须传 scope 参数让 Telegram 知道初始化范围
+        - finalize=False：__aexit__ 不调 FinishTakeoutSessionRequest，
+          takeout_id 留在 session 供下次复用
 
-            # reverse=True → id 升序；min_id 严格大于 last_id
-            async for tl_msg in client.iter_messages(entity, min_id=last_id, reverse=True):
-                if abort_check and abort_check():
-                    return
-                converted = convert_message(tl_msg, chat_id)
-                fetched += 1
-                last_id = tl_msg.id  # 记录进度（即使 converted is None 也推进，避免回退重拉）
-                if converted is not None:
-                    yield converted
-                if on_progress and fetched % 50 == 0:
-                    await _maybe_call(on_progress, fetched)
-            return  # 正常走完
-        except FloodWaitError as e:
-            # Telegram 限流 → 自动等待（不计入 attempt）
-            wait = max(int(getattr(e, "seconds", 0) or 0), 1) + 2
-            if wait > flood_wait_max:
-                logger.error(
-                    "iter_messages(%s) FloodWait 要求等待 %ds，超过上限 %ds，放弃",
-                    chat_id, wait, flood_wait_max,
-                )
-                raise
-            logger.warning(
-                "iter_messages(%s) FloodWait %ds @ msg_id=%d，自动等待后续传...",
-                chat_id, wait, last_id,
+        Telethon 1.x 把旧的简化参数 ``messages=True`` 拆成了四个对话类型开关
+        （``users`` 私聊 / ``chats`` 普通群 / ``megagroups`` 超级群 / ``channels`` 频道）。
+        我们要拉所有类型对话的历史消息，全部置 True；``files=False``（不下载媒体）+
+        ``contacts=False``（不要联系人列表）保持 takeout 最小占用。
+        """
+        if c.session.takeout_id is None:
+            return c.takeout(
+                finalize=False,
+                users=True,
+                chats=True,
+                megagroups=True,
+                channels=True,
             )
-            await _maybe_call(on_flood_wait, wait)
+        return c.takeout(finalize=False)
+
+    try:
+        while True:
             try:
-                # FloodWait 期间也要响应 abort（按秒分片 sleep）
-                slept = 0
-                while slept < wait:
+                client = await get_client(api_id, api_hash)
+                if not client.is_connected():
+                    await client.connect()
+                if not await client.is_user_authorized():
+                    raise RuntimeError("未登录")
+
+                # entity 解析：Telethon get_entity 接受 int id（带 -100 前缀） / username / Peer
+                entity = await _resolve_entity(client, chat_id)
+
+                # 进入 takeout（仅首次循环）—— 重连时复用同一 takeout_id
+                if takeout_active and rpc_client is None:
+                    takeout_ctx = await _ensure_takeout(client)
+                    try:
+                        rpc_client = await takeout_ctx.__aenter__()
+                    except TakeoutInitDelayError as e:
+                        wait = max(int(getattr(e, "seconds", 0) or 0), 1)
+                        logger.warning(
+                            "Takeout 需用户授权或等待 %ds（请在 Telegram 客户端确认数据导出请求）",
+                            wait,
+                        )
+                        await _maybe_call(on_takeout_pending, wait)
+                        raise
+                elif rpc_client is None:
+                    rpc_client = client
+
+                # 记录本轮 iter_messages 开始前的 raw_fetched 基线，用来在 iter 结束时判断
+                # "本轮拉了多少 raw"。只看 raw_fetched 总值会被前一轮 fallback 干扰
+                raw_fetched_before_iter = raw_fetched
+
+                # reverse=True → id 升序；min_id 严格大于 last_id
+                # wait_time=0 → 跳过 Telethon 默认每 100 条 sleep 1s（takeout 通道允许）
+                async for tl_msg in rpc_client.iter_messages(
+                    entity, min_id=last_id, reverse=True, wait_time=0,
+                ):
                     if abort_check and abort_check():
                         return
-                    step = min(1, wait - slept)
-                    await _asyncio.sleep(step)
-                    slept += step
-            finally:
-                # 通知 UI 等待结束
-                await _maybe_call(on_flood_wait, 0)
-            # 不 disconnect 也不 reset auth cache —— 继续 while 循环重启 iter_messages(min_id=last_id)
-            continue
-        except (ConnectionError, OSError, _asyncio.TimeoutError) as e:
-            attempt += 1
-            if attempt > max_retries:
-                logger.error(
-                    "iter_messages(%s) 连接 %d 次重试后仍失败：%s",
-                    chat_id, max_retries, e,
+                    raw_fetched += 1
+                    converted = convert_message(tl_msg, chat_id)
+                    last_id = tl_msg.id  # 记录进度（即使 converted is None 也推进，避免回退重拉）
+                    if converted is not None:
+                        fetched += 1
+                        yield converted
+                    # 进度回调按 raw 维度计数（更接近"telegram 实际处理量"，不会因为整群
+                    # 都是 service messages 而显得停滞）
+                    if on_progress and raw_fetched % 50 == 0:
+                        await _maybe_call(on_progress, raw_fetched)
+
+                # iter_messages 自然走完（无异常）。检测 takeout 静默 0 条的 fallback 条件：
+                #   - 当前走的是 takeout 通道
+                #   - 还没尝试过 fallback
+                #   - 本轮没拉到任何 raw 消息
+                #   - 上层估算这群有新消息
+                # 命中 → 退出 takeout context，下一轮 while 走普通通道重试。
+                this_iter_raw = raw_fetched - raw_fetched_before_iter
+                if (
+                    takeout_active
+                    and not takeout_fallback_done
+                    and this_iter_raw == 0
+                    and expected_new > 0
+                ):
+                    logger.warning(
+                        "iter_messages(%s) takeout 通道返回 0 条 raw 但远端预计 %d 条新消息，"
+                        "fallback 到普通通道重试（min_id=%d）",
+                        chat_id, expected_new, last_id,
+                    )
+                    takeout_fallback_done = True
+                    takeout_active = False
+                    # 退出 takeout context（finalize=False，takeout_id 留在 session）
+                    if takeout_ctx is not None:
+                        try:
+                            await takeout_ctx.__aexit__(None, None, None)
+                        except Exception as ex:
+                            logger.warning("退出 takeout context 失败（fallback 路径，可忽略）：%s", ex)
+                        takeout_ctx = None
+                    rpc_client = None
+                    continue  # 重新进 while，这次 takeout_active=False → 走普通通道
+                return  # 正常走完
+            except FloodWaitError as e:
+                # Telegram 限流 → 自动等待（不计入 attempt）
+                wait = max(int(getattr(e, "seconds", 0) or 0), 1) + 2
+                if wait > flood_wait_max:
+                    logger.error(
+                        "iter_messages(%s) FloodWait 要求等待 %ds，超过上限 %ds，放弃",
+                        chat_id, wait, flood_wait_max,
+                    )
+                    raise
+                logger.warning(
+                    "iter_messages(%s) FloodWait %ds @ msg_id=%d，自动等待后续传...",
+                    chat_id, wait, last_id,
                 )
-                raise
-            delay = min(2 ** attempt, 60)
-            logger.warning(
-                "iter_messages(%s) 断开于 msg_id=%d（%s），%ds 后第 %d/%d 次重连续传...",
-                chat_id, last_id, str(e)[:100], delay, attempt, max_retries,
-            )
-            # 主动断开旧连接让下次循环重建（避免 telethon 内部状态卡住）
+                await _maybe_call(on_flood_wait, wait)
+                try:
+                    # FloodWait 期间也要响应 abort（按秒分片 sleep）
+                    slept = 0
+                    while slept < wait:
+                        if abort_check and abort_check():
+                            return
+                        step = min(1, wait - slept)
+                        await _asyncio.sleep(step)
+                        slept += step
+                finally:
+                    # 通知 UI 等待结束
+                    await _maybe_call(on_flood_wait, 0)
+                # 不 disconnect 也不 reset auth cache —— 继续 while 循环重启 iter_messages(min_id=last_id)
+                continue
+            except (ConnectionError, OSError, _asyncio.TimeoutError) as e:
+                attempt += 1
+                if attempt > max_retries:
+                    logger.error(
+                        "iter_messages(%s) 连接 %d 次重试后仍失败：%s",
+                        chat_id, max_retries, e,
+                    )
+                    raise
+                delay = min(2 ** attempt, 60)
+                logger.warning(
+                    "iter_messages(%s) 断开于 msg_id=%d（%s），%ds 后第 %d/%d 次重连续传...",
+                    chat_id, last_id, str(e)[:100], delay, attempt, max_retries,
+                )
+                # 主动断开旧连接让下次循环重建（避免 telethon 内部状态卡住）
+                # 注意：takeout context 跨重连保持打开，takeout_id 不变 —— 重连后下一次
+                # iter_messages 仍走 InvokeWithTakeoutRequest 通道
+                try:
+                    if client is not None and client.is_connected():
+                        await client.disconnect()
+                except Exception:
+                    pass
+                _invalidate_auth_cache()
+                await _asyncio.sleep(delay)
+    finally:
+        # 退出 takeout context（finalize=False → 不调 FinishTakeoutSessionRequest，
+        # takeout_id 保留在 session 文件供下次同步复用，避免反复触发用户授权）
+        if takeout_ctx is not None:
             try:
-                if client is not None and client.is_connected():
-                    await client.disconnect()
-            except Exception:
-                pass
-            _invalidate_auth_cache()
-            await _asyncio.sleep(delay)
+                await takeout_ctx.__aexit__(None, None, None)
+            except Exception as e:
+                logger.warning("退出 takeout context 失败（可忽略）：%s", e)
 
 
 async def _resolve_entity(client: TelegramClient, chat_id: str) -> Any:

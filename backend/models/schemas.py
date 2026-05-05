@@ -399,6 +399,9 @@ class TelegramSyncProgress(BaseModel):
     current_imported: int = 0                 # 当前 chat 累计入库条数
     flood_wait_until: datetime | None = None  # FloodWait 等待截止时间（UTC）；非空表示正在限流等待
     flood_wait_seconds: int = 0               # 本次 FloodWait 总秒数（用于 UI 倒计时分母）
+    takeout_pending: bool = False             # Takeout 授权挂起：用户需要在另一台 Telegram 客户端点"同意导出"
+    takeout_pending_until: datetime | None = None  # Telegram 给的最长等待截止时间（UTC）
+    takeout_pending_seconds: int = 0          # Telegram 给的最长等待秒数
     results: list[dict] = []                  # 每个 chat 完成后追加 {chat_id, chat_name, status, message_count, error?}
     started_at: datetime | None = None
     finished_at: datetime | None = None

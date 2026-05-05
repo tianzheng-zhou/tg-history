@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from telethon.errors import (
     FloodWaitError,
     SessionPasswordNeededError,
+    TakeoutInitDelayError,
 )
 
 from backend.models.database import (
@@ -47,7 +48,6 @@ from backend.models.schemas import (
 )
 from backend.routers.import_router import (
     _enqueue_index,
-    _load_existing_ids,
     _stable_id_offset,
     import_messages_for_chat,
 )
@@ -76,6 +76,9 @@ _sync_progress: dict[str, Any] = {
     "current_imported": 0,
     "flood_wait_until": None,
     "flood_wait_seconds": 0,
+    "takeout_pending": False,
+    "takeout_pending_until": None,
+    "takeout_pending_seconds": 0,
     "results": [],
     "started_at": None,
     "finished_at": None,
@@ -98,6 +101,9 @@ def _reset_progress(total: int) -> None:
         "current_imported": 0,
         "flood_wait_until": None,
         "flood_wait_seconds": 0,
+        "takeout_pending": False,
+        "takeout_pending_until": None,
+        "takeout_pending_seconds": 0,
         "results": [],
         "started_at": datetime.utcnow(),
         "finished_at": None,
@@ -337,34 +343,41 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
     new_chat_ids: list[str] = []
     try:
         # ---------- 阶段 0：预扫描（Phase H：消息级总进度分母） ----------
-        # 对每个 chat 估算"待拉取条数"，累加成 grand_total，
         # 让前端主进度条按消息维度显示总体进度（而不是 chat 数维度）。
-        # 串行调（避免对同一账号并发触发 FloodWait），每 chat ~200ms：
-        #   - 100 个群 ≈ 20 秒预扫描，可接受
-        #   - 单个 chat ≈ 0.2 秒，几乎无感
+        # 优化：list_dialogs 一次返回所有对话的 last_message_id，本地 SQL 一次 GROUP BY
+        # 拿所有 chat 的 max(Message.id)，整个阶段 0 总计 2 个 IO 操作（~1-2 秒），
+        # 不再随 chat 数线性增长。
         _sync_progress["estimating"] = True
+        try:
+            dialogs = await tg.list_dialogs(api_id, api_hash)
+            remote_max_map: dict[str, int] = {
+                d["chat_id"]: int(d.get("last_message_id") or 0) for d in dialogs
+            }
+        except Exception as e:
+            logger.warning("预扫描 list_dialogs 失败：%s", e)
+            remote_max_map = {}
+
+        def _all_local_max() -> dict[str, int]:
+            rows = (
+                db.query(Message.chat_id, func.max(Message.id))
+                .filter(Message.chat_id.in_(chat_ids))
+                .group_by(Message.chat_id)
+                .all()
+            )
+            return {cid: mid for cid, mid in rows if mid is not None}
+
+        local_max_map = await asyncio.to_thread(_all_local_max)
+
         pre_estimates: dict[str, int] = {}
         for cid in chat_ids:
             if _sync_progress.get("aborting"):
                 break
-
-            def _local_min(cid_=cid) -> int:
-                offset = _stable_id_offset(cid_)
-                row = (
-                    db.query(func.max(Message.id))
-                    .filter(Message.chat_id == cid_)
-                    .scalar()
-                )
-                return max(0, (row or 0) - offset) if row else 0
-
-            local_min = await asyncio.to_thread(_local_min)
-            try:
-                remote_max = await tg.get_chat_remote_max_id(api_id, api_hash, cid)
-            except Exception:
-                remote_max = 0
+            offset = _stable_id_offset(cid)
+            local_min = max(0, local_max_map.get(cid, 0) - offset) if local_max_map.get(cid) else 0
+            remote_max = remote_max_map.get(cid, 0)
             est = max(0, remote_max - local_min) if remote_max > local_min else 0
             pre_estimates[cid] = est
-            _sync_progress["grand_total"] = sum(pre_estimates.values())
+        _sync_progress["grand_total"] = sum(pre_estimates.values())
         _sync_progress["estimating"] = False
 
         # ---------- 阶段 1：实际同步 ----------
@@ -375,8 +388,11 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
             # 一次性把该 chat 的状态加载齐全，包含：
             #   - min_id（incremental 拉取下界）
             #   - Import 行
-            #   - 现有全局 message id 集合（用于本次同步整个生命周期的 dedup）
-            # 后续所有 batch 都共用 existing_ids，避免每个 batch O(N) 扫全表。
+            # 注意：以前这里还会调 _load_existing_ids(db, cid) 一次性加载全 chat 的
+            # message.id 集合（50w 群 ~30MB 内存 / 几秒 IO，且阻塞 sync 启动让用户看着空白）。
+            # 现在改用 import_messages_for_chat 内部的 batch-scope IN 查询（每 2000 条
+            # 消息一次 IN，~10ms 被 commit 时间天然掩盖），把 existing_ids 设 None
+            # 即可触发新模式。
             def _load_chat_state():
                 offset_local = _stable_id_offset(cid)
                 row_local = (
@@ -387,13 +403,9 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
                 min_id_local = max(0, (row_local or 0) - offset_local) if row_local else 0
                 imp_local = db.query(Import).filter(Import.chat_id == cid).first()
                 existing_local = imp_local.chat_name if imp_local else None
-                # 50w 量级：~30MB / 几秒；但只发生一次
-                ids_local = _load_existing_ids(db, cid) if imp_local else set()
-                return min_id_local, imp_local, existing_local, ids_local
+                return min_id_local, imp_local, existing_local
 
-            min_id, imp, existing_name, existing_ids = await asyncio.to_thread(
-                _load_chat_state
-            )
+            min_id, imp, existing_name = await asyncio.to_thread(_load_chat_state)
 
             # 群名优先级：
             #   1. 现有 Import.chat_name 且看起来不是 chat_id 数字 → 用它
@@ -440,6 +452,21 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
                     _sync_progress["flood_wait_until"] = None
                     _sync_progress["flood_wait_seconds"] = 0
 
+            # Takeout 授权挂起回调：iter_chat_messages 进入 takeout context 失败时调用
+            #   wait > 0：用户必须在另一台 Telegram 客户端点"同意导出"，最多等 wait 秒
+            #   wait == 0：takeout 已就绪，清空挂起状态
+            def _on_takeout_pending(wait: int) -> None:
+                if wait > 0:
+                    _sync_progress["takeout_pending"] = True
+                    _sync_progress["takeout_pending_until"] = (
+                        datetime.now(timezone.utc) + timedelta(seconds=wait)
+                    )
+                    _sync_progress["takeout_pending_seconds"] = wait
+                else:
+                    _sync_progress["takeout_pending"] = False
+                    _sync_progress["takeout_pending_until"] = None
+                    _sync_progress["takeout_pending_seconds"] = 0
+
             batch: list[dict] = []
             min_dt: datetime | None = None
             max_dt: datetime | None = None
@@ -450,8 +477,12 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
                 async for converted in tg.iter_chat_messages(
                     api_id, api_hash, cid,
                     min_id=min_id,
+                    # 上一阶段预扫描算出的"远端有但本地没的"消息数估计，供 iter_chat_messages
+                    # 内部判断是否触发 takeout→普通通道的 fallback（>0 时启用）
+                    expected_new=estimated_total,
                     abort_check=lambda: _sync_progress.get("aborting", False),
                     on_flood_wait=_on_flood_wait,
+                    on_takeout_pending=_on_takeout_pending,
                 ):
                     _sync_progress["current_fetched"] = _sync_progress.get("current_fetched", 0) + 1
                     # 跨 chat 累加（Phase H）：让前端主进度条能按消息维度显示总进度
@@ -466,7 +497,8 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
 
                     if len(batch) >= 2000:
                         # batch size 500 → 2000：减少 commit 次数 + 减少 progress 更新频率。
-                        # existing_ids 共享：避免每个 batch 重新加载全 chat id 集合。
+                        # existing_ids=None：启用 import_messages_for_chat 的 batch-scope dedup
+                        # （每 batch 一次 IN 查询而不是开局一次性加载全 chat id 集到内存）。
                         # skip_total_count=True：避免每 batch 都跑一次 COUNT(*) 全表扫。
                         partial = await asyncio.to_thread(
                             import_messages_for_chat,
@@ -475,8 +507,7 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
                             chat_name=chat_name,
                             messages=batch,
                             date_range=tg.date_range_string(min_dt, max_dt),
-                            existing_ids=existing_ids,
-                            update_existing_ids=True,
+                            existing_ids=None,
                             skip_total_count=True,
                         )
                         total_new += partial.message_count
@@ -484,6 +515,13 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
                         batch.clear()
 
                 # 正常走完：剩余 batch 在下方统一 flush（避免与 except 分支重复）
+            except TakeoutInitDelayError as e:
+                # Takeout 需用户授权 —— 全局问题（不只影响当前 chat），后续所有 chat 都会一样失败。
+                # _on_takeout_pending 已写入挂起状态供前端展示横幅。
+                # 标记当前 chat 失败 + 触发 abort，让外层主循环退出（用户授权后重新点同步）
+                error = f"Telegram 数据导出需授权：请在另一台 Telegram 客户端确认请求（最多等 {e.seconds} 秒后重试）"
+                logger.warning("Takeout 授权挂起（%ds），同步终止待用户操作", e.seconds)
+                _sync_progress["aborting"] = True
             except FloodWaitError as e:
                 # 兜底：iter_chat_messages 已经会自动 sleep ≤ flood_wait_max（30 分钟）的限流；
                 # 走到这里说明等待时间超过上限，让用户知道并继续下一个 chat
@@ -495,7 +533,13 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
 
             # 无论成功/失败，把 batch 里剩下的消息存入 DB —— 保证「部分成功」不会丢
             # 收尾 flush 用 skip_total_count=False，让 Import.message_count 拿到准确值
-            if batch or total_new > 0:
+            #
+            # 第三个条件 ``imp is None and error is None``：首次同步一个群拿到 0 条新消息
+            # 但没出错的情况下，也走一次 import_messages_for_chat 让它创建 message_count=0 的
+            # Import 行 —— 否则该群从未在「已导入的群聊」列表里出现，用户会以为"被静默跳过"。
+            # 错误情况（imp is None and error is not None）保持不建 Import 行，免得用户在列表里
+            # 看到一行"成功导入 0 条"而把红色错误条目当作误报。
+            if batch or total_new > 0 or (imp is None and error is None):
                 try:
                     partial = await asyncio.to_thread(
                         import_messages_for_chat,
@@ -504,8 +548,7 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
                         chat_name=chat_name,
                         messages=batch,
                         date_range=tg.date_range_string(min_dt, max_dt),
-                        existing_ids=existing_ids,
-                        update_existing_ids=True,
+                        existing_ids=None,
                         skip_total_count=False,  # 收尾纠正 Import.message_count
                     )
                     total_new += partial.message_count
@@ -530,6 +573,23 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
             _sync_progress["completed"] = _sync_progress.get("completed", 0) + 1
 
     finally:
+        # abort 中途退出 for 循环时，被跳过的 chat 一直没机会写 results。
+        # 这里补一次差集：让用户能在 UI 上看到"哪些群没跑"，而不是误以为它们被静默成功导入。
+        try:
+            processed_ids = {r["chat_id"] for r in _sync_progress.get("results", [])}
+            for cid in chat_ids:
+                if cid in processed_ids:
+                    continue
+                _sync_progress["results"].append({
+                    "chat_id": cid,
+                    "chat_name": cid,  # 拿不到 entity 的真实名字（从未进循环），先回退到 chat_id
+                    "status": "skipped",
+                    "message_count": 0,
+                    "error": "中止同步前未处理",
+                })
+        except Exception:
+            logger.exception("补全 skipped results 失败（可忽略）")
+
         _sync_progress["running"] = False
         _sync_progress["estimating"] = False
         _sync_progress["finished_at"] = datetime.utcnow()

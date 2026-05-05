@@ -65,11 +65,39 @@ def _load_existing_ids(db: Session, chat_id: str) -> set[int]:
 
     在 50w 量级群聊上这一步本身就是 ~30MB 内存 + 几秒 IO，
     调用方应该 **每个 chat 只调一次**，然后把结果传给后续所有 batch。
+
+    增量同步路径（``_sync_runner``）已改用 :func:`_existing_ids_in` 走 batch-scope
+    IN 查询替代此函数；本函数仅保留给文件导入路径（``_import_one_parsed_with_progress``）
+    使用 —— 单文件导入一次性提交全 chat messages，全集加载更划算。
     """
     return {
         row[0]
         for row in db.query(Message.id).filter(Message.chat_id == chat_id).all()
     }
+
+
+def _existing_ids_in(db: Session, candidate_ids: list[int]) -> set[int]:
+    """批量查询给定 unique_id 列表中哪些已存在于 ``messages`` 表。
+
+    对增量同步场景（每批 ~2000 条消息），这是 :func:`_load_existing_ids` 的
+    O(N_chat) → O(batch) 替代品：
+
+    - 50w 群启动同步时不再一次性加载 ~30MB id 集到内存（节省冷启 IO + 内存峰值）
+    - 每 batch ~10ms IN 查询（被 batch flush 的 commit 时间天然掩盖）
+
+    SQLite 默认 ``SQLITE_MAX_VARIABLE_NUMBER`` 是 999；这里按 800 分片留余量。
+    """
+    if not candidate_ids:
+        return set()
+    out: set[int] = set()
+    chunk = 800
+    for i in range(0, len(candidate_ids), chunk):
+        sub = candidate_ids[i:i + chunk]
+        out.update(
+            row[0]
+            for row in db.query(Message.id).filter(Message.id.in_(sub)).all()
+        )
+    return out
 
 
 def import_messages_for_chat(
@@ -103,8 +131,17 @@ def import_messages_for_chat(
     """
     # 检查是否已导入（支持增量）
     existing = db.query(Import).filter(Import.chat_id == chat_id).first()
+
+    # Dedup 模式选择：
+    #   batch-scope（existing_ids is None）：每 FLUSH_EVERY 条做一次 IN 查询，
+    #     避免 50w 量级一次性加载 ~30MB id 集到内存。同 batch 内已选中的 id 通过
+    #     local_existing.add(unique_id) 防止重复。
+    #   full-set（existing_ids is not None）：调用方传入的全集 set；保持原行为。
+    #     update_existing_ids=True 时仍会 in-place 把新插入的 id 加回 set，
+    #     供调用方在多次 import_messages_for_chat 调用之间复用 dedup 状态。
+    use_batch_scope_dedup = (existing_ids is None) and (existing is not None)
     if existing_ids is None:
-        existing_ids = _load_existing_ids(db, chat_id) if existing else set()
+        existing_ids = set()  # full-set mode 下空集合等价于"chat 全新"
 
     # 为避免跨群聊 message id 冲突，使用 chat_id 稳定哈希偏移
     id_offset = _stable_id_offset(chat_id)
@@ -112,49 +149,77 @@ def import_messages_for_chat(
     # 批量插入新消息
     total_msgs = len(messages)
     new_count = 0
-    batch: list[Message] = []
     inserted_ids: list[int] = []  # 仅记录这次实际新增的全局 unique_id，用于 FTS 增量插入
+    pending: list[dict] = []      # 累积到 FLUSH_EVERY 后统一做 dedup + ORM build
 
     # 在大 batch 内部分块 flush，避免一次性把 50w ORM 对象塞进 SQLAlchemy session
     FLUSH_EVERY = 2000
     FTS_CHUNK = 500  # 远低于 SQLite 默认 SQLITE_MAX_VARIABLE_NUMBER
 
-    def _flush_batch_and_fts():
-        if not batch:
+    def _flush_pending():
+        """对 pending 批量 dedup + 构造 ORM + bulk_save。"""
+        nonlocal new_count
+        if not pending:
             return
-        db.bulk_save_objects(batch)
-        batch.clear()
+
+        # 计算本批所有 unique_id，一次 IN 查（仅 batch-scope mode）
+        if use_batch_scope_dedup:
+            cand = [id_offset + m["id"] for m in pending]
+            local_existing = _existing_ids_in(db, cand)
+        else:
+            # full-set mode：直接用调用方传入的 set（避免拷贝）
+            local_existing = existing_ids
+
+        orm_batch: list[Message] = []
+        # 独立的"本批已 schedule 入库 id"集合：
+        # - 防止 messages 列表里同一 id 出现两次（PK 冲突）
+        # - 与 local_existing 解耦，避免在 update_existing_ids=False 时意外
+        #   mutate 调用方传入的 set（保持原契约）
+        same_batch_seen: set[int] = set()
+        for m in pending:
+            unique_id = id_offset + m["id"]
+            # 双重 check 兼容历史数据：m["id"] 可能是没加 offset 的旧格式
+            if (
+                m["id"] in local_existing
+                or unique_id in local_existing
+                or unique_id in same_batch_seen
+            ):
+                continue
+            msg = Message(
+                id=unique_id,
+                chat_id=m["chat_id"],
+                date=m["date"],
+                sender=m["sender"],
+                sender_id=m["sender_id"],
+                text=m["text"],
+                text_plain=m["text_plain"],
+                reply_to_id=(id_offset + m["reply_to_id"]) if m["reply_to_id"] else None,
+                forwarded_from=m["forwarded_from"],
+                media_type=m["media_type"],
+            )
+            if m.get("entities"):
+                msg.set_entities(m["entities"])
+            orm_batch.append(msg)
+            inserted_ids.append(unique_id)
+            same_batch_seen.add(unique_id)
+            # 仅在 full-set mode 且调用方明确要求时把新 id 加回 set，
+            # 让多次调用之间能复用 dedup 状态（_import_one_parsed_with_progress 路径）
+            if update_existing_ids:
+                existing_ids.add(unique_id)
+            new_count += 1
+
+        if orm_batch:
+            db.bulk_save_objects(orm_batch)
+        pending.clear()
 
     for idx, m in enumerate(messages):
-        unique_id = id_offset + m["id"]
-        if m["id"] in existing_ids or unique_id in existing_ids:
-            continue
-        msg = Message(
-            id=unique_id,
-            chat_id=m["chat_id"],
-            date=m["date"],
-            sender=m["sender"],
-            sender_id=m["sender_id"],
-            text=m["text"],
-            text_plain=m["text_plain"],
-            reply_to_id=(id_offset + m["reply_to_id"]) if m["reply_to_id"] else None,
-            forwarded_from=m["forwarded_from"],
-            media_type=m["media_type"],
-        )
-        if m.get("entities"):
-            msg.set_entities(m["entities"])
-        batch.append(msg)
-        inserted_ids.append(unique_id)
-        if update_existing_ids:
-            existing_ids.add(unique_id)
-        new_count += 1
-
-        if len(batch) >= FLUSH_EVERY:
-            _flush_batch_and_fts()
+        pending.append(m)
+        if len(pending) >= FLUSH_EVERY:
+            _flush_pending()
             if progress_cb is not None:
                 progress_cb(idx + 1, total_msgs)
 
-    _flush_batch_and_fts()
+    _flush_pending()
     if progress_cb is not None:
         progress_cb(total_msgs, total_msgs)
 

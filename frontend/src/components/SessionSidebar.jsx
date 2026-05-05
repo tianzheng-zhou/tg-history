@@ -54,17 +54,22 @@ export default function SessionSidebar({ refreshKey }) {
   const reload = useCallback(async () => {
     setLoading(true);
     try {
-      const r1 = await listSessions({ archived: false, q: q || undefined, limit: 100 });
+      // 两次 listSessions 互不依赖 → 并行发，省一次 RTT。
+      // archivedOpen=false 时第二次仍发 limit=1 仅为拿 total 计数（用来显示"已归档 (N)"按钮），
+      // 服务端 ~25ms，比再设一个独立的 count endpoint 简单。
+      const [r1, r2] = await Promise.all([
+        listSessions({ archived: false, q: q || undefined, limit: 100 }),
+        listSessions({
+          archived: true,
+          q: q || undefined,
+          limit: archivedOpen ? 100 : 1,
+        }),
+      ]);
       setActive(r1.sessions || []);
       if (archivedOpen) {
-        const r2 = await listSessions({ archived: true, q: q || undefined, limit: 100 });
         setArchived(r2.sessions || []);
-        setArchivedTotal(r2.total || 0);
-      } else {
-        // 仅取计数
-        const r2 = await listSessions({ archived: true, q: q || undefined, limit: 1 });
-        setArchivedTotal(r2.total || 0);
       }
+      setArchivedTotal(r2.total || 0);
     } catch (e) {
       console.error("listSessions failed", e);
     } finally {
@@ -72,16 +77,16 @@ export default function SessionSidebar({ refreshKey }) {
     }
   }, [q, archivedOpen]);
 
-  useEffect(() => { reload(); }, [reload, refreshKey]);
-
-  // 当某个 run 状态变化（结束 / 新增）时，刷新一次列表（last_preview 会更新）
+  // 当某个 run 状态变化（结束 / 新增）时，列表里的 last_preview 会更新 —— 跟 reload 触发条件
+  // 合并到同一个 useEffect，避免一次 mount 同时跑两个 effect（StrictMode 下被放大成 4 次 reload，
+  // 浏览器并发 8+ 个 listSessions 请求，让用户看到明显的"加载一下"）
   const runsHash = Object.values(runs)
     .map((r) => `${r.session_id}:${r.status}:${r.maxSeq}`)
     .join("|");
   useEffect(() => {
     reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runsHash]);
+  }, [reload, refreshKey, runsHash]);
 
   const handleNew = () => navigate("/qa");
 

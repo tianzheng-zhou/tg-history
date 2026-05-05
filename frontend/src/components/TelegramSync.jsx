@@ -653,13 +653,13 @@ export default function TelegramSync({ onImported }) {
 // ---------- 同步进度面板 ----------
 
 function SyncProgressPanel({ progress }) {
-  // 倒计时本地 tick：仅在 FloodWait 中启动 1Hz interval 重渲染
+  // 倒计时本地 tick：仅在 FloodWait 或 Takeout 授权挂起 中启动 1Hz interval 重渲染
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (!progress?.flood_wait_until) return undefined;
+    if (!progress?.flood_wait_until && !progress?.takeout_pending_until) return undefined;
     const id = setInterval(() => setNow(Date.now()), 500);
     return () => clearInterval(id);
-  }, [progress?.flood_wait_until]);
+  }, [progress?.flood_wait_until, progress?.takeout_pending_until]);
 
   const floodWaitRemaining = useMemo(() => {
     if (!progress?.flood_wait_until) return 0;
@@ -667,6 +667,13 @@ function SyncProgressPanel({ progress }) {
     if (!Number.isFinite(deadline)) return 0;
     return Math.max(0, Math.ceil((deadline - now) / 1000));
   }, [progress?.flood_wait_until, now]);
+
+  const takeoutPendingRemaining = useMemo(() => {
+    if (!progress?.takeout_pending_until) return 0;
+    const deadline = new Date(progress.takeout_pending_until).getTime();
+    if (!Number.isFinite(deadline)) return 0;
+    return Math.max(0, Math.ceil((deadline - now) / 1000));
+  }, [progress?.takeout_pending_until, now]);
 
   // 选择主进度的呈现维度（三档退化 — Phase H）：
   //   1. grand_total > 0   → 全局消息维度（grand_fetched / grand_total），覆盖所有 chat 总量
@@ -740,6 +747,29 @@ function SyncProgressPanel({ progress }) {
         </p>
       )}
 
+      {/* Takeout 授权挂起横幅（最高优先级 —— 用户必须操作才能继续） */}
+      {progress.takeout_pending && (
+        <div className="mt-2 px-3 py-2 rounded border border-purple-200 bg-purple-50 flex items-start gap-2">
+          <ShieldCheck size={16} className="text-purple-600 shrink-0 mt-0.5" />
+          <div className="flex-1 min-w-0">
+            <div className="text-xs font-semibold text-purple-900 flex items-center gap-1">
+              <Smartphone size={12} className="shrink-0" />
+              需要授权 Telegram 数据导出
+            </div>
+            <div className="text-xs text-purple-800 mt-1 leading-relaxed">
+              请打开 <span className="font-medium">手机 / Desktop / Web</span> 上的 Telegram，在「设置」或弹出通知里
+              <span className="font-medium">同意本次数据导出请求</span>。
+              授权后回到这里点「开始同步」即可继续，无需再次确认。
+            </div>
+            {takeoutPendingRemaining > 0 && progress.takeout_pending_seconds > 0 && (
+              <div className="text-[11px] text-purple-700 mt-1">
+                Telegram 给出的最长等待：{takeoutPendingRemaining} 秒（超过后需重新发起请求）
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* FloodWait 倒计时横幅 */}
       {progress.running && progress.flood_wait_until && floodWaitRemaining > 0 && (
         <div className="mt-2 px-3 py-2 rounded border border-amber-200 bg-amber-50 flex items-center gap-2">
@@ -769,19 +799,24 @@ function SyncProgressPanel({ progress }) {
 
       {!progress.running && progress.results?.length > 0 && (
         <div className="mt-2 max-h-48 overflow-y-auto space-y-0.5">
-          {progress.results.map((r, i) => (
-            <p
-              key={i}
-              className={`text-xs ${
-                r.status === "ok" ? "text-green-700" : "text-red-600"
-              }`}
-            >
-              {r.status === "ok" ? "✓" : "✗"} {r.chat_name}
-              {r.status === "ok"
-                ? ` · 新增 ${r.message_count.toLocaleString()} 条`
-                : ` · ${r.error}`}
-            </p>
-          ))}
+          {progress.results.map((r, i) => {
+            // 三态显示：
+            //  - ok      → 绿 ✓ 新增 N 条
+            //  - skipped → 灰 ⊘ 中止前未处理（用户主动终止时被跳过的群）
+            //  - error / 其他 → 红 ✗ 错误信息
+            const isOk = r.status === "ok";
+            const isSkipped = r.status === "skipped";
+            const cls = isOk ? "text-green-700" : isSkipped ? "text-muted-foreground" : "text-red-600";
+            const icon = isOk ? "✓" : isSkipped ? "⊘" : "✗";
+            const tail = isOk
+              ? ` · 新增 ${r.message_count.toLocaleString()} 条`
+              : ` · ${r.error || "未知错误"}`;
+            return (
+              <p key={i} className={`text-xs ${cls}`}>
+                {icon} {r.chat_name}{tail}
+              </p>
+            );
+          })}
         </div>
       )}
     </div>
