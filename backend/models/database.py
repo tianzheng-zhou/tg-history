@@ -283,6 +283,28 @@ class TelegramAccount(Base):
     last_login_at = Column(DateTime)
 
 
+class TgUserProfileCache(Base):
+    """按需调 Telegram API 拉到的用户主页缓存。
+
+    仅当 agent 调 ``tool_get_user_profile`` 时才会写入；不会全量同步。
+    """
+
+    __tablename__ = "tg_user_profile_cache"
+
+    sender_id = Column(String, primary_key=True)              # "user6747261966"，与 messages.sender_id 同源
+    tg_user_id = Column(Integer, index=True)                  # 6747261966
+    display_name = Column(String)                             # first_name + last_name
+    username = Column(String, index=True)                     # 不带 @ 的用户名（可能为空）
+    bio = Column(Text)                                        # FullUser.about
+    is_bot = Column(Boolean, default=False)
+    is_premium = Column(Boolean, default=False)
+    common_chats_count = Column(Integer, default=0)
+    phone = Column(String)
+    deleted = Column(Boolean, default=False)                  # User.deleted（账号注销/封禁）
+    payload = Column(Text)                                    # 完整 JSON 兜底（含未来字段）
+    fetched_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 # ---------- Engine / Session ----------
 
 def _ensure_data_dir():

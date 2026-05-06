@@ -228,6 +228,11 @@ SYSTEM_PROMPT = """你是一个 Telegram 聊天记录分析的智能助手（Orc
 - **fetch_topic_context**：整话题原文
 - **fetch_messages**：按 id 拉原文 + 可选 `context_window` 拉前后 N 条邻居
 - **search_by_sender / search_by_date**：按人 / 按日期
+- **get_user_profile**(sender_id 或 username)：调 Telegram API 拉**实时**用户主页（display name / username / **bio** / 共同群数）
+  - 用于"这个 sender 是谁"、"卖家靠不靠谱"、"频道作者背景"
+  - **重要**：很多 Telegram 用户在 display name 和 bio 里放业务标签 / 联系方式 / 卡网链接
+  - 限流 1 req/sec，**不要批量调**；24h 内同一用户走本地缓存
+  - 仅限真实用户（user...），频道 / 群组 sender_id 不支持
 
 ## Artifact：调研型问题默认产出侧边文档
 

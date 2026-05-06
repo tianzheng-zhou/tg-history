@@ -513,6 +513,32 @@ async def tool_search_by_sender(
     }
 
 
+async def tool_get_user_profile(
+    db: Session,
+    *,
+    sender_id: str | None = None,
+    username: str | None = None,
+    use_cache: bool = True,
+) -> dict:
+    """按需调 Telegram API 拉用户主页（display name / username / bio / 共同群数等）。
+
+    至少传 ``sender_id`` 或 ``username`` 之一：
+        sender_id="user6747261966"   # 来自 messages.sender_id
+        username="cwoiuhwooiv"        # 来自截图或链接，可带 @
+
+    24h 内同 sender_id 的二次调用走缓存；超过则重新调 API。
+    Telegram 未登录、用户不存在、隐私限制等都返回结构化错误（带 ``code``）。
+    """
+    # 委托给 service 模块（限流 / 缓存 / 错误转换都在那边）
+    from backend.services.tg_user_profile import fetch_user_profile
+    return await fetch_user_profile(
+        db,
+        sender_id=sender_id,
+        username=username,
+        use_cache=use_cache,
+    )
+
+
 async def tool_search_by_date(
     db: Session,
     start_date: str,
@@ -1048,6 +1074,46 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "get_user_profile",
+            "description": (
+                "按需调 Telegram API 拉某用户的实时主页（display name / username / bio / 共同群数）。\n"
+                "**何时用**：\n"
+                "- 你在某条消息里看到一个 sender_id（如 'user6747261966'），想知道这人到底是谁、bio 写了什么\n"
+                "- 用户给了一个 @username，想看他的主页\n"
+                "- 在调研'卖家是否靠谱'、'这个频道作者背景'时，bio 经常有联系方式 / 业务标签\n"
+                "**何时不用**：\n"
+                "- 你只是想搜历史消息（用 keyword_search / search_by_sender）\n"
+                "- 你已经在 24h 内查过同一个用户（agent 自己应该记得，不必重查；非要重查可设 use_cache=false）\n"
+                "**注意**：\n"
+                "- 此工具会消耗 Telegram API quota，**不要批量调用**（限流：1 req/sec）\n"
+                "- 频道（channel...）和群组（chat...）不支持，仅限真实用户（user...）\n"
+                "- 未登录 Telegram 时返回 code='no_login'\n"
+                "- 隐私设置严格的用户可能拿不到 bio（返回 fallback 含基础信息）"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sender_id": {
+                        "type": "string",
+                        "description": "本地消息表里的 sender_id，如 'user6747261966'。优先使用这个",
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "Telegram username，如 'cwoiuhwooiv' 或 '@cwoiuhwooiv'",
+                    },
+                    "use_cache": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "是否优先用 24h 内的本地缓存。设 false 强制重新调 API",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_by_date",
             "description": "按日期范围查询消息（按时间顺序）。适合'某月发生了什么'这种时间型问题。"
                            "可选 chat_ids / senders / keywords 做进一步过滤。",
@@ -1309,6 +1375,7 @@ TOOL_HANDLERS = {
     "search_by_sender": tool_search_by_sender,
     "search_by_date": tool_search_by_date,
     "list_topics": tool_list_topics,
+    "get_user_profile": tool_get_user_profile,
     # research 工具在 dispatch_tool 中特殊处理（调用 sub_agent）
 }
 
