@@ -25,9 +25,13 @@ from backend.services.artifact_service import (
 )
 
 
-def _msg_to_dict(m: Message, preview_len: int = 400) -> dict:
-    """统一的消息 dict 格式"""
-    return {
+def _msg_to_dict(m: Message, preview_len: int = 400, include_sender_id: bool = False) -> dict:
+    """统一的消息 dict 格式。
+
+    ``include_sender_id`` 默认 False，避免每条消息多塞一段 token；
+    需要后续把 sender_id 喂给 ``get_user_profile`` 时由调用方显式开启。
+    """
+    out: dict = {
         "message_id": m.id,
         "chat_id": m.chat_id,
         "sender": m.sender,
@@ -35,6 +39,9 @@ def _msg_to_dict(m: Message, preview_len: int = 400) -> dict:
         "text": (m.text_plain or "")[:preview_len],
         "topic_id": m.topic_id,
     }
+    if include_sender_id:
+        out["sender_id"] = m.sender_id
+    return out
 
 
 def _parse_date(s: str | None) -> datetime | None:
@@ -236,6 +243,7 @@ async def tool_keyword_search(
     end_date: str | None = None,
     senders: list[str] | None = None,
     topic_ids: list[int] | None = None,
+    include_sender_id: bool = False,
 ) -> dict:
     """关键词检索：FTS5 trigram 优先，0 命中时回退 LIKE。rerank 按相关性重排。
 
@@ -329,7 +337,7 @@ async def tool_keyword_search(
         msgs = msgs[:limit]
 
     return {
-        "results": [_msg_to_dict(m, preview_len=250) for m in msgs],
+        "results": [_msg_to_dict(m, preview_len=250, include_sender_id=include_sender_id) for m in msgs],
         "count": len(msgs),
         "method": used_method,
     }
@@ -341,6 +349,7 @@ async def tool_fetch_messages(
     full_text: bool = False,
     limit: int | None = None,
     context_window: int = 0,
+    include_sender_id: bool = False,
 ) -> dict:
     """按 message_id 列表获取完整消息内容。
 
@@ -411,12 +420,12 @@ async def tool_fetch_messages(
     msgs, ctx_msgs = await asyncio.to_thread(_q)
     preview_len = 2000 if full_text else 500
     out: dict = {
-        "messages": [_msg_to_dict(m, preview_len=preview_len) for m in msgs],
+        "messages": [_msg_to_dict(m, preview_len=preview_len, include_sender_id=include_sender_id) for m in msgs],
         "count": len(msgs),
         "truncated": truncated,
     }
     if ctx_msgs:
-        out["context_messages"] = [_msg_to_dict(m, preview_len=preview_len) for m in ctx_msgs]
+        out["context_messages"] = [_msg_to_dict(m, preview_len=preview_len, include_sender_id=include_sender_id) for m in ctx_msgs]
         out["context_count"] = len(ctx_msgs)
     return out
 
@@ -425,6 +434,7 @@ async def tool_fetch_topic_context(
     db: Session,
     topic_id: int,
     limit: int = 30,
+    include_sender_id: bool = False,
 ) -> dict:
     """获取某话题的完整消息列表（按时间排序）。limit 默认 30、最大 200。"""
     limit = max(1, min(int(limit), 200))
@@ -455,7 +465,7 @@ async def tool_fetch_topic_context(
         "message_count": topic.message_count,
         "summary": topic.summary,
         "category": topic.category,
-        "messages": [_msg_to_dict(m, preview_len=400) for m in msgs],
+        "messages": [_msg_to_dict(m, preview_len=400, include_sender_id=include_sender_id) for m in msgs],
     }
 
 
@@ -470,6 +480,7 @@ async def tool_search_by_sender(
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = 50,
+    include_sender_id: bool = False,
 ) -> dict:
     """查询某些发言人的消息。senders 和 keywords 组内都是 OR 关系。"""
     senders_list = _coerce_str_list(senders)
@@ -508,7 +519,7 @@ async def tool_search_by_sender(
 
     msgs = await asyncio.to_thread(_q)
     return {
-        "results": [_msg_to_dict(m, preview_len=300) for m in msgs],
+        "results": [_msg_to_dict(m, preview_len=300, include_sender_id=include_sender_id) for m in msgs],
         "count": len(msgs),
     }
 
@@ -549,6 +560,7 @@ async def tool_search_by_date(
     keywords: list[str] | None = None,
     keyword: str | None = None,
     limit: int = 50,
+    include_sender_id: bool = False,
 ) -> dict:
     """按日期范围查询消息。start_date / end_date 格式: YYYY-MM-DD。
 
@@ -588,7 +600,7 @@ async def tool_search_by_date(
 
     msgs = await asyncio.to_thread(_q)
     return {
-        "messages": [_msg_to_dict(m, preview_len=300) for m in msgs],
+        "messages": [_msg_to_dict(m, preview_len=300, include_sender_id=include_sender_id) for m in msgs],
         "count": len(msgs),
     }
 
@@ -987,6 +999,11 @@ TOOL_SCHEMAS = [
                         "default": 30,
                         "description": "返回数量。范围 1-200。调研性问题建议 50-100",
                     },
+                    "include_sender_id": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "是否在结果中返回每条消息的 sender_id（如 'user6747261966'）。默认 false 以节省 token；如果后续打算用 get_user_profile 查这些发言人的主页/bio，请设为 true",
+                    },
                 },
                 "required": [],
             },
@@ -1020,6 +1037,11 @@ TOOL_SCHEMAS = [
                         "default": 0,
                         "description": "每条消息在同 chat 时序上的前后 N 条上下文（0 = 不拉，最大 20）",
                     },
+                    "include_sender_id": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "是否返回每条消息的 sender_id（如 'user6747261966'）。后续需要用 get_user_profile 查发言人主页时设为 true",
+                    },
                 },
                 "required": ["message_ids"],
             },
@@ -1039,6 +1061,11 @@ TOOL_SCHEMAS = [
                         "type": "integer",
                         "default": 30,
                         "description": "返回消息数上限（默认 30 / 最大 200）",
+                    },
+                    "include_sender_id": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "是否返回每条消息的 sender_id（如 'user6747261966'）。后续需要用 get_user_profile 查发言人主页时设为 true",
                     },
                 },
                 "required": ["topic_id"],
@@ -1066,6 +1093,11 @@ TOOL_SCHEMAS = [
                     "start_date": {"type": "string", "description": "YYYY-MM-DD"},
                     "end_date": {"type": "string", "description": "YYYY-MM-DD"},
                     "limit": {"type": "integer", "default": 50, "description": "范围 1-200"},
+                    "include_sender_id": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "是否返回每条消息的 sender_id（如 'user6747261966'）。后续需要用 get_user_profile 查发言人主页时设为 true",
+                    },
                 },
                 "required": [],
             },
@@ -1077,6 +1109,9 @@ TOOL_SCHEMAS = [
             "name": "get_user_profile",
             "description": (
                 "按需调 Telegram API 拉某用户的实时主页（display name / username / bio / 共同群数）。\n"
+                "**前置条件**：要拿到消息里的 sender_id，需要在调用 keyword_search / fetch_messages / "
+                "fetch_topic_context / search_by_sender / search_by_date 时把 `include_sender_id` 设为 true"
+                "（默认 false 时返回结果不含该字段以节省 token）。\n"
                 "**何时用**：\n"
                 "- 你在某条消息里看到一个 sender_id（如 'user6747261966'），想知道这人到底是谁、bio 写了什么\n"
                 "- 用户给了一个 @username，想看他的主页\n"
@@ -1128,6 +1163,11 @@ TOOL_SCHEMAS = [
                     "keywords": {"type": "array", "items": {"type": "string"}, "description": "关键词列表（OR）"},
                     "keyword": {"type": "string", "description": "单关键词（兼容老参数名）"},
                     "limit": {"type": "integer", "default": 50},
+                    "include_sender_id": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "是否返回每条消息的 sender_id（如 'user6747261966'）。后续需要用 get_user_profile 查发言人主页时设为 true",
+                    },
                 },
                 "required": ["start_date"],
             },
