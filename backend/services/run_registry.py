@@ -13,7 +13,7 @@ import asyncio
 import traceback
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import AsyncIterator
 
 from backend.models.database import SessionLocal
@@ -44,7 +44,7 @@ class Run:
     subscribers: set[asyncio.Queue] = field(default_factory=set)
     task: asyncio.Task | None = None
 
-    started_at: datetime = field(default_factory=datetime.utcnow)
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: datetime | None = None
 
     final_answer: str = ""
@@ -97,7 +97,7 @@ class RunRegistry:
                 chat_ids=chat_ids,
                 date_range=date_range,
                 sender=sender,
-                started_at=datetime.utcnow(),
+                started_at=datetime.now(timezone.utc),
             )
             self._runs[run_id] = run
             self._session_active[session_id] = run_id
@@ -178,7 +178,7 @@ class RunRegistry:
 
     async def cleanup_expired(self, ttl_seconds: int = 300) -> int:
         """删除已完成且超过 ttl 的 run。返回清理数量。"""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         to_delete: list[str] = []
         for run_id, run in self._runs.items():
             if run.status in ("pending", "running"):
@@ -317,6 +317,10 @@ def _build_trajectory(run: Run) -> dict:
 async def _run_worker(run: Run) -> None:
     """后台任务：跑 agent / rag，fan-out 事件，完成后持久化 assistant turn。"""
     db = SessionLocal()
+    # 通过共享 dict 让 qa_agent 在每次累加 usage 后实时把"当前 task_usage 快照"
+    # 写进来。即使下面的 async for 被 cancel，finally 里仍能从这里读到中断前的
+    # 累计 token + 费用估算并持久化到 turn meta（aborted 状态也能展示费用）。
+    usage_collector: dict = {}
     try:
         run.status = "running"
 
@@ -386,6 +390,7 @@ async def _run_worker(run: Run) -> None:
                 chat_ids=run.chat_ids,
                 history=history if history else None,
                 session_id=run.session_id,
+                usage_collector=usage_collector,
             ):
                 _emit(run, ev)
                 t = ev.get("type")
@@ -413,7 +418,16 @@ async def _run_worker(run: Run) -> None:
         _emit(run, {"type": "error", "error": str(e)})
 
     finally:
-        run.completed_at = datetime.utcnow()
+        run.completed_at = datetime.now(timezone.utc)
+
+        # 中断 / 失败时 final_answer 事件不会触发，但 collector["snapshot"] 已被
+        # qa_agent 实时刷新——用它兜底，让 aborted / failed 也能持久化 task_usage
+        # （含主+子分模型 token 用量 + 费用估算）。
+        # 注意：collector 是 main agent 路径的；rag 模式不参与，所以兜底仅在 agent 模式生效。
+        if run.final_task_usage is None:
+            snap = usage_collector.get("snapshot") if usage_collector else None
+            if snap:
+                run.final_task_usage = snap
 
         # 持久化 assistant turn（包含 trajectory + usage）
         trajectory = _build_trajectory(run)

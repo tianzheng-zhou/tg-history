@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
@@ -190,7 +190,7 @@ def create_artifact(
             f"请改用 update_artifact / rewrite_artifact 修改它，或换一个 key 新建"
         )
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     art = Artifact(
         session_id=session_id,
         artifact_key=artifact_key,
@@ -253,7 +253,7 @@ def update_artifact(
 
     new_content = cur.replace(old_str, new_str, 1)
     next_version = (art.current_version or 0) + 1
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     ver = ArtifactVersion(
         artifact_id=art.id,
@@ -296,7 +296,7 @@ def rewrite_artifact(
     prev_length = len(latest.content) if latest else 0
 
     next_version = (art.current_version or 0) + 1
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     ver = ArtifactVersion(
         artifact_id=art.id,
@@ -347,8 +347,8 @@ def artifact_to_summary_dict(art: Artifact) -> dict:
         "title": art.title,
         "content_type": art.content_type or "text/markdown",
         "current_version": art.current_version or 1,
-        "created_at": art.created_at or datetime.utcnow(),
-        "updated_at": art.updated_at or datetime.utcnow(),
+        "created_at": art.created_at or datetime.now(timezone.utc),
+        "updated_at": art.updated_at or datetime.now(timezone.utc),
     }
 
 
@@ -368,5 +368,5 @@ def version_to_item_dict(ver: ArtifactVersion) -> dict:
         "op": ver.op,
         "op_meta": _parse_op_meta(ver.op_meta),
         "turn_id": ver.turn_id,
-        "created_at": ver.created_at or datetime.utcnow(),
+        "created_at": ver.created_at or datetime.now(timezone.utc),
     }

@@ -4,7 +4,7 @@ import json
 import logging
 import tempfile
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -456,7 +456,7 @@ def _finish_import_progress(error: str | None = None) -> None:
     with _import_lock:
         _import_progress["running"] = False
         _import_progress["stage"] = "error" if error else "done"
-        _import_progress["finished_at"] = datetime.utcnow().isoformat()
+        _import_progress["finished_at"] = datetime.now(timezone.utc).isoformat()
         if error:
             _import_progress["error"] = error
 
@@ -589,7 +589,7 @@ async def import_chat(
     # 在写盘之前一次性"check + reserve"，避免两个并发上传都通过 running=False 检查后
     # 都开始写盘 / 跑 worker（TOCTOU race）。
     task_id = hashlib.sha256(
-        f"upload-{datetime.utcnow().isoformat()}".encode()
+        f"upload-{datetime.now(timezone.utc).isoformat()}".encode()
     ).hexdigest()[:16]
     with _import_lock:
         if _import_progress["running"]:
@@ -606,7 +606,7 @@ async def import_chat(
             "chats_total": 0,
             "files_done": 0,
             "files_total": 0,
-            "started_at": datetime.utcnow().isoformat(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
             "finished_at": None,
             "results": [],
             "error": None,
@@ -1002,7 +1002,7 @@ def _run_folder_scan(folder_id: int, task_id: str) -> None:
                 _import_progress["files_done"] += 1
 
         # 更新 folder 扫描元数据
-        folder.last_scan_at = datetime.now()
+        folder.last_scan_at = datetime.now(timezone.utc)
         folder.last_scan_total = len(files)
         folder.last_scan_imported = imported_count
         folder.last_scan_skipped = skipped
@@ -1033,7 +1033,7 @@ async def folder_scan(folder_id: int):
     与 ``/api/import`` 一样改成后台任务，前端通过 ``/api/import-progress`` 轮询。
     """
     task_id = hashlib.sha256(
-        f"folder-{folder_id}-{datetime.utcnow().isoformat()}".encode()
+        f"folder-{folder_id}-{datetime.now(timezone.utc).isoformat()}".encode()
     ).hexdigest()[:16]
     # check + reserve 原子操作，避免 TOCTOU
     with _import_lock:
@@ -1051,7 +1051,7 @@ async def folder_scan(folder_id: int):
             "chats_total": 0,
             "files_done": 0,
             "files_total": 0,
-            "started_at": datetime.utcnow().isoformat(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
             "finished_at": None,
             "results": [],
             "error": None,

@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import (
@@ -12,6 +12,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    TypeDecorator,
     UniqueConstraint,
     create_engine,
     event,
@@ -20,6 +21,40 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from backend.config import settings
+
+
+class UtcDateTime(TypeDecorator):
+    """审计时间专用列类型：保证写入时统一为 UTC、读取时返回 aware UTC datetime。
+
+    SQLite 不原生支持时区，所以底层仍存 naive datetime；本类做应用层兜底：
+    - 写入：aware → astimezone(UTC).replace(tzinfo=None)；naive → 假定已是 UTC 直接存
+    - 读取：naive UTC → 附加 tzinfo=UTC → aware UTC
+    Pydantic 序列化 aware datetime 会带 ``+00:00`` 后缀，前端 ``new Date(str)`` 能按 UTC
+    正确解析后再转本地显示，避免"UI 时间偏 8 小时"问题。
+
+    仅用于审计/系统时间字段（created_at / updated_at / imported_at 等）。
+    业务字段（Message.date / Topic.start_date）继续用 naive DateTime（语义=本地时间）。
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return value.replace(tzinfo=timezone.utc)
+
+
+def _utc_now() -> datetime:
+    """审计字段统一 default：aware UTC。"""
+    return datetime.now(timezone.utc)
 
 
 class Base(DeclarativeBase):
@@ -82,7 +117,7 @@ class Import(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     chat_name = Column(String)
     chat_id = Column(String, unique=True)
-    imported_at = Column(DateTime, default=datetime.now)
+    imported_at = Column(UtcDateTime, default=_utc_now)
     message_count = Column(Integer, default=0)
     date_range = Column(String)  # "2024-01-01 ~ 2024-06-30"
     index_built = Column(Boolean, default=False)  # 向量索引是否已构建
@@ -101,8 +136,8 @@ class ChatSession(Base):
     archived = Column(Boolean, default=False, index=True)
     turn_count = Column(Integer, default=0)
     last_preview = Column(String)  # 最后一条消息 80 字预览
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, index=True)
+    created_at = Column(UtcDateTime, default=_utc_now)
+    updated_at = Column(UtcDateTime, default=_utc_now, index=True)
 
 
 class ChatTurn(Base):
@@ -119,7 +154,7 @@ class ChatTurn(Base):
     trajectory = Column(Text)  # JSON，仅 assistant，完整 agent 推理链
     mode = Column(String)  # "agent" | "rag" 本轮实际模式
     meta = Column(Text)  # JSON：usage/confidence/aborted/run_id/...
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(UtcDateTime, default=_utc_now)
 
 
 class Artifact(Base):
@@ -145,8 +180,8 @@ class Artifact(Base):
     current_version = Column(Integer, default=1)  # 当前最新版本号（=ArtifactVersion.version 最大值）
     # 预留字段：未来升级到 chat-scoped 知识库时使用，现阶段始终 None
     chat_id = Column(String, nullable=True, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(UtcDateTime, default=_utc_now)
+    updated_at = Column(UtcDateTime, default=_utc_now, onupdate=_utc_now)
 
     __table_args__ = (
         UniqueConstraint("session_id", "artifact_key", name="uq_artifact_session_key"),
@@ -180,7 +215,7 @@ class ArtifactVersion(Base):
         ForeignKey("chat_turns.id", ondelete="SET NULL"),
         nullable=True,
     )
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(UtcDateTime, default=_utc_now)
 
     __table_args__ = (
         UniqueConstraint("artifact_id", "version", name="uq_artifact_version"),
@@ -223,11 +258,11 @@ class PublishedArticle(Base):
 
     # 时间
     # ↓ 用户关心的"生成时间" = 源 ArtifactVersion.created_at，UI 主展示字段
-    content_created_at = Column(DateTime, nullable=False, index=True)
+    content_created_at = Column(UtcDateTime, nullable=False, index=True)
     # 发布动作的时间（首次 publish 时 & overwrite 不改），仅用于内部追溯
-    published_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    published_at = Column(UtcDateTime, default=_utc_now, nullable=False)
     # 覆盖模式下会变，用来做"最近改动"排序辅助
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    updated_at = Column(UtcDateTime, default=_utc_now, onupdate=_utc_now, nullable=False)
 
 
 class WatchedFolder(Base):
@@ -238,8 +273,8 @@ class WatchedFolder(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     path = Column(String, unique=True, nullable=False)        # 绝对、规范化后的路径
     alias = Column(String)                                    # 可选别名（默认取路径末段）
-    added_at = Column(DateTime, default=datetime.now)
-    last_scan_at = Column(DateTime)
+    added_at = Column(UtcDateTime, default=_utc_now)
+    last_scan_at = Column(UtcDateTime)
     last_scan_total = Column(Integer, default=0)              # 上次扫描发现的 result.json 总数
     last_scan_imported = Column(Integer, default=0)           # 上次扫描成功导入的文件数
     last_scan_skipped = Column(Integer, default=0)            # 上次扫描因 mtime 未变跳过的文件数
@@ -259,7 +294,7 @@ class ImportedFile(Base):
     chat_count = Column(Integer, default=0)                   # 该文件解析出多少个群聊
     status = Column(String)                                   # "ok" | "error"
     error = Column(Text)                                      # 错误信息（截断）
-    imported_at = Column(DateTime, default=datetime.now)
+    imported_at = Column(UtcDateTime, default=_utc_now)
 
 
 class TelegramAccount(Base):
@@ -279,8 +314,8 @@ class TelegramAccount(Base):
     username = Column(String)                                 # 登录后填入（可能为空）
     first_name = Column(String)
     last_name = Column(String)
-    created_at = Column(DateTime, default=datetime.now)
-    last_login_at = Column(DateTime)
+    created_at = Column(UtcDateTime, default=_utc_now)
+    last_login_at = Column(UtcDateTime)
 
 
 class TgUserProfileCache(Base):
@@ -302,7 +337,7 @@ class TgUserProfileCache(Base):
     phone = Column(String)
     deleted = Column(Boolean, default=False)                  # User.deleted（账号注销/封禁）
     payload = Column(Text)                                    # 完整 JSON 兜底（含未来字段）
-    fetched_at = Column(DateTime, default=datetime.utcnow, index=True)
+    fetched_at = Column(UtcDateTime, default=_utc_now, index=True)
 
 
 # ---------- Engine / Session ----------

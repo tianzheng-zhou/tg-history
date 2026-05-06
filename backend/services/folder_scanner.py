@@ -200,7 +200,7 @@ def upsert_imported_file(
     error: str | None = None,
 ) -> None:
     """写入或更新 imported_files 行。调用方负责 commit。"""
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     err = (error[:500] if error else None)
     row = db.query(ImportedFile).filter(ImportedFile.abs_path == abs_path).first()
@@ -213,7 +213,7 @@ def upsert_imported_file(
             chat_count=chat_count,
             status=status,
             error=err,
-            imported_at=datetime.now(),
+            imported_at=datetime.now(timezone.utc),
         )
         db.add(row)
     else:
@@ -223,4 +223,4 @@ def upsert_imported_file(
         row.chat_count = chat_count
         row.status = status
         row.error = err
-        row.imported_at = datetime.now()
+        row.imported_at = datetime.now(timezone.utc)

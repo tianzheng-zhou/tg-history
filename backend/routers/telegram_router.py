@@ -105,7 +105,7 @@ def _reset_progress(total: int) -> None:
         "takeout_pending_until": None,
         "takeout_pending_seconds": 0,
         "results": [],
-        "started_at": datetime.utcnow(),
+        "started_at": datetime.now(timezone.utc),
         "finished_at": None,
     })
 
@@ -255,7 +255,7 @@ async def login_verify(req: TelegramVerifyRequest, db: Session = Depends(get_db)
     acc.username = info.get("username")
     acc.first_name = info.get("first_name")
     acc.last_name = info.get("last_name")
-    acc.last_login_at = datetime.utcnow()
+    acc.last_login_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(acc)
 
@@ -592,7 +592,7 @@ async def _sync_runner(api_id: int, api_hash: str, chat_ids: list[str]) -> None:
 
         _sync_progress["running"] = False
         _sync_progress["estimating"] = False
-        _sync_progress["finished_at"] = datetime.utcnow()
+        _sync_progress["finished_at"] = datetime.now(timezone.utc)
         _sync_progress["current_chat_id"] = None
         _sync_progress["current_chat_name"] = None
         _sync_progress["current_chat_total"] = 0

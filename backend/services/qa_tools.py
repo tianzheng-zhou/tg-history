@@ -571,6 +571,8 @@ async def tool_search_by_date(
     if sd is None:
         return {"messages": [], "count": 0,
                 "error": f"start_date 格式错误（应为 YYYY-MM-DD）: {start_date!r}"}
+    # 用 naive 本地时间 fallback：与 Message.date（naive 本地时间业务字段）语义对齐，
+    # 不能用 datetime.now(timezone.utc)——那会导致 SQL 比较 aware/naive 混算。
     ed = _parse_date(end_date) if end_date else datetime.now()
     if ed is None:
         return {"messages": [], "count": 0,

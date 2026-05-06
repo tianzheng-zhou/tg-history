@@ -603,10 +603,15 @@ def convert_message(msg: TLMessage, chat_id: str) -> Optional[dict]:
     # 输出一致（entities=[] 也兼容下游）。
     text_field_raw = text_plain
 
+    # Telethon 的 msg.date 是 aware UTC datetime；先 .astimezone() 转换为
+    # 服务器本地时区，再去掉 tzinfo 存成 naive 本地时间——与 parser.py 走 JSON
+    # 文件路径写入的 Message.date 语义一致（Telegram Desktop 导出 result.json
+    # 里的 "date" 字段就是导出客户端的本地时间，无时区后缀）。
+    # 否则同一条消息走 Telethon 同步会比 JSON 导入早 8 小时（中国 UTC+8）。
     return {
         "id": msg.id,
         "chat_id": chat_id,
-        "date": msg.date.replace(tzinfo=None) if msg.date else None,
+        "date": msg.date.astimezone().replace(tzinfo=None) if msg.date else None,
         "sender": sender_display,
         "sender_id": sender_id_str,
         "text": json.dumps(text_field_raw, ensure_ascii=False) if text_field_raw else "",

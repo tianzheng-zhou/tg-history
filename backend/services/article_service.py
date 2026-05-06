@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
@@ -161,8 +161,8 @@ def list_drafts(db: Session) -> list[dict]:
             "content_length": len(content),
             "content_preview": _preview(content),
             "publication_count": pub_counts.get(art.id, 0),
-            "created_at": art.created_at or datetime.utcnow(),
-            "updated_at": art.updated_at or datetime.utcnow(),
+            "created_at": art.created_at or datetime.now(timezone.utc),
+            "updated_at": art.updated_at or datetime.now(timezone.utc),
         })
     return out
 
@@ -217,7 +217,7 @@ def publish_article(
     session_row = db.query(ChatSession).filter(ChatSession.id == session_id).first()
     session_title = (session_row.title if session_row else None) or "（未命名会话）"
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     # 源版本的生成时间，用作 UI 主展示
     content_created_at = cur_ver.created_at or now
 
@@ -263,7 +263,7 @@ def publish_article(
     article.content_type = art.content_type or "text/markdown"
     article.content_created_at = content_created_at
     # published_at 保持不变（这是"首次发布时间"的语义）
-    # updated_at 由 SQLAlchemy onupdate=datetime.utcnow 自动更新
+    # updated_at 由 SQLAlchemy onupdate=_utc_now 自动更新
     db.commit()
     db.refresh(article)
     return article

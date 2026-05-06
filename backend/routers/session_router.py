@@ -180,8 +180,10 @@ def export_session(
         )
 
     # Markdown
+    # s.created_at 是 aware UTC（UtcDateTime 列），导出文档显示服务器本地时间更友好
+    created_local = s.created_at.astimezone().strftime("%Y-%m-%d %H:%M") if s.created_at else "—"
     lines: list[str] = [f"# {s.title}", ""]
-    lines.append(f"- 创建时间：{s.created_at}")
+    lines.append(f"- 创建时间：{created_local}")
     lines.append(f"- 模式：{s.mode}")
     lines.append(f"- 消息数：{s.turn_count}")
     lines.append("")

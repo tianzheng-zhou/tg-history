@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import and_, desc, func, or_
@@ -62,8 +62,8 @@ def session_to_dict(s: ChatSession, artifact_count: int = 0) -> dict:
         "turn_count": s.turn_count or 0,
         "artifact_count": artifact_count,
         "last_preview": s.last_preview,
-        "created_at": s.created_at or datetime.utcnow(),
-        "updated_at": s.updated_at or datetime.utcnow(),
+        "created_at": s.created_at or datetime.now(timezone.utc),
+        "updated_at": s.updated_at or datetime.now(timezone.utc),
     }
 
 
@@ -100,7 +100,7 @@ def turn_to_dict(t: ChatTurn) -> dict:
         "trajectory": _parse_json(t.trajectory),
         "mode": t.mode,
         "meta": _parse_json(t.meta),
-        "created_at": t.created_at or datetime.utcnow(),
+        "created_at": t.created_at or datetime.now(timezone.utc),
     }
 
 
@@ -113,7 +113,7 @@ def create_session(
     chat_ids: list[str] | None = None,
 ) -> ChatSession:
     sid = uuid.uuid4().hex
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     s = ChatSession(
         id=sid,
         title=title or "新对话",
@@ -204,7 +204,7 @@ def update_session(
     if chat_ids is not None:
         s.chat_ids = _dump_json(chat_ids) if chat_ids else None
     if bump_updated:
-        s.updated_at = datetime.utcnow()
+        s.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(s)
     return s
@@ -262,7 +262,7 @@ def append_turn(
 ) -> ChatTurn:
     """追加一条 turn，并更新 session 的 turn_count / last_preview / updated_at。"""
     seq = _next_seq(db, session_id)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     t = ChatTurn(
         session_id=session_id,
         seq=seq,

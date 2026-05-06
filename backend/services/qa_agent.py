@@ -484,18 +484,93 @@ def _build_artifact_summary(db: Session, session_id: str | None) -> str:
     return "\n".join(lines)
 
 
+def _build_task_usage_dict(
+    cumulative_usage: dict,
+    sub_agent_usage: dict,
+    main_model: str,
+    sub_model: str,
+    actual_steps: int,
+    max_steps: int,
+    forced_summary: bool,
+    *,
+    partial: bool = False,
+) -> dict:
+    """从累积 usage 构造完整 task_usage dict（含主/子分模型计价）。
+
+    抽成独立函数让"中断时从 collector 拿当前快照"和"final_answer 时给完整数据"
+    复用同一段计算逻辑，避免双份维护。
+
+    ``partial=True`` 时多打一个 ``partial`` 标记（前端可据此显示"中断时累计"前缀）。
+    """
+    has_sub = sub_agent_usage["total_tokens"] > 0
+    main_usage = {
+        k: max(cumulative_usage[k] - sub_agent_usage[k], 0)
+        for k in cumulative_usage
+    }
+    main_cost = llm_adapter.estimate_cost(
+        main_model,
+        main_usage["prompt_tokens"],
+        main_usage["completion_tokens"],
+        main_usage["cached_tokens"],
+        main_usage["cache_creation_tokens"],
+    )
+    sub_cost = llm_adapter.estimate_cost(
+        sub_model,
+        sub_agent_usage["prompt_tokens"],
+        sub_agent_usage["completion_tokens"],
+        sub_agent_usage["cached_tokens"],
+        sub_agent_usage["cache_creation_tokens"],
+    ) if has_sub else 0.0
+    total_cost = round(main_cost + sub_cost, 6)
+
+    task_usage: dict = {
+        "main": {
+            "model": main_model,
+            **main_usage,
+            "cost_yuan": main_cost,
+        },
+        # 汇总字段（兼容老前端读取）
+        **cumulative_usage,
+        "estimated_cost_yuan": total_cost,
+        "model": main_model,
+        # 循环诊断信息
+        "steps": actual_steps,
+        "max_steps": max_steps,
+        "forced_summary": forced_summary,
+        # 老兼容字段（老 session 读取不会报错）
+        "sub_agent_prompt_tokens": sub_agent_usage["prompt_tokens"],
+        "sub_agent_completion_tokens": sub_agent_usage["completion_tokens"],
+        "sub_agent_cached_tokens": sub_agent_usage["cached_tokens"],
+    }
+    if has_sub:
+        task_usage["sub"] = {
+            "model": sub_model,
+            **sub_agent_usage,
+            "cost_yuan": sub_cost,
+        }
+    if partial:
+        task_usage["partial"] = True
+    return task_usage
+
+
 async def run_agent(
     db: Session,
     question: str,
     chat_ids: list[str] | None = None,
     history: list[dict] | None = None,
     session_id: str | None = None,
+    usage_collector: dict | None = None,
 ) -> AsyncIterator[dict]:
     """Agent 主循环，yield 事件给上层。
 
     Args:
         session_id: 当前对话 session 的 ID。Artifact 类工具需要它作为上下文；
             缺失时这些工具会返回 ``no_session`` 错误（不会让整个 agent 崩）。
+        usage_collector: 可选 dict 引用——本函数会在每次累加 usage 后把当前
+            partial task_usage 快照写入 ``usage_collector["snapshot"]``。这样即使
+            上层把本 generator cancel 掉，也能从 collector 读到中断前的累计用量
+            + 费用估算（主 agent 累计 + 子 agent 累计 + 主/子分模型计价）。
+            ``run_registry._run_worker`` 用此机制保证 aborted 状态也能持久化 task_usage。
     """
     # 构造 user 消息；如果指定了 chat_ids，注入上下文
     # 注意：时间戳和 artifact 摘要的注入发生在上游 run_registry._run_worker 中
@@ -525,23 +600,52 @@ async def run_agent(
     cited_message_ids: set[int] = set()
     final_text_parts: list[str] = []
 
-    # 累计 token 用量（含子 Agent）
-    cumulative_usage = {
-        "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
-        "cached_tokens": 0, "cache_creation_tokens": 0,
-    }
-    sub_agent_usage = {
-        "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
-        "cached_tokens": 0, "cache_creation_tokens": 0,
-    }
+    # 累计 token 用量（含子 Agent）—— 优先用 collector 提供的 dict 引用，
+    # 这样 generator 被 cancel 后上层仍能读到中断前的累计值。
+    if usage_collector is not None:
+        cumulative_usage = usage_collector.setdefault("cumulative", {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "cached_tokens": 0, "cache_creation_tokens": 0,
+        })
+        sub_agent_usage = usage_collector.setdefault("sub_agent", {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "cached_tokens": 0, "cache_creation_tokens": 0,
+        })
+    else:
+        cumulative_usage = {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "cached_tokens": 0, "cache_creation_tokens": 0,
+        }
+        sub_agent_usage = {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "cached_tokens": 0, "cache_creation_tokens": 0,
+        }
     # 是否走到了"达到 MAX_STEPS 强制总结"分支（前端可提示"被截断"）
     forced_summary = False
     # 最终实际用到的步数（未被截断时 = 正常结束步；被截断时 = MAX_STEPS）
     actual_steps = 0
 
+    main_model = settings.llm_model_qa
+    sub_model = settings.effective_sub_agent_model
+
     def _add_usage(target: dict, u: dict):
         for k in target:
             target[k] += u.get(k, 0)
+
+    def _refresh_usage_snapshot() -> None:
+        """每次累加 usage 后调用：把当前累计值写入 collector["snapshot"]。
+
+        ``run_registry`` 在 cancel 后会读 ``snapshot`` 持久化到 turn meta，
+        让 aborted 状态也能展示"已花费 X 元"。
+        """
+        if usage_collector is None:
+            return
+        usage_collector["snapshot"] = _build_task_usage_dict(
+            cumulative_usage, sub_agent_usage,
+            main_model, sub_model,
+            actual_steps or 0, MAX_STEPS, forced_summary,
+            partial=True,
+        )
 
     for step in range(1, MAX_STEPS + 1):
         yield {"type": "step_start", "step": step}
@@ -584,6 +688,9 @@ async def run_agent(
                 elif ev["type"] == "usage":
                     # 累加到全局用量
                     _add_usage(cumulative_usage, ev)
+                    # 立即刷新 partial 快照——cancel 落在后续 await 时仍能保留
+                    actual_steps = step
+                    _refresh_usage_snapshot()
                     # 向上透传 usage（上下文占比显示）
                     yield {**ev, "step": step}
                 elif ev["type"] == "done":
@@ -683,6 +790,15 @@ async def run_agent(
 
         async def _sub_event_cb(ev: dict):
             sub_events.append(ev)
+            # 子 Agent 每次累加 usage 时实时透传增量，让主 Agent 也实时累加；
+            # 这样如果用户在子 Agent 跑一半时点 abort，主 Agent 的 cumulative_usage /
+            # sub_agent_usage 已经反映了部分用量，写入 collector["snapshot"] 后
+            # run_registry 的 finally 块能持久化中断时的费用估算。
+            if ev.get("type") == "sub_usage_delta":
+                u = ev.get("usage") or {}
+                _add_usage(cumulative_usage, u)
+                _add_usage(sub_agent_usage, u)
+                _refresh_usage_snapshot()
 
         # Artifact 工具与 sub_agent 都通过 dispatch_tool 入口；
         # session_id 给 artifact handlers 用，event_callback 给 sub_agent 用。
@@ -747,11 +863,15 @@ async def run_agent(
 
             call, result, duration_ms = item
 
-            # 收集子 Agent usage（research 工具返回中包含 usage 字段）
-            sub_usage = result.get("usage") if isinstance(result, dict) else None
-            if sub_usage and isinstance(sub_usage, dict):
-                _add_usage(cumulative_usage, sub_usage)
-                _add_usage(sub_agent_usage, sub_usage)
+            # 收集子 Agent usage（research 工具返回中包含 usage 字段）。
+            # research 工具的 usage 已经通过 sub_usage_delta 事件实时累加（见上面
+            # _sub_event_cb），这里跳过避免双计；其他工具不会返回 usage 字段。
+            if call["name"] != "research":
+                sub_usage = result.get("usage") if isinstance(result, dict) else None
+                if sub_usage and isinstance(sub_usage, dict):
+                    _add_usage(cumulative_usage, sub_usage)
+                    _add_usage(sub_agent_usage, sub_usage)
+                    _refresh_usage_snapshot()
 
             # 收集消息 ID 用于后续引用
             _collect_ids(result, cited_message_ids)
@@ -834,6 +954,7 @@ async def run_agent(
                     _fu = getattr(chunk, "usage", None)
                     if _fu is not None:
                         _add_usage(cumulative_usage, llm_adapter.parse_usage(_fu))
+                        _refresh_usage_snapshot()
                     choice = chunk.choices[0] if chunk.choices else None
                     if choice and choice.delta.content:
                         forced_text += choice.delta.content
@@ -845,59 +966,16 @@ async def run_agent(
     # 构造 sources（从引用过的消息中选前 5 条，按话题去重）
     sources = _build_sources(db, cited_message_ids)
 
-    # 计算预估费用 —— 主/子 分模型计价。
-    # cumulative_usage 包含主+子（子的 usage 在处理 research 结果时被加进去了），
-    # 主仅 = cumulative - sub。max(0, ...) 防边界。
-    main_model = settings.llm_model_qa
-    sub_model = settings.effective_sub_agent_model
-    has_sub = sub_agent_usage["total_tokens"] > 0
-
-    main_usage = {
-        k: max(cumulative_usage[k] - sub_agent_usage[k], 0)
-        for k in cumulative_usage
-    }
-    main_cost = llm_adapter.estimate_cost(
-        main_model,
-        main_usage["prompt_tokens"],
-        main_usage["completion_tokens"],
-        main_usage["cached_tokens"],
-        main_usage["cache_creation_tokens"],
+    # 构造 final task_usage（与 _refresh_usage_snapshot 走同一份逻辑，partial=False）
+    task_usage = _build_task_usage_dict(
+        cumulative_usage, sub_agent_usage,
+        main_model, sub_model,
+        actual_steps or MAX_STEPS, MAX_STEPS, forced_summary,
+        partial=False,
     )
-    sub_cost = llm_adapter.estimate_cost(
-        sub_model,
-        sub_agent_usage["prompt_tokens"],
-        sub_agent_usage["completion_tokens"],
-        sub_agent_usage["cached_tokens"],
-        sub_agent_usage["cache_creation_tokens"],
-    ) if has_sub else 0.0
-    total_cost = round(main_cost + sub_cost, 6)
-
-    task_usage: dict = {
-        # 新结构：主/子明细
-        "main": {
-            "model": main_model,
-            **main_usage,
-            "cost_yuan": main_cost,
-        },
-        # 汇总字段（兼容老前端读取）
-        **cumulative_usage,
-        "estimated_cost_yuan": total_cost,
-        "model": main_model,
-        # 循环诊断信息
-        "steps": actual_steps or MAX_STEPS,
-        "max_steps": MAX_STEPS,
-        "forced_summary": forced_summary,
-        # 老兼容字段（老 session 读取不会报错）
-        "sub_agent_prompt_tokens": sub_agent_usage["prompt_tokens"],
-        "sub_agent_completion_tokens": sub_agent_usage["completion_tokens"],
-        "sub_agent_cached_tokens": sub_agent_usage["cached_tokens"],
-    }
-    if has_sub:
-        task_usage["sub"] = {
-            "model": sub_model,
-            **sub_agent_usage,
-            "cost_yuan": sub_cost,
-        }
+    # 同步 collector 的最新快照为最终值（覆盖 partial=True 的中间快照）
+    if usage_collector is not None:
+        usage_collector["snapshot"] = task_usage
 
     yield {
         "type": "final_answer",

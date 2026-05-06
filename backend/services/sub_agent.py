@@ -428,6 +428,19 @@ async def run_sub_agent(
         if event_callback:
             await event_callback(event)
 
+    async def _add_usage_and_emit(u: dict | None):
+        """累加本次 LLM 调用的 usage，并实时通过 event_callback emit 一个增量。
+
+        让上层（主 Agent / run_registry）即使在子 Agent 跑一半时被 cancel，
+        也能拿到中断前已累计的 usage —— 否则子 Agent 是普通 async 函数，
+        cancel 时 return dict 永远不会执行，外层完全感知不到已花费的 tokens。
+        """
+        if not u:
+            return
+        _add_usage(u)
+        # 增量 = 本次累加的 usage（不是累计值）；上层用 _add_usage 可叠加
+        await _emit({"type": "sub_usage_delta", "usage": u})
+
     # 标记：是否因为上下文软上限提前 break（决定要不要走强制总结分支）
     soft_limit_hit = False
 
@@ -458,7 +471,7 @@ async def run_sub_agent(
                 elif ev["type"] == "tool_calls":
                     step_tool_calls = ev["calls"]
                 elif ev["type"] == "usage":
-                    _add_usage(ev["usage"])
+                    await _add_usage_and_emit(ev["usage"])
                 elif ev["type"] == "done":
                     break
         except Exception as e:
@@ -574,7 +587,7 @@ async def run_sub_agent(
         async with sem:
             resp = await client.chat.completions.create(**force_kwargs)
         report = resp.choices[0].message.content or ""
-        _add_usage(llm_adapter.parse_usage(getattr(resp, "usage", None)))
+        await _add_usage_and_emit(llm_adapter.parse_usage(getattr(resp, "usage", None)))
     except Exception as e:
         report = f"子 Agent 强制总结失败: {e}"
 

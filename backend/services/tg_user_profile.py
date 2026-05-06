@@ -20,7 +20,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -123,7 +123,9 @@ def _get_cached(db: Session, sender_id: str | None, username: str | None) -> TgU
 def _is_fresh(row: TgUserProfileCache) -> bool:
     if not row or not row.fetched_at:
         return False
-    return datetime.utcnow() - row.fetched_at < CACHE_TTL
+    # row.fetched_at 经 UtcDateTime TypeDecorator 返回为 aware UTC；
+    # 所以左侧也用 aware UTC。避免 aware/naive 混算 TypeError。
+    return datetime.now(timezone.utc) - row.fetched_at < CACHE_TTL
 
 
 def _save_to_cache(db: Session, sender_id: str, full_user_resp: Any) -> TgUserProfileCache:
@@ -171,7 +173,7 @@ def _save_to_cache(db: Session, sender_id: str, full_user_resp: Any) -> TgUserPr
     row.phone = getattr(base_user, "phone", None)
     row.deleted = bool(getattr(base_user, "deleted", False))
     row.payload = json.dumps(payload, ensure_ascii=False)
-    row.fetched_at = datetime.utcnow()
+    row.fetched_at = datetime.now(timezone.utc)
 
     db.commit()
     db.refresh(row)
@@ -375,6 +377,6 @@ async def fetch_user_profile(
                 common_chats_count=getattr(full.full_user, "common_chats_count", 0) or 0,
                 phone=getattr(entity, "phone", None),
                 deleted=bool(getattr(entity, "deleted", False)),
-                fetched_at=datetime.utcnow(),
+                fetched_at=datetime.now(timezone.utc),
             )
         return _row_to_dict(row, cached=False)
