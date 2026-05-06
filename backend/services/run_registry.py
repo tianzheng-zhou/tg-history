@@ -53,6 +53,10 @@ class Run:
     final_task_usage: dict | None = None
     error: str | None = None
 
+    # tool_call_id → 完整 tool_result JSON 字符串。不走 run.events 避免给 SSE 订阅者
+    # 反复推送 50KB+ 大负载；build_trajectory 时合并进 tool_calls[i].output 持久化。
+    tool_outputs: dict = field(default_factory=dict)
+
 
 # ---------- Registry ----------
 
@@ -198,7 +202,21 @@ registry = RunRegistry()
 # ---------- event emit ----------
 
 def _emit(run: Run, event: dict) -> None:
-    """给事件打 seq、追加到 buffer、广播给所有订阅者。"""
+    """给事件打 seq、追加到 buffer、广播给所有订阅者。
+
+    特殊处理：tool_result 事件里的 ``output_full`` 字段（可能 50KB 量级）
+    不走 run.events 也不推给 SSE 订阅者，只存到 ``run.tool_outputs[tool_call_id]``，
+    由 ``_build_trajectory`` 最后合并进 tool_calls[i].output。
+    这样可以：
+      - 避免订阅者反复拿到大重复 payload（前端只需 output_preview）。
+      - 避免 run.events buffer 随调用次数线性增长。
+    """
+    if event.get("type") == "tool_result" and "output_full" in event:
+        full = event.pop("output_full")
+        tc_id = event.get("id")
+        if tc_id and isinstance(full, str):
+            run.tool_outputs[tc_id] = full
+
     event["seq"] = run.seq
     run.seq += 1
     run.events.append(event)
@@ -213,7 +231,11 @@ def _emit(run: Run, event: dict) -> None:
 # ---------- trajectory 构造 ----------
 
 def _build_trajectory(run: Run) -> dict:
-    """从 run.events 构造紧凑 trajectory JSON，供持久化 + 历史还原用。"""
+    """从 run.events + run.tool_outputs 构造紧凑 trajectory JSON。
+
+    输出结构跟原来一致，额外给每个 tool_calls[i] 打上 ``output``（完整 JSON 字符串）。
+    ``output`` 会被 session_service.get_history_messages 读出来还原成完整的 tool 角色 message。
+    """
     steps_by_idx: dict[int, dict] = {}
 
     def _ensure(step: int) -> dict:
@@ -267,6 +289,14 @@ def _build_trajectory(run: Run) -> dict:
             s["thinking"] = s["thinking"][:MAX_CHARS] + "\n...[truncated]"
         if len(s["reasoning"]) > MAX_CHARS:
             s["reasoning"] = s["reasoning"][:MAX_CHARS] + "\n...[truncated]"
+
+    # 把 run.tool_outputs 合并进每个 step 的 tool_calls[i].output。
+    # _truncate_tool_output 已经保证每条 ≤ MAX_TOOL_OUTPUT_CHARS（50000），这里不再截。
+    for s in steps_by_idx.values():
+        for tc in s.get("tool_calls", []):
+            tc_id = tc.get("id")
+            if tc_id and tc_id in run.tool_outputs:
+                tc["output"] = run.tool_outputs[tc_id]
 
     # RAG 模式的额外事件（status/search_result/rerank/context）
     rag_events = []

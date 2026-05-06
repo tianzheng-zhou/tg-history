@@ -12,6 +12,7 @@
 | [`04-agent-core.md`](./04-agent-core.md) | **Agent 主循环（最核心）** | `llm_adapter.py`, `qa_agent.py` |
 | [`05-tools-and-subagent.md`](./05-tools-and-subagent.md) | **工具集 + 子 Agent + Prompt 全文** | `qa_tools.py`, `sub_agent.py` |
 | [`06-runtime-and-artifact.md`](./06-runtime-and-artifact.md) | Run / Session / Artifact + 工程实践 + 迁移 Checklist | `run_registry.py`, `session_service.py`, `artifact_service.py` |
+| [`07-multi-turn-history-replay.md`](./07-multi-turn-history-replay.md) | **多轮对话完整工具结果回放（Claude Code 风格）** | `qa_agent.py`, `run_registry.py`, `session_service.py` |
 
 ## 阅读建议
 
@@ -23,13 +24,14 @@
 
 ### 路径 B：完整迁移（按顺序读）
 
-按文档编号 01 → 06 顺序读完，每篇约 30~60 分钟。
+按文档编号 01 → 07 顺序读完，每篇约 30~60 分钟。
 
 ### 路径 C：只取核心 Agent 框架
 
 1. `04-agent-core.md` 全文（LLM Adapter + 主 Agent）
 2. `05-tools-and-subagent.md` 全文（工具 + 子 Agent + Prompts）
 3. `06-runtime-and-artifact.md` 第 14 节（Run Registry）+ 第 16 节（工程实践）+ 第 17 节（迁移 Checklist）
+4. `07-multi-turn-history-replay.md` 全文（多轮对话完整工具记忆 — 让 Agent 跨轮看见之前的工具调用结果）
 
 ## 关键认知
 
@@ -46,6 +48,7 @@
 | **工具错误的 `suggestion`** | LLM 自动纠错全靠它 |
 | **`_truncate_tool_output` 智能截断** | 不做的话上下文必爆 |
 | **前缀缓存友好的历史重放** | 多轮对话费用直接×几倍 |
+| **多轮对话完整工具结果回放**（07） | 不做的话第二轮 Agent 完全忘记之前查过什么 → 重复搜索或瞎答 |
 
 ### 哪些可以根据场景裁剪
 

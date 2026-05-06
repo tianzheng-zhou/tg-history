@@ -256,6 +256,9 @@ async def _run_worker(run):
 
 ### 14.7 Trajectory 构造（持久化用）
 
+> 💡 **本节描述的是 trajectory 的基础形态**。改造后 trajectory 还会在每个 `tool_calls[i]` 上多一个 `output` 字段（完整工具结果 JSON），用于多轮对话回放。详见 [`07-multi-turn-history-replay.md`](./07-multi-turn-history-replay.md)。
+
+
 ```python
 def _build_trajectory(run):
     """从 run.events 构造紧凑 trajectory JSON"""
@@ -343,6 +346,8 @@ async def periodic_cleanup(interval_seconds=60):
 ---
 
 ## 15. Session / Turn / Artifact 服务（`session_service.py` + `artifact_service.py`）
+
+> 💡 **`get_history_messages` 的完整重放架构详见** [`07-multi-turn-history-replay.md`](./07-multi-turn-history-replay.md)。本节讲的是基础 CRUD 与只回放纯文本的「老行为」；改造后的「完整重放」会进一步从 trajectory 还原 tool_calls + tool 角色 messages。
 
 ### 15.1 Session CRUD 关键设计
 
@@ -630,10 +635,11 @@ if _estimate_messages_tokens(messages) > SUB_CONTEXT_SOFT_LIMIT_TOKENS:
 - [ ] **Run Registry**（`backend/services/run_registry.py`）
   - 异步任务 + 事件 buffer
   - SSE 订阅 + last_event_id 续播
-  - Trajectory 持久化
+  - Trajectory 持久化（含 `tool_calls[i].output` 完整工具结果，详见 [`07-multi-turn-history-replay.md`](./07-multi-turn-history-replay.md)）
 
 - [ ] **Session / Artifact Service**
   - 前缀缓存友好的历史重放（meta.injected_prefix）
+  - **多轮对话完整重放**：`get_history_messages` 从 trajectory 还原 tool_calls + tool 角色 messages（[详情](./07-multi-turn-history-replay.md)）
   - Artifact 版本历史（不存 diff，全量保留）
   - StrReplaceError 带 nearby_snippets
 
@@ -654,6 +660,7 @@ if _estimate_messages_tokens(messages) > SUB_CONTEXT_SOFT_LIMIT_TOKENS:
   EMBEDDING_MODEL=text-embedding-v4
   RERANK_MODEL=qwen3-rerank
   ENABLE_QWEN_EXPLICIT_CACHE=true
+  ENABLE_FULL_HISTORY_REPLAY=true
   DATA_DIR=./data
   ```
 
@@ -689,6 +696,7 @@ if _estimate_messages_tokens(messages) > SUB_CONTEXT_SOFT_LIMIT_TOKENS:
 | **工具错误的 `suggestion`** | LLM 自动纠错全靠它 |
 | **`_truncate_tool_output` 智能截断** | 不做的话上下文必爆 |
 | **前缀缓存友好的历史重放**（meta.injected_prefix）| 多轮对话费用直接×几倍 |
+| **多轮对话完整工具结果回放**（[07](./07-multi-turn-history-replay.md)）| 不做的话第二轮 Agent 完全忘记之前查过什么 → 重复搜索或瞎答 |
 
 ---
 
@@ -767,3 +775,7 @@ _run_worker (finally):
 3. 显式缓存有没有正确注入（多轮对话费用差很多）
 4. 前缀缓存重放历史时是不是用 `meta.injected_prefix` 重新拼了 user content
 5. SSE 的 `X-Accel-Buffering: no` 头有没有设（nginx 反代会缓冲）
+
+---
+
+> 下一篇：[`07-multi-turn-history-replay.md`](./07-multi-turn-history-replay.md) — 多轮对话完整工具结果回放（Claude Code 风格）。主要内容：`output_full` 字段设计、`Run.tool_outputs` 剥离机制、`get_history_messages` 重写、token/DB 影响估算。

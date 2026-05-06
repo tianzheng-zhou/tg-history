@@ -28,6 +28,13 @@ class Settings(BaseSettings):
     # 改成显式 cache_control 后命中率 99%+，命中价 10%。
     enable_qwen_explicit_cache: bool = True
 
+    # 多轮对话历史完整重放开关（Claude Code 风格）
+    # 开启时：把每轮 trajectory 里的 tool_calls + 完整 tool_results 还原回 messages，
+    #        让 Agent 能"看到"前几轮调用了什么工具、找到了哪些消息。
+    # 关闭时：仅回放 user/assistant 的纯文本 content（旧行为，省 token）。
+    # DB 体积影响：单 ChatTurn.trajectory 5KB → 30~100KB；显式缓存命中后实际费用约为关闭时 1.5~2x。
+    enable_full_history_replay: bool = True
+
     # Embedding / Rerank
     embedding_model: str = "text-embedding-v4"
     rerank_model: str = "qwen3-rerank"

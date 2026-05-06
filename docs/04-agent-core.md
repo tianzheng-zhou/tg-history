@@ -623,3 +623,5 @@ augmented_user_content = f"{injected_prefix}\n\n---\n\n{question}"
 ---
 
 > 下一篇：[`05-tools-and-subagent.md`](./05-tools-and-subagent.md) — 工具集 + 子 Agent + 主/子 Agent system prompt 全文。
+>
+> 延伸阅读：[`07-multi-turn-history-replay.md`](./07-multi-turn-history-replay.md) — 多轮对话时 Agent 如何"看见"前几轮的工具调用结果（trajectory 持久化 + Claude Code 风格完整重放）。

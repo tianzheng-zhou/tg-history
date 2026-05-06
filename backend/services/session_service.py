@@ -14,6 +14,7 @@ from typing import Any
 from sqlalchemy import and_, desc, func, or_
 from sqlalchemy.orm import Session
 
+from backend.config import settings
 from backend.models.database import Artifact, ArtifactVersion, ChatSession, ChatTurn
 
 
@@ -287,28 +288,156 @@ def append_turn(
     return t
 
 
+def _user_content_with_prefix(turn: ChatTurn) -> str | None:
+    """重建 user message 的实际 LLM content：injected_prefix + 原始 question。
+
+    历史重放时必须**和当时提交给 LLM 的 user message 完全一致**，否则前缀缓存失效。
+    """
+    if not turn.content:
+        return None
+    meta = _parse_json(turn.meta) or {}
+    prefix = meta.get("injected_prefix")
+    if prefix:
+        return f"{prefix}\n\n---\n\n{turn.content}"
+    return turn.content
+
+
+def _has_full_tool_outputs(trajectory: dict | None) -> bool:
+    """trajectory 是否包含完整 tool_results（新版 trajectory）。
+
+    判断条件：任意 step 的任意 tool_call 含非空 ``output`` 字段。
+    老 session（改造前生成的）只有 ``preview``，这里返回 False，调用方走 fallback。
+    """
+    if not isinstance(trajectory, dict):
+        return False
+    for s in trajectory.get("steps") or []:
+        for tc in s.get("tool_calls") or []:
+            if tc.get("output"):
+                return True
+    return False
+
+
+def _replay_assistant_turn_full(turn: ChatTurn) -> list[dict]:
+    """把一个 assistant turn 还原成完整 OpenAI messages 序列。
+
+    每个 trajectory step → 1 条 assistant message（含 content + reasoning_content + tool_calls）
+    + N 条 tool messages（每条对应该 step 里的一个 tool_call）。
+
+    最后一个 step 如果没有 tool_calls，它就是"最终答案"那一步：
+      - 优先用 ``turn.content``（数据库里持久化的纯净答案）作为 assistant.content
+      - fallback 用 step.thinking（trajectory 里累积的 thinking_delta）
+
+    Kimi 多步要求保留 ``reasoning_content`` —— 有就带上，OpenAI/Qwen 也会忽略未知字段。
+    """
+    trajectory = _parse_json(turn.trajectory) or {}
+    steps = trajectory.get("steps") or []
+    if not steps:
+        # 没有 trajectory steps（比如 RAG 模式）→ 退回单条 assistant content
+        if turn.content:
+            return [{"role": "assistant", "content": turn.content}]
+        return []
+
+    result: list[dict] = []
+    for i, step in enumerate(steps):
+        is_last = i == len(steps) - 1
+        tool_calls_raw = step.get("tool_calls") or []
+        thinking = step.get("thinking") or ""
+        reasoning = step.get("reasoning") or ""
+
+        asst: dict = {"role": "assistant"}
+
+        # content：最后一步且无 tool_calls 时优先用 turn.content（最终答案的纯净版）
+        if is_last and not tool_calls_raw:
+            asst["content"] = turn.content or thinking or None
+        else:
+            asst["content"] = thinking or None
+
+        # Kimi 思考链 —— 多步工具调用时必须保留
+        if reasoning:
+            asst["reasoning_content"] = reasoning
+
+        # tool_calls 还原
+        if tool_calls_raw:
+            asst["tool_calls"] = []
+            for j, tc in enumerate(tool_calls_raw):
+                tc_id = tc.get("id") or f"call_{turn.id}_{i}_{j}"
+                args = tc.get("args") or {}
+                asst["tool_calls"].append({
+                    "id": tc_id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.get("name") or "",
+                        "arguments": json.dumps(args, ensure_ascii=False)
+                                       if not isinstance(args, str) else args,
+                    },
+                })
+
+        # 跳过完全空的 assistant message（没 content 也没 tool_calls）
+        if asst.get("content") is None and not asst.get("tool_calls"):
+            continue
+
+        result.append(asst)
+
+        # 紧跟 tool messages（顺序必须和 assistant.tool_calls 完全一致）
+        if tool_calls_raw:
+            for j, tc in enumerate(tool_calls_raw):
+                tc_id = tc.get("id") or f"call_{turn.id}_{i}_{j}"
+                output = tc.get("output")
+                if not output:
+                    # 兜底：用 preview 序列化（虽然信息有损，但至少 tool_call_id 配对成功
+                    # 不会让 OpenAI API 报 "tool message must follow tool_calls" 错）
+                    preview = tc.get("preview") or {"note": "no full output recorded"}
+                    output = json.dumps(preview, ensure_ascii=False)
+                result.append({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": output,
+                })
+
+    return result
+
+
 def get_history_messages(db: Session, session_id: str) -> list[dict]:
-    """返回给 agent 用的对话历史（仅 role + content，忽略 trajectory）。
+    """返回给 agent 用的对话历史（不含当前正在生成的 turn）。
 
-    不含当前正在生成的 turn（调用此函数时尚未追加）。
+    两种模式（由 ``settings.enable_full_history_replay`` 控制）：
 
-    **前缀缓存关键**：user turn 的 content 只存纯净的用户问题，
-    但 LLM 看到的 user message 实际是 `meta.injected_prefix + content`
-    （时间戳 + artifact 快照等注入信息）。这里重放历史时**重新拼出那份内容**，
-    保证和上一轮提交给 LLM 的 user message 完全一致，从而前缀缓存能命中。
+    1. **完整重放**（默认开启，Claude Code 风格）：
+       从 ``ChatTurn.trajectory`` 还原每轮的完整 OpenAI messages 序列——
+       assistant message 带 ``tool_calls``、紧跟 N 条 ``tool`` 角色消息（带完整 output）。
+       Agent 第二轮开始能"看到"前几轮调用了哪些工具、找到了哪些 message_id。
+       老 session（trajectory 没有 ``output`` 字段）自动 fallback 到模式 2。
+
+    2. **仅文本回放**（旧行为，feature flag 关闭时）：
+       只回放 user.content + assistant.content。
+
+    **前缀缓存关键（两种模式共有）**：user turn 的 content 是纯净问题，
+    LLM 看到的实际是 ``meta.injected_prefix + content``（时间戳 + artifact 快照）。
+    这里重新拼出 prefix+content，保证和上一轮提交给 LLM 的 user message 完全一致，
+    从而显式缓存能跨轮命中。
     """
     turns = get_turns(db, session_id)
+    full_replay = settings.enable_full_history_replay
+
     result: list[dict] = []
     for t in turns:
-        if t.role not in ("user", "assistant") or not t.content:
-            continue
-        content = t.content
         if t.role == "user":
-            meta = _parse_json(t.meta) or {}
-            prefix = meta.get("injected_prefix")
-            if prefix:
-                content = f"{prefix}\n\n---\n\n{content}"
-        result.append({"role": t.role, "content": content})
+            content = _user_content_with_prefix(t)
+            if content:
+                result.append({"role": "user", "content": content})
+            continue
+
+        if t.role != "assistant":
+            continue
+
+        trajectory = _parse_json(t.trajectory)
+        if full_replay and _has_full_tool_outputs(trajectory):
+            result.extend(_replay_assistant_turn_full(t))
+        else:
+            # 老 session / RAG turn / feature flag 关闭 → 单条 content
+            if t.content:
+                result.append({"role": "assistant", "content": t.content})
+
     return result
 
 

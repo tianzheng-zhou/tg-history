@@ -640,6 +640,7 @@ async def run_agent(
             except json.JSONDecodeError as e:
                 args = {}
                 err_result = {"error": f"参数 JSON 解析失败: {e}", "raw": args_str[:200]}
+                err_result_str = json.dumps(err_result, ensure_ascii=False)
                 yield {
                     "type": "tool_call",
                     "step": step,
@@ -654,13 +655,15 @@ async def run_agent(
                     "id": call["id"],
                     "name": name,
                     "output_preview": err_result,
+                    # output_full 供 run_registry 持久化到 trajectory（在 _emit 里 pop、不发给订阅者）
+                    "output_full": err_result_str,
                     "duration_ms": 0,
                     "error": True,
                 }
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call["id"],
-                    "content": json.dumps(err_result, ensure_ascii=False),
+                    "content": err_result_str,
                 })
                 continue
             parsed_calls.append((call, args))
@@ -724,19 +727,21 @@ async def run_agent(
                 # asyncio.gather return_exceptions=True
                 err_call = parsed_calls[i][0]
                 err_result = {"error": f"工具执行异常: {item}"}
+                err_result_str = json.dumps(err_result, ensure_ascii=False)
                 yield {
                     "type": "tool_result",
                     "step": step,
                     "id": err_call["id"],
                     "name": err_call["name"],
                     "output_preview": err_result,
+                    "output_full": err_result_str,
                     "duration_ms": 0,
                     "error": True,
                 }
                 messages.append({
                     "role": "tool",
                     "tool_call_id": err_call["id"],
-                    "content": json.dumps(err_result, ensure_ascii=False),
+                    "content": err_result_str,
                 })
                 continue
 
@@ -766,6 +771,9 @@ async def run_agent(
                 "id": call["id"],
                 "name": call["name"],
                 "output_preview": _make_preview(result),
+                # 完整结果供下游持久化到 trajectory.tool_calls[i].output（多轮对话重放用）
+                # _emit 会在入 run.events 前 pop 走、不推送给前端 SSE 订阅者
+                "output_full": result_str,
                 "duration_ms": duration_ms,
                 "error": "error" in result,
             }
