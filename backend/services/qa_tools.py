@@ -245,7 +245,7 @@ async def tool_keyword_search(
     topic_ids: list[int] | None = None,
     include_sender_id: bool = False,
 ) -> dict:
-    """关键词检索：FTS5 trigram 优先，0 命中时回退 LIKE。rerank 按相关性重排。
+    """关键词检索：精确 LIKE 优先，FTS5 trigram 补充。
 
     参数：
     - keyword: 单关键词 / FTS5 表达式（兼容老参数名）
@@ -260,7 +260,6 @@ async def tool_keyword_search(
     if not kws:
         return {"results": [], "count": 0, "error": "需提供 keyword 或 keywords"}
     fts_query = " OR ".join(kws)
-    primary_kw = kws[0]
 
     chat_ids = _coerce_str_list(chat_ids)
     topic_ids = _coerce_int_list(topic_ids)
@@ -285,56 +284,48 @@ async def tool_keyword_search(
             q = q.filter(or_(*[Message.sender.like(f"%{s}%") for s in senders]))
         return q
 
-    def _fts_then_like() -> tuple[list[Message], str]:
+    def _keyword_candidates() -> tuple[list[Message], str]:
         msgs_local: list[Message] = []
-        method = "fts5"
+        seen_ids: set[int] = set()
+        methods: list[str] = []
+
+        def _add_many(items: list[Message]) -> None:
+            for item in items:
+                if item.id in seen_ids:
+                    continue
+                seen_ids.add(item.id)
+                msgs_local.append(item)
+
+        like_clauses = [Message.text_plain.like(f"%{k}%") for k in kws]
+        try:
+            q = db.query(Message).filter(or_(*like_clauses))
+            q = _apply_filters(q)
+            like_msgs = q.order_by(Message.date.desc()).limit(fetch_limit).all()
+            if like_msgs:
+                _add_many(like_msgs)
+                methods.append("like")
+        except Exception as e:
+            methods.append(f"like_err({type(e).__name__})")
+
         try:
             rows = db.execute(
-                sa_text("SELECT rowid FROM messages_fts WHERE messages_fts MATCH :kw LIMIT :lim"),
-                {"kw": fts_query, "lim": fetch_limit},
+                sa_text("SELECT msg_id FROM messages_fts WHERE messages_fts MATCH :kw LIMIT :lim"),
+                {"kw": fts_query, "lim": min(fetch_limit * 5, 1000)},
             ).fetchall()
             if rows:
                 ids = [r[0] for r in rows]
                 q = db.query(Message).filter(Message.id.in_(ids))
                 q = _apply_filters(q)
-                msgs_local = q.order_by(Message.date).all()
+                fts_msgs = q.order_by(Message.date.desc()).limit(fetch_limit).all()
+                if fts_msgs:
+                    _add_many(fts_msgs)
+                    methods.append("fts5")
         except Exception as e:
-            method = f"fts5_err({type(e).__name__})"
+            methods.append(f"fts5_err({type(e).__name__})")
+        return msgs_local[:fetch_limit], "+".join(methods) if methods else "none"
 
-        if not msgs_local:
-            method = "like"
-            kw_clean = primary_kw.split(" OR ")[0].split()[0].strip('"').strip()
-            if kw_clean:
-                q = db.query(Message).filter(Message.text_plain.like(f"%{kw_clean}%"))
-                q = _apply_filters(q)
-                msgs_local = q.order_by(Message.date.desc()).limit(fetch_limit).all()
-                msgs_local.reverse()
-        return msgs_local, method
-
-    msgs, used_method = await asyncio.to_thread(_fts_then_like)
-
-    # rerank：用语义相关性重排候选结果
-    reranked = False
-    if len(msgs) > 1:
-        try:
-            docs = [(m.text_plain or "")[:500] for m in msgs]
-            rerank_results = await llm_adapter.rerank(
-                query=fts_query, documents=docs, top_n=min(limit, len(msgs)),
-            )
-            if rerank_results:
-                reranked_msgs = []
-                for rr in rerank_results:
-                    idx = rr["index"]
-                    if 0 <= idx < len(msgs):
-                        reranked_msgs.append(msgs[idx])
-                msgs = reranked_msgs
-                reranked = True
-                used_method += "+rerank"
-        except Exception:
-            pass
-
-    if not reranked:
-        msgs = msgs[:limit]
+    msgs, used_method = await asyncio.to_thread(_keyword_candidates)
+    msgs = msgs[:limit]
 
     return {
         "results": [_msg_to_dict(m, preview_len=250, include_sender_id=include_sender_id) for m in msgs],
@@ -979,7 +970,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "keyword_search",
-            "description": "关键词搜索（FTS5 trigram，0 命中时自动回退 LIKE，兼容短中文词）。"
+            "description": "关键词搜索（精确 LIKE + FTS5 trigram，兼容短中文词、代码、URL）。"
                            "适合找具体的词/短语/代码/URL 等精确匹配内容，语义检索找不到时作为备选。"
                            "支持多关键词（keywords 列表自动 OR 拼接）、日期/发言人/群聊/话题多维过滤。",
             "parameters": {

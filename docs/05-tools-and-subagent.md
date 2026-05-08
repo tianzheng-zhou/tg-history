@@ -181,7 +181,7 @@ async def tool_keyword_search(db, keyword=None, keywords=None, ...):
     def _fts_then_like():
         try:
             rows = db.execute(
-                text("SELECT rowid FROM messages_fts WHERE messages_fts MATCH :kw LIMIT :lim"),
+                text("SELECT msg_id FROM messages_fts WHERE messages_fts MATCH :kw LIMIT :lim"),
                 {"kw": fts_query, "lim": fetch_limit},
             ).fetchall()
             if rows:

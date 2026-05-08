@@ -43,7 +43,7 @@ async def _keyword_search(
     def _q() -> list[Message]:
         try:
             rows = db.execute(
-                text("SELECT rowid FROM messages_fts WHERE messages_fts MATCH :kw LIMIT :lim"),
+                text("SELECT msg_id FROM messages_fts WHERE messages_fts MATCH :kw LIMIT :lim"),
                 {"kw": keyword, "lim": limit},
             ).fetchall()
         except Exception:
