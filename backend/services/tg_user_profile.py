@@ -46,6 +46,13 @@ _concurrency = asyncio.Semaphore(1)
 _last_call_ts = 0.0
 _MIN_INTERVAL_SEC = 1.0
 
+# 连接保护：Telegram/代理不可达时不要让 client.connect() 长时间拖住后端。
+# 第一次失败最多等待 8s；失败后 30s 内直接快速失败，避免 Agent 连续工具调用把请求队列卡死。
+_CONNECT_TIMEOUT_SEC = 8.0
+_CONNECT_FAILURE_COOLDOWN_SEC = 30.0
+_connect_failure_until = 0.0
+_connect_failure_reason = ""
+
 # FloodWait 上限：等待超过这个秒数就放弃，告诉 agent rate_limited
 _FLOOD_WAIT_MAX = 30
 
@@ -182,15 +189,51 @@ def _save_to_cache(db: Session, sender_id: str, full_user_resp: Any) -> TgUserPr
 
 async def _get_authorized_client(db: Session):
     """拿到已登录的 TelegramClient。未登录返回 None（让上层翻译成 no_login 错误）。"""
+    global _connect_failure_until, _connect_failure_reason
+
+    now = time.monotonic()
+    if now < _connect_failure_until:
+        logger.warning(
+            "Telegram 连接处于短期熔断中，跳过本次连接尝试（剩余 %.1fs）：%s",
+            _connect_failure_until - now,
+            _connect_failure_reason or "previous connect failed",
+        )
+        return None
+
     acc = db.query(TelegramAccount).order_by(TelegramAccount.id.asc()).first()
     if acc is None:
         return None
     client = await telegram_sync.get_client(acc.api_id, acc.api_hash)
     if not client.is_connected():
         try:
-            await client.connect()
+            await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT_SEC)
+            _connect_failure_until = 0.0
+            _connect_failure_reason = ""
+        except asyncio.TimeoutError:
+            _connect_failure_reason = f"connect timeout after {_CONNECT_TIMEOUT_SEC:.1f}s"
+            _connect_failure_until = time.monotonic() + _CONNECT_FAILURE_COOLDOWN_SEC
+            logger.warning(
+                "Telegram client connect 超时 %.1fs，进入 %.0fs 熔断（代理慢或不可用）",
+                _CONNECT_TIMEOUT_SEC,
+                _CONNECT_FAILURE_COOLDOWN_SEC,
+            )
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            return None
         except Exception:
-            logger.warning("Telegram client connect 失败", exc_info=True)
+            _connect_failure_reason = "connect failed"
+            _connect_failure_until = time.monotonic() + _CONNECT_FAILURE_COOLDOWN_SEC
+            logger.warning(
+                "Telegram client connect 失败，进入 %.0fs 熔断",
+                _CONNECT_FAILURE_COOLDOWN_SEC,
+                exc_info=True,
+            )
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
             return None
     try:
         if not await client.is_user_authorized():
@@ -276,10 +319,10 @@ async def fetch_user_profile(
             if stale:
                 resp = _row_to_dict(stale, cached=True)
                 resp["stale"] = True
-                resp["warning"] = "Telegram 未登录，返回的是过期缓存"
+                resp["warning"] = "Telegram 未登录或连接不可用，返回的是过期缓存"
                 return resp
             return {
-                "error": "Telegram 未登录或会话失效；请到设置里登录后重试",
+                "error": "Telegram 未登录、会话失效或当前网络/代理无法连接 Telegram；请到设置里检查登录态和代理后重试",
                 "code": "no_login",
             }
 

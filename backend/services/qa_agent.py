@@ -602,13 +602,44 @@ async def run_agent(
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
 
-    # 注入多轮对话历史（只保留 user/assistant 的文本，不含工具调用细节）
+    # 注入多轮对话历史。
+    # session_service.get_history_messages 在完整回放模式下会还原出：
+    #   assistant(tool_calls) → tool(tool_call_id, content) → assistant(final answer)
+    # 这里必须原样保留这些 OpenAI messages；如果只保留 user/assistant.content，
+    # Agent 下一轮就看不到前几轮工具调用的输入和输出。
     if history:
         for h in history:
             role = h.get("role") if isinstance(h, dict) else h.role
-            content = h.get("content") if isinstance(h, dict) else h.content
-            if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
+            if role not in ("user", "assistant", "tool"):
+                continue
+            if not isinstance(h, dict):
+                content = getattr(h, "content", None)
+                if content:
+                    messages.append({"role": role, "content": content})
+                continue
+
+            if role == "tool":
+                tool_call_id = h.get("tool_call_id")
+                content = h.get("content")
+                if tool_call_id and content is not None:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": content,
+                    })
+                continue
+
+            msg: dict = {"role": role}
+            if "content" in h:
+                msg["content"] = h.get("content")
+            if role == "assistant" and h.get("tool_calls"):
+                msg["tool_calls"] = h["tool_calls"]
+            if role == "assistant" and h.get("reasoning_content"):
+                msg["reasoning_content"] = h["reasoning_content"]
+
+            # OpenAI 兼容接口允许 tool_calls assistant content 为 None；普通消息则必须有内容。
+            if msg.get("content") is not None or msg.get("tool_calls"):
+                messages.append(msg)
 
     messages.append({"role": "user", "content": user_content})
 
