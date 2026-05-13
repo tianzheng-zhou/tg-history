@@ -304,7 +304,7 @@ async def _stream_sub_llm(
     effective_messages = messages
     if (
         settings.enable_qwen_explicit_cache
-        and llm_adapter.is_qwen_model(model)
+        and llm_adapter.supports_qwen_cache_control(model)
         and not is_kimi
     ):
         effective_messages = llm_adapter.inject_cache_control(messages)
@@ -571,7 +571,7 @@ async def run_sub_agent(
         force_messages = messages
         if (
             settings.enable_qwen_explicit_cache
-            and llm_adapter.is_qwen_model(model)
+            and llm_adapter.supports_qwen_cache_control(model)
             and not llm_adapter.is_kimi_model(model)
         ):
             force_messages = llm_adapter.inject_cache_control(messages)

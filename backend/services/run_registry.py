@@ -375,6 +375,9 @@ async def _run_worker(run: Run) -> None:
             ):
                 _emit(run, ev)
                 t = ev.get("type")
+                if t == "error":
+                    run.error = ev.get("error") or "未知错误"
+                    raise RuntimeError(run.error)
                 if t == "done":
                     run.final_answer = ev.get("answer", "") or ""
                     run.final_sources = ev.get("sources", []) or []
@@ -394,6 +397,9 @@ async def _run_worker(run: Run) -> None:
             ):
                 _emit(run, ev)
                 t = ev.get("type")
+                if t == "error":
+                    run.error = ev.get("error") or "未知错误"
+                    raise RuntimeError(run.error)
                 if t == "final_answer":
                     run.final_answer = ev.get("answer", "") or ""
                     run.final_sources = ev.get("sources", []) or []
@@ -415,7 +421,8 @@ async def _run_worker(run: Run) -> None:
         traceback.print_exc()
         run.status = "failed"
         run.error = str(e)
-        _emit(run, {"type": "error", "error": str(e)})
+        if not any(ev.get("type") == "error" for ev in run.events):
+            _emit(run, {"type": "error", "error": str(e)})
 
     finally:
         run.completed_at = datetime.now(timezone.utc)

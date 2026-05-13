@@ -32,10 +32,29 @@ function withCurrentValue(options, currentValue) {
   return [currentValue, ...options];
 }
 
+function uniqueList(items) {
+  return [...new Set(items.filter(Boolean))];
+}
+
+function parseModelList(raw) {
+  return uniqueList(
+    (raw || "")
+      .replace(/\r/g, "\n")
+      .replace(/,/g, "\n")
+      .split("\n")
+      .map((item) => item.trim())
+  );
+}
+
 export default function Settings() {
   const [form, setForm] = useState({
     dashscope_api_key: "",
     moonshot_api_key: "",
+    custom_openai_api_key: "",
+    custom_openai_base_url: "http://550c.duckdns.org/v1",
+    custom_openai_models: "",
+    custom_openai_default_context_window: 272000,
+    custom_openai_context_windows: "",
     llm_model_map: "qwen3.5-plus",
     llm_model_qa: "qwen3.6-plus",
     llm_model_sub_agent: "",  // 空 = 跟随 QA 模型
@@ -45,13 +64,22 @@ export default function Settings() {
   });
   const [hasKey, setHasKey] = useState(false);
   const [hasMoonshotKey, setHasMoonshotKey] = useState(false);
+  const [hasCustomOpenAIKey, setHasCustomOpenAIKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+
+  const customModelOptions = parseModelList(form.custom_openai_models);
+  const llmOptions = uniqueList([...MODEL_OPTIONS.llm, ...customModelOptions]);
+  const qaOptions = uniqueList([...MODEL_OPTIONS.llm_qa, ...customModelOptions]);
 
   useEffect(() => {
     getSettings().then((data) => {
       setForm((prev) => ({
         ...prev,
+        custom_openai_base_url: data.custom_openai_base_url || "http://550c.duckdns.org/v1",
+        custom_openai_models: data.custom_openai_models || "",
+        custom_openai_default_context_window: data.custom_openai_default_context_window || 272000,
+        custom_openai_context_windows: data.custom_openai_context_windows || "",
         llm_model_map: data.llm_model_map,
         llm_model_qa: data.llm_model_qa,
         llm_model_sub_agent: data.llm_model_sub_agent ?? "",
@@ -61,6 +89,7 @@ export default function Settings() {
       }));
       setHasKey(data.has_api_key);
       setHasMoonshotKey(data.has_moonshot_key);
+      setHasCustomOpenAIKey(data.has_custom_openai_key);
     });
   }, []);
 
@@ -75,10 +104,14 @@ export default function Settings() {
       if (!payload.moonshot_api_key) {
         delete payload.moonshot_api_key;
       }
+      if (!payload.custom_openai_api_key) {
+        delete payload.custom_openai_api_key;
+      }
       await updateSettings(payload);
       setSaved(true);
       if (form.dashscope_api_key) setHasKey(true);
       if (form.moonshot_api_key) setHasMoonshotKey(true);
+      if (form.custom_openai_api_key) setHasCustomOpenAIKey(true);
       setTimeout(() => setSaved(false), 3000);
     } catch {
       alert("保存失败");
@@ -127,6 +160,84 @@ export default function Settings() {
               <p className="text-xs text-green-600 mt-1">✓ Moonshot Key 已配置</p>
             )}
           </div>
+          <div className="mt-3 border-t border-border pt-3">
+            <label className="block text-sm text-muted-foreground mb-1">
+              OpenAI 兼容中转站 Base URL
+            </label>
+            <input
+              type="text"
+              value={form.custom_openai_base_url}
+              onChange={(e) => update("custom_openai_base_url", e.target.value)}
+              placeholder="http://550c.duckdns.org/v1"
+              className="w-full border border-border rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+            <p className="text-xs text-muted-foreground mt-1">
+              兼容 OpenAI Chat Completions 协议，默认使用个人中转站
+            </p>
+          </div>
+          <div className="mt-3">
+            <label className="block text-sm text-muted-foreground mb-1">
+              OpenAI 兼容中转站 API Key
+            </label>
+            <input
+              type="password"
+              value={form.custom_openai_api_key}
+              onChange={(e) => update("custom_openai_api_key", e.target.value)}
+              placeholder={hasCustomOpenAIKey ? "已配置（留空保持不变）" : "sk-..."}
+              className="w-full border border-border rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+            {hasCustomOpenAIKey && (
+              <p className="text-xs text-green-600 mt-1">✓ 中转站 Key 已配置</p>
+            )}
+          </div>
+          <div className="mt-3">
+            <label className="block text-sm text-muted-foreground mb-1">
+              OpenAI 兼容中转站模型列表
+            </label>
+            <textarea
+              rows={3}
+              value={form.custom_openai_models}
+              onChange={(e) => update("custom_openai_models", e.target.value)}
+              placeholder={"gpt-4o-mini\nclaude-3-5-sonnet"}
+              className="w-full border border-border rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+            <p className="text-xs text-muted-foreground mt-1">
+              逗号或换行分隔；模型 ID 会原样发送给中转站，并加入下方 LLM 下拉框
+            </p>
+          </div>
+          <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-sm text-muted-foreground mb-1">
+                中转站默认上下文窗口
+              </label>
+              <input
+                type="number"
+                min="1"
+                value={form.custom_openai_default_context_window}
+                onChange={(e) => update("custom_openai_default_context_window", Number(e.target.value))}
+                placeholder="272000"
+                className="w-full border border-border rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                未单独配置时，自定义模型统一使用该窗口
+              </p>
+            </div>
+            <div>
+              <label className="block text-sm text-muted-foreground mb-1">
+                逐模型上下文窗口
+              </label>
+              <textarea
+                rows={3}
+                value={form.custom_openai_context_windows}
+                onChange={(e) => update("custom_openai_context_windows", e.target.value)}
+                placeholder={"gpt-5.5=272000\nother-model=131072"}
+                className="w-full border border-border rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                可选；支持 model=窗口，逗号或换行分隔
+              </p>
+            </div>
+          </div>
         </section>
 
         {/* LLM 模型 */}
@@ -142,7 +253,7 @@ export default function Settings() {
                 onChange={(e) => update("llm_model_map", e.target.value)}
                 className="w-full border border-border rounded-md px-3 py-2 text-sm"
               >
-                {withCurrentValue(MODEL_OPTIONS.llm, form.llm_model_map).map((m) => (
+                {withCurrentValue(llmOptions, form.llm_model_map).map((m) => (
                   <option key={m} value={m}>
                     {m}
                   </option>
@@ -161,7 +272,7 @@ export default function Settings() {
                 onChange={(e) => update("llm_model_qa", e.target.value)}
                 className="w-full border border-border rounded-md px-3 py-2 text-sm"
               >
-                {withCurrentValue(MODEL_OPTIONS.llm_qa, form.llm_model_qa).map((m) => (
+                {withCurrentValue(qaOptions, form.llm_model_qa).map((m) => (
                   <option key={m} value={m}>
                     {m}
                   </option>
@@ -181,7 +292,7 @@ export default function Settings() {
                 className="w-full border border-border rounded-md px-3 py-2 text-sm"
               >
                 <option value="">跟随问答模型</option>
-                {withCurrentValue(MODEL_OPTIONS.llm_qa, form.llm_model_sub_agent).map((m) => (
+                {withCurrentValue(qaOptions, form.llm_model_sub_agent).map((m) => (
                   <option key={m} value={m}>
                     {m}
                   </option>

@@ -11,6 +11,16 @@ class Settings(BaseSettings):
     moonshot_api_key: str = ""
     moonshot_base_url: str = "https://api.moonshot.cn/v1"
 
+    # OpenAI 兼容中转站（个人 API 中转站）
+    custom_openai_api_key: str = ""
+    custom_openai_base_url: str = "http://550c.duckdns.org/v1"
+    # 逗号 / 换行分隔的模型 ID 列表。命中这些模型时走 custom_openai_base_url。
+    custom_openai_models: str = ""
+    # 中转站模型默认上下文窗口；可用 custom_openai_context_windows 做逐模型覆盖。
+    custom_openai_default_context_window: int = 272_000
+    # 逐模型上下文窗口，格式：model-a=272000,model-b=131072
+    custom_openai_context_windows: str = ""
+
     # LLM 模型
     # 注意：map 模型在话题切分里被高频调用，是 token 消耗大头。
     # qwen3.5-flash 比 qwen3.5-plus 输入便宜 4x、输出便宜 2.4x，限流也更宽松。

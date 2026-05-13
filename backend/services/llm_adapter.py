@@ -9,12 +9,14 @@ from backend.config import settings
 # DashScope RPM 30,000（含百炼直供 kimi/），官方 Moonshot 并发限制 = 3
 _DASHSCOPE_CHAT_SEM = asyncio.Semaphore(10)
 _MOONSHOT_CHAT_SEM = asyncio.Semaphore(3)
+_CUSTOM_OPENAI_CHAT_SEM = asyncio.Semaphore(3)
 _EMBED_SEM = asyncio.Semaphore(20)
 
 # ---------- 多 Provider 单例 client ----------
 
 _dashscope_client: AsyncOpenAI | None = None
 _moonshot_client: AsyncOpenAI | None = None
+_custom_openai_client: AsyncOpenAI | None = None
 
 
 def _make_http_client(timeout: float = 180.0) -> httpx.AsyncClient:
@@ -54,7 +56,34 @@ def _get_moonshot_client() -> AsyncOpenAI:
     return _moonshot_client
 
 
+def _get_custom_openai_client() -> AsyncOpenAI:
+    """个人 OpenAI 兼容中转站 client"""
+    global _custom_openai_client
+    if _custom_openai_client is None:
+        _custom_openai_client = AsyncOpenAI(
+            api_key=settings.custom_openai_api_key,
+            base_url=normalize_openai_base_url(settings.custom_openai_base_url),
+            http_client=_make_http_client(),
+        )
+    return _custom_openai_client
+
+
 # ---------- Provider 路由 ----------
+
+def normalize_openai_base_url(base_url: str) -> str:
+    """规范化 OpenAI 兼容接口 Base URL。
+
+    OpenAI SDK 的 ``base_url`` 必须指向 API 前缀（通常是 ``.../v1``），
+    后续会自动拼接 ``/chat/completions``。如果只填服务根地址，
+    请求会被发到 ``/chat/completions``，很多中转站会返回 HTML 首页或 501。
+    """
+    url = (base_url or "").strip().rstrip("/")
+    if not url:
+        return "http://550c.duckdns.org/v1"
+    last_segment = url.rsplit("/", 1)[-1].lower()
+    if last_segment.startswith("v") and last_segment[1:].isdigit():
+        return url
+    return f"{url}/v1"
 
 KIMI_MODELS = {"kimi-k2.6", "kimi-k2.5", "kimi-k2-0905-preview",
                "kimi/kimi-k2.6", "kimi/kimi-k2.5"}
@@ -68,6 +97,53 @@ def is_kimi_model(model: str) -> bool:
 def is_qwen_model(model: str) -> bool:
     """判断是否为 Qwen 系列模型（DashScope 兼容协议、支持 cache_control）"""
     return model.startswith("qwen") or model.startswith("qvq") or model.startswith("qwq")
+
+
+def parse_custom_openai_models(raw: str | None = None) -> list[str]:
+    """解析自定义 OpenAI 兼容中转站模型列表（支持逗号 / 换行分隔）。"""
+    value = settings.custom_openai_models if raw is None else raw
+    models: list[str] = []
+    seen: set[str] = set()
+    for item in value.replace("\r", "\n").replace(",", "\n").split("\n"):
+        model = item.strip()
+        if model and model not in seen:
+            seen.add(model)
+            models.append(model)
+    return models
+
+
+def parse_custom_openai_context_windows(raw: str | None = None) -> dict[str, int]:
+    """解析自定义模型上下文窗口配置，格式：model=272000（支持逗号 / 换行分隔）。"""
+    value = settings.custom_openai_context_windows if raw is None else raw
+    windows: dict[str, int] = {}
+    for item in value.replace("\r", "\n").replace(",", "\n").split("\n"):
+        pair = item.strip()
+        if not pair:
+            continue
+        if "=" in pair:
+            model, raw_window = pair.split("=", 1)
+        elif ":" in pair:
+            model, raw_window = pair.split(":", 1)
+        else:
+            continue
+        model = model.strip()
+        try:
+            window = int(raw_window.strip().replace("_", ""))
+        except ValueError:
+            continue
+        if model and window > 0:
+            windows[model] = window
+    return windows
+
+
+def is_custom_openai_model(model: str) -> bool:
+    """判断模型是否应走个人 OpenAI 兼容中转站。"""
+    return model in parse_custom_openai_models()
+
+
+def supports_qwen_cache_control(model: str) -> bool:
+    """仅 DashScope Qwen 模型支持 cache_control，custom provider 即便模型名以 qwen 开头也不注入。"""
+    return is_qwen_model(model) and not is_custom_openai_model(model)
 
 
 # 显式缓存最小阈值：阿里云要求 ≥1024 token 才会真正建缓存块
@@ -155,6 +231,8 @@ def _is_dashscope_kimi(model: str) -> bool:
 
 def get_client_for_model(model: str) -> AsyncOpenAI:
     """根据模型名称返回对应 provider 的 client"""
+    if is_custom_openai_model(model):
+        return _get_custom_openai_client()
     if is_kimi_model(model) and not _is_dashscope_kimi(model):
         return _get_moonshot_client()  # 官方 Moonshot API
     return _get_client()  # DashScope（含 kimi/ 百炼直供）
@@ -162,6 +240,8 @@ def get_client_for_model(model: str) -> AsyncOpenAI:
 
 def get_chat_semaphore(model: str) -> asyncio.Semaphore:
     """获取模型对应 provider 的 chat 并发 semaphore"""
+    if is_custom_openai_model(model):
+        return _CUSTOM_OPENAI_CHAT_SEM
     if is_kimi_model(model) and not _is_dashscope_kimi(model):
         return _MOONSHOT_CHAT_SEM  # 官方 Moonshot 并发 = 3
     return _DASHSCOPE_CHAT_SEM  # DashScope（含 kimi/ 百炼直供）RPM 30,000
@@ -220,6 +300,11 @@ def get_context_window(model: str) -> int:
     """
     if model in MODEL_CONTEXT_WINDOW:
         return MODEL_CONTEXT_WINDOW[model]
+    if is_custom_openai_model(model):
+        custom_windows = parse_custom_openai_context_windows()
+        if model in custom_windows:
+            return custom_windows[model]
+        return settings.custom_openai_default_context_window
     # 按 key 长度倒序，优先匹配更长的 prefix（避免 qwen-plus 误匹配 qwen-plus-...）
     for key in sorted(MODEL_CONTEXT_WINDOW.keys(), key=len, reverse=True):
         if model.startswith(key):

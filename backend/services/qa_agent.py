@@ -312,7 +312,7 @@ async def _stream_llm_step(
     effective_messages = messages
     if (
         settings.enable_qwen_explicit_cache
-        and llm_adapter.is_qwen_model(model)
+        and llm_adapter.supports_qwen_cache_control(model)
         and not is_kimi
     ):
         effective_messages = llm_adapter.inject_cache_control(messages)
@@ -340,6 +340,9 @@ async def _stream_llm_step(
     tool_calls_acc: dict[int, dict] = {}
     reasoning_parts: list[str] = []
     last_usage: dict | None = None
+    finish_reasons: list[str] = []
+    saw_content = False
+    saw_tool_call = False
 
     async with sem:
         stream = await client.chat.completions.create(**kwargs)
@@ -353,6 +356,8 @@ async def _stream_llm_step(
             choice = chunk.choices[0] if chunk.choices else None
             if not choice:
                 continue
+            if choice.finish_reason:
+                finish_reasons.append(str(choice.finish_reason))
             delta = choice.delta
 
             # Kimi reasoning_content（思考链 token）
@@ -363,10 +368,12 @@ async def _stream_llm_step(
 
             # 文本 token
             if delta.content:
+                saw_content = True
                 yield {"type": "text_delta", "text": delta.content}
 
             # 工具调用分片聚合
             if delta.tool_calls:
+                saw_tool_call = True
                 for tc in delta.tool_calls:
                     idx = tc.index
                     if idx not in tool_calls_acc:
@@ -414,6 +421,17 @@ async def _stream_llm_step(
             "max_context": max_ctx,
             "percent": round(last_usage["prompt_tokens"] / max_ctx, 4) if max_ctx else 0.0,
             "model": model,
+        }
+
+    if not saw_content and not saw_tool_call:
+        reason = finish_reasons[-1] if finish_reasons else "unknown"
+        yield {
+            "type": "error",
+            "error": (
+                f"LLM 未返回文本或工具调用（finish_reason={reason}）。"
+                "请检查中转站 Base URL 是否指向 OpenAI 兼容 /v1 接口，"
+                "以及该模型是否支持 Chat Completions 流式输出。"
+            ),
         }
 
     yield {"type": "done"}
@@ -693,6 +711,9 @@ async def run_agent(
                     _refresh_usage_snapshot()
                     # 向上透传 usage（上下文占比显示）
                     yield {**ev, "step": step}
+                elif ev["type"] == "error":
+                    yield {"type": "error", "error": ev["error"]}
+                    return
                 elif ev["type"] == "done":
                     break
         except Exception as e:
@@ -932,7 +953,7 @@ async def run_agent(
             _effective_messages = messages
             if (
                 settings.enable_qwen_explicit_cache
-                and llm_adapter.is_qwen_model(_model)
+                and llm_adapter.supports_qwen_cache_control(_model)
                 and not llm_adapter.is_kimi_model(_model)
             ):
                 _effective_messages = llm_adapter.inject_cache_control(messages)
@@ -1024,7 +1045,7 @@ async def _force_summarize_recovery(messages: list[dict], cited_ids: set[int]) -
         sem = llm_adapter.get_chat_semaphore(model)
         if (
             settings.enable_qwen_explicit_cache
-            and llm_adapter.is_qwen_model(model)
+            and llm_adapter.supports_qwen_cache_control(model)
             and not llm_adapter.is_kimi_model(model)
         ):
             recovery_msgs = llm_adapter.inject_cache_control(recovery_msgs)

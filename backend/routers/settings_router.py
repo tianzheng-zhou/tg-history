@@ -21,6 +21,11 @@ def _build_response() -> SettingsResponse:
         rerank_model=settings.rerank_model,
         has_api_key=bool(settings.dashscope_api_key),
         has_moonshot_key=bool(settings.moonshot_api_key),
+        custom_openai_base_url=settings.custom_openai_base_url,
+        custom_openai_models=settings.custom_openai_models,
+        custom_openai_default_context_window=settings.custom_openai_default_context_window,
+        custom_openai_context_windows=settings.custom_openai_context_windows,
+        has_custom_openai_key=bool(settings.custom_openai_api_key),
     )
 
 
@@ -38,8 +43,19 @@ def update_settings(req: SettingsUpdate):
     if req.moonshot_api_key is not None:
         settings.moonshot_api_key = req.moonshot_api_key
         # 切换 Moonshot key 时重置 client 单例
-        from backend.services import llm_adapter
         llm_adapter._moonshot_client = None
+    if req.custom_openai_api_key is not None:
+        settings.custom_openai_api_key = req.custom_openai_api_key
+        llm_adapter._custom_openai_client = None
+    if req.custom_openai_base_url is not None:
+        settings.custom_openai_base_url = llm_adapter.normalize_openai_base_url(req.custom_openai_base_url)
+        llm_adapter._custom_openai_client = None
+    if req.custom_openai_models is not None:
+        settings.custom_openai_models = req.custom_openai_models
+    if req.custom_openai_default_context_window is not None:
+        settings.custom_openai_default_context_window = req.custom_openai_default_context_window
+    if req.custom_openai_context_windows is not None:
+        settings.custom_openai_context_windows = req.custom_openai_context_windows
     if req.llm_model_map is not None:
         settings.llm_model_map = req.llm_model_map
     if req.llm_model_qa is not None:
@@ -62,11 +78,23 @@ def update_settings(req: SettingsUpdate):
 def _persist_env():
     """将当前配置写入 .env 文件"""
     env_path = os.path.join(os.getcwd(), ".env")
+    custom_openai_models = ",".join(llm_adapter.parse_custom_openai_models(settings.custom_openai_models))
+    custom_openai_context_windows = ",".join(
+        f"{model}={window}"
+        for model, window in llm_adapter.parse_custom_openai_context_windows(
+            settings.custom_openai_context_windows
+        ).items()
+    )
     lines = {
         "DASHSCOPE_API_KEY": settings.dashscope_api_key,
         "DASHSCOPE_BASE_URL": settings.dashscope_base_url,
         "MOONSHOT_API_KEY": settings.moonshot_api_key,
         "MOONSHOT_BASE_URL": settings.moonshot_base_url,
+        "CUSTOM_OPENAI_API_KEY": settings.custom_openai_api_key,
+        "CUSTOM_OPENAI_BASE_URL": settings.custom_openai_base_url,
+        "CUSTOM_OPENAI_MODELS": custom_openai_models,
+        "CUSTOM_OPENAI_DEFAULT_CONTEXT_WINDOW": str(settings.custom_openai_default_context_window),
+        "CUSTOM_OPENAI_CONTEXT_WINDOWS": custom_openai_context_windows,
         "LLM_MODEL_MAP": settings.llm_model_map,
         "LLM_MODEL_QA": settings.llm_model_qa,
         "LLM_MODEL_SUB_AGENT": settings.llm_model_sub_agent,

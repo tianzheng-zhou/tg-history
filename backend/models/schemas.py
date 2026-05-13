@@ -270,6 +270,11 @@ class RunInfo(BaseModel):
 class SettingsUpdate(BaseModel):
     dashscope_api_key: str | None = None
     moonshot_api_key: str | None = None
+    custom_openai_api_key: str | None = None
+    custom_openai_base_url: str | None = None
+    custom_openai_models: str | None = None
+    custom_openai_default_context_window: int | None = None
+    custom_openai_context_windows: str | None = None
     llm_model_map: str | None = None
     llm_model_qa: str | None = None
     llm_model_sub_agent: str | None = None  # 空 "" = 跟随 llm_model_qa
@@ -289,6 +294,11 @@ class SettingsResponse(BaseModel):
     rerank_model: str
     has_api_key: bool
     has_moonshot_key: bool = False
+    custom_openai_base_url: str = ""
+    custom_openai_models: str = ""
+    custom_openai_default_context_window: int = 272000
+    custom_openai_context_windows: str = ""
+    has_custom_openai_key: bool = False
 
 
 # ---------- Watched Folders ----------
